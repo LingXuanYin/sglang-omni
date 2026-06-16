@@ -443,11 +443,16 @@ explicitly asks you to fix a named gap (e.g. speaker sim warm-cache).
 - **Qwen3-ASR (TTS CI stage 1 / `--model tts`)**: uses `omni`, **2 GPU / router DP=2**.
   TTS stage-1 Qwen3-ASR correctness runs with ASR request concurrency **2**.
   Standalone `qwen3-asr-v1` calibration keeps ASR request concurrency **32**,
-  and Higgs/TTS generation stages use **16**.
+  and TTS generation stages use **16**.
   Included in `--model tts --stages ALL`; calibrate alone with
   `--stages qwen3_asr`. Venv only needs to pass precheck for torch/sglang pins
   and cached assets. Do **not** use `--skip-precheck`. Source
   `.github/scripts/ci_env.sh` before pytest/calibration.
+- **TTS random-pick CI (`--model tts`)**: CI randomly selects one configured
+  TTS model preset per commit, but calibration must **never** randomly select.
+  `models/tts/config.yaml` expands every `calibration_preset` into its own
+  stages. `--stages tts` / `ALL` therefore runs Higgs and MOSS independently
+  and produces per-preset worst-of-N rows.
 - **Qwen3-ASR (standalone `--model qwen3-asr-v1`)**: same runtime as above;
   use only for isolated ASR calibration — **TTS PRs should use `--model tts`**.
 - **Qwen3 MoE stages**: `flashinfer-python` (cu13) JIT-compiles its MoE/cutlass
@@ -534,9 +539,18 @@ fragments:
 
 Common TTS preset:
 ```
-# Full TTS CI pipeline (stage 1 Qwen3-ASR + stages 2–4 Higgs voice clone), 5 repeats.
+# Full TTS CI pipeline: Qwen3-ASR + every configured TTS model preset, 5 repeats.
+# As of this branch, `tts` expands to Higgs and MOSS; it is not a random pick.
 python .claude/skills/tune-ci-thresholds/tune.py --model tts run \
   --stages ALL --repeats 5 --output-dir .tune-runs/<timestamp>_tts_all_r5
+
+# Only model-dependent TTS stages, all configured presets:
+python .claude/skills/tune-ci-thresholds/tune.py --model tts run \
+  --stages tts --repeats 5 --output-dir .tune-runs/<timestamp>_tts_models_r5
+
+# One preset only, for debugging or a targeted rerun after a failed repeat:
+python .claude/skills/tune-ci-thresholds/tune.py --model tts run \
+  --stages tts_moss --repeats 5 --output-dir .tune-runs/<timestamp>_tts_moss_r5
 
 # Stage 1 only (Qwen3-ASR on SeedTTS EN 20-sample correctness subset):
 python .claude/skills/tune-ci-thresholds/tune.py --model tts run \
@@ -571,12 +585,48 @@ Notes:
   bake slack into calibrated literals.
 - Shortcuts: `qwen3_asr`, `@wer`, `@speed`.
 - Standalone model **`qwen3-asr-v1`** remains for isolated ASR runs;
-  **TTS pipeline calibration uses `--model tts`** so Qwen3-ASR and Higgs stages
-  share one run directory and provenance.
+  **TTS pipeline calibration uses `--model tts`** so Qwen3-ASR plus every
+  configured TTS model preset share one run directory and provenance.
 
-### TTS (Higgs) calibration targets (stages 2–4)
+### TTS random-pick CI vs calibration coverage
 
-**Fixed presets in `test_tts_ci.py` — never apply, never worst-of-N write:**
+CI and calibration intentionally have different sampling policies:
+
+- **CI:** `omni-ci.yaml` runs `pick-tts-model` and chooses one TTS preset
+  (`higgs` or `moss` on this branch) for that commit. This keeps per-commit
+  cost at one TTS model × two modes.
+- **Calibration:** `tune.py --model tts` must run **all** TTS presets declared
+  under `models/tts/config.yaml::metric_sources.test_tts_ci.py.calibration_presets`.
+  It never calls CI's random picker and never infers one preset's threshold from
+  another preset's numbers.
+- **Worst-of-N scope:** compute worst-of-5 independently for each
+  `(preset, mode, metric-group)` tuple. Do not aggregate Higgs and MOSS into a
+  single worst row, and do not let a partial/failed run for one preset count as
+  evidence for the other.
+- **Threshold surface:** every preset in the CI random-pick set must have the
+  same calibrated metric groups and assertion semantics: non-stream speed,
+  non-stream WER, non-stream similarity, non-stream UTMOS, stream speed, and
+  stream WER. Numeric values may differ per preset. Missing thresholds for a
+  scaffold preset are allowed only as a temporary report-only state; do not
+  silently reuse Higgs literals for MOSS.
+- **GPU topology:** calibration stages can declare per-preset GPU needs.
+  Higgs and MOSS currently use 2 GPUs total: the router launches two complete
+  single-GPU workers. MOSS Local's default pipeline config is colocated, so its
+  codec/vocoder run on each worker's visible `cuda:0`.
+
+The generated stage aliases reflect this:
+
+| Alias | Expands to |
+|-------|------------|
+| `tts` | all model-dependent TTS stages for every configured preset |
+| `tts_higgs` | all Higgs TTS stages |
+| `tts_moss` | all MOSS TTS stages |
+| `tts_higgs_nonstream` / `tts_moss_stream` | one preset and one mode |
+| `@speed`, `@wer`, `@similarity`, `@utmos` | metric group across presets; `@speed` and `@wer` also include Qwen3-ASR when `--model tts` is selected |
+
+### TTS model calibration targets (stages 2–4)
+
+**Fixed sample presets in `test_tts_ci.py` — never apply, never worst-of-N write:**
 `SEEDTTS_EN_FULLSET_SAMPLES` (=1088), `TTS_SIMILARITY_MAX_SAMPLES` (=50),
 `STREAMING_BENCHMARK_MAX_SAMPLES` (=None → full 1088). These define *how many*
 samples CI runs; tune.py only uses them indirectly for strict-audit sample counts
@@ -584,24 +634,43 @@ samples CI runs; tune.py only uses them indirectly for strict-audit sample count
 Generation concurrency is **16** for both non-streaming and streaming TTS stages;
 the Qwen3-ASR WER transcribe phase remains **32**.
 
-**Calibrated thresholds** (worst-of-N → `apply-plan` → test file):
+**Calibrated thresholds** (worst-of-N → `apply-plan` → `tts_ci_config.py`) use the
+**same metric groups** for every TTS preset, but **different Python symbols**
+per preset. Never write MOSS worst-of-N into Higgs `HIGGS_VC_*` literals or vice
+versa.
 
-| Stage key | Group | What gets written | Test constant(s) |
-|-----------|-------|-------------------|------------------|
-| `tts_nonstream_speed` | speed | P95 speed slack | `_VC_NON_STREAM_P95[16]` |
-| `tts_stream_speed` | speed | same | `_VC_STREAM_P95[16]` |
-| `tts_nonstream_wer` | wer | corpus WER ref | `VC_WER_MAX_CORPUS` |
-| `tts_stream_wer` | wer | same | `VC_STREAM_WER_MAX_CORPUS` |
-| `tts_nonstream_similarity` | similarity | min mean score (50-sample eval) | `VC_SIMILARITY_MEAN_MIN` |
-| `tts_nonstream_utmos` | utmos | MOS reference score | `VC_UTMOS_MEAN_REFERENCE` |
+| Stage key | Group | Higgs symbol(s) | MOSS symbol(s) |
+|-----------|-------|-----------------|----------------|
+| `tts_<preset>_nonstream_speed` | speed | `_HIGGS_VC_NON_STREAM_P95[...]` | `_MOSS_VC_NON_STREAM_P95[...]` |
+| `tts_<preset>_stream_speed` | speed | `_HIGGS_VC_STREAM_P95[...]` | `_MOSS_VC_STREAM_P95[...]` |
+| `tts_<preset>_nonstream_wer` | wer | `HIGGS_VC_WER_MAX_CORPUS` | `MOSS_VC_WER_MAX_CORPUS` |
+| `tts_<preset>_stream_wer` | wer | `HIGGS_VC_STREAM_WER_MAX_CORPUS` | `MOSS_VC_STREAM_WER_MAX_CORPUS` |
+| `tts_<preset>_nonstream_similarity` | similarity | `HIGGS_VC_SIMILARITY_MEAN_MIN` | `MOSS_VC_SIMILARITY_MEAN_MIN` |
+| `tts_<preset>_nonstream_utmos` | utmos | `HIGGS_VC_UTMOS_MEAN_REFERENCE` | `MOSS_VC_UTMOS_MEAN_REFERENCE` |
+
+`stages.yaml` `metrics.*.source` must point at the preset-specific symbol
+(e.g. `tts_moss_nonstream_wer` → `MOSS_VC_WER_MAX_CORPUS`). `discover` enforces
+this via `calibration_presets.<preset>.constant_filter` in
+`models/tts/config.yaml` (`^HIGGS_VC_` for higgs, `^MOSS_VC_` for moss), and
+reads/writes threshold literals through
+`models/tts/config.yaml::metric_sources.test_tts_ci.py.threshold_file`
+(`tests/test_model/tts_ci_config.py`).
 
 Notes:
-- **WER** calibrates corpus reference only (`VC_*_WER_MAX_CORPUS`); CI asserts
-  via `apply_wer_slack()`. Per-sample WER caps and generation failure budgets
-  are not calibrated.
-- **Similarity** calibrates **`VC_SIMILARITY_MEAN_MIN`**, not `TTS_SIMILARITY_MAX_SAMPLES`.
-- **UTMOS** calibrates **`VC_UTMOS_MEAN_REFERENCE`**; CI derives the assertion
+- **WER** calibrates corpus reference only (`*_WER_MAX_CORPUS`); CI asserts via
+  `apply_wer_slack()`. Per-sample WER caps and generation failure budgets are
+  not calibrated.
+- **Similarity** calibrates `*_SIMILARITY_MEAN_MIN`, not
+  `TTS_SIMILARITY_MAX_SAMPLES`.
+- **UTMOS** calibrates `*_UTMOS_MEAN_REFERENCE`; CI derives the assertion
   threshold with `apply_mos_slack()`.
+- Both presets have `gate_thresholds=True`. Apply worst-of-N **per preset** using
+  the symbols above; a MOSS calibration run must not modify any `HIGGS_VC_*` /
+  `_HIGGS_VC_*` literal, and a Higgs run must not modify any `MOSS_VC_*` /
+  `_MOSS_VC_*` literal.
+- When applying from a run dir, use each stage's `calibration_preset` and
+  `metrics.*.source` from `apply-plan` — do not infer cross-preset symbols from
+  stage titles alone.
 - **Stage 4 (consistency)** is a separate CI job that runs
   `tests/test_model/test_tts_consistency_artifacts.py` (not `test_tts_ci.py`),
   comparing the stage-2/stage-3 speed artifacts with `TTS_CONSISTENCY_CONCURRENCY=16`.
@@ -1185,6 +1254,11 @@ weights checklist for agents).
    path, and after the user accepts in interactive prompts):
      - Write **`write_value`** from `apply-plan` — never `worst_rounded`
        directly, and never re-format with `display.digits`.
+     - **TTS preset isolation:** each stage's `calibration_preset` and
+       `metrics.*.source` / `symbol` from apply-plan identify the exact
+       literal to edit (`HIGGS_VC_*` for higgs, `MOSS_VC_*` for moss). Never
+       substitute one preset's symbol for another, even when metric groups
+       match.
      - **Bare `source`** (no `[...]`), e.g. `MMMU_MIN_ACCURACY`:
        replace the RHS literal of `MMMU_MIN_ACCURACY = <old>` with
        `write_value`.
@@ -1309,8 +1383,8 @@ weights checklist for agents).
     ├── qwen3-omni-v1/                   # v1 pipeline (qwen3-omni)
     │   ├── config.yaml
     │   └── stages.yaml
-    ├── tts/                             # TTS CI pipeline (stage 1 Qwen3-ASR + Higgs)
-    │   ├── config.yaml                  #   qwen3-asr + test_tts_ci.py; variants for Higgs
+    ├── tts/                             # TTS CI pipeline (stage 1 Qwen3-ASR + Higgs/MOSS)
+    │   ├── config.yaml                  #   per-preset constant_filter for discover/apply
     │   └── stages.yaml
     └── qwen3-asr-v1/                    # Isolated Qwen3-ASR only
         ├── config.yaml

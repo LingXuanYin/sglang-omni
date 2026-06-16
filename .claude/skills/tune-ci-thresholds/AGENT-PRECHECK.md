@@ -27,11 +27,26 @@ Read `handoff:` in the active host profile and confirm with the user if unclear.
 
 | Scope | `--model` | Stages | Repeats | Order |
 |-------|-----------|--------|---------|-------|
-| TTS CI | `tts` | `ALL` | 5 | — |
+| TTS CI | `tts` | `ALL` | 5 | Runs Qwen3-ASR plus every configured TTS `calibration_preset`; do not use CI random pick |
 | Qwen3-Omni CI | `qwen3-omni-v1` | `ALL` | 5 | — |
 | Full CI | both | each `ALL` | 5 each | **TTS first**, then Qwen3-Omni |
 
 Run precheck for **every** model you will calibrate before `tune.py run`.
+For `--model tts`, the `tts` alias expands to every TTS model preset declared
+in `models/tts/config.yaml` (currently Higgs and MOSS). Calibration must produce
+worst-of-5 for each preset independently even though CI samples one preset per
+commit.
+
+**Threshold symbols (do not cross-apply):**
+
+| Preset | WER (non-stream / stream) | Similarity | UTMOS | Speed P95 dict |
+|--------|---------------------------|------------|-------|----------------|
+| `higgs` | `HIGGS_VC_WER_MAX_CORPUS` / `HIGGS_VC_STREAM_WER_MAX_CORPUS` | `HIGGS_VC_SIMILARITY_MEAN_MIN` | `HIGGS_VC_UTMOS_MEAN_REFERENCE` | `_HIGGS_VC_NON_STREAM_P95` / `_HIGGS_VC_STREAM_P95` |
+| `moss` | `MOSS_VC_WER_MAX_CORPUS` / `MOSS_VC_STREAM_WER_MAX_CORPUS` | `MOSS_VC_SIMILARITY_MEAN_MIN` | `MOSS_VC_UTMOS_MEAN_REFERENCE` | `_MOSS_VC_NON_STREAM_P95` / `_MOSS_VC_STREAM_P95` |
+
+After changing threshold literals in `tests/test_model/tts_ci_config.py`, run
+`tune.py --model tts discover` so `stages.yaml` sources stay aligned with
+`calibration_presets.*.constant_filter`.
 
 ---
 

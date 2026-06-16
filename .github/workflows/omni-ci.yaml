@@ -11,6 +11,12 @@ on:
     branches: [main]
     types: [opened, labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      tts_ci_model:
+        description: "Optional TTS CI model preset to run (higgs or moss). Leave empty for random."
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: omni-ci-${{ github.event.pull_request.number || github.ref }}
@@ -27,6 +33,7 @@ env:
         && format('/github/home/pr-{0}', github.event.pull_request.number)
         || format('/github/home/run-{0}', github.run_id) }}
   TTS_MODEL_PATH: boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999
+  MOSS_TTS_MODEL_PATH: OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5
   QWEN3_ASR_MODEL_PATH: Qwen/Qwen3-ASR-1.7B
 
 
@@ -125,15 +132,51 @@ jobs:
             Qwen/Qwen3-Omni-30B-A3B-Instruct \
             marksverdhei/Qwen3-Omni-30B-A3B-FP8 \
             "${QWEN3_ASR_MODEL_PATH}" \
-            "${TTS_MODEL_PATH}"
+            "${TTS_MODEL_PATH}" \
+            "${MOSS_TTS_MODEL_PATH}"
+
+  pick-tts-model:
+    name: pick TTS model
+    needs: setup
+    if: needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      tts_ci_model: ${{ steps.pick.outputs.tts_ci_model }}
+    steps:
+      - id: pick
+        env:
+          TTS_CI_MODEL_OVERRIDE: ${{ github.event.inputs.tts_ci_model }}
+        run: |
+          models=(higgs moss)
+          selected=""
+          override="${TTS_CI_MODEL_OVERRIDE,,}"
+          if [[ -n "${override}" ]]; then
+            for model in "${models[@]}"; do
+              if [[ "${override}" == "${model}" ]]; then
+                selected="${model}"
+                break
+              fi
+            done
+            if [[ -z "${selected}" ]]; then
+              echo "::error::Unsupported tts_ci_model='${TTS_CI_MODEL_OVERRIDE}'. Expected one of: ${models[*]}"
+              exit 1
+            fi
+          else
+            selected="${models[$((RANDOM % ${#models[@]}))]}"
+          fi
+          echo "Selected TTS CI model: ${selected}"
+          echo "tts_ci_model=${selected}" >> "$GITHUB_OUTPUT"
 
   tts-ci:
     name: TTS CI
-    needs: [setup, pr-test]
+    needs: [setup, pr-test, pick-tts-model]
     if: >-
       always() && !cancelled() &&
-      needs.setup.result == 'success'
+      needs.setup.result == 'success' &&
+      needs.pick-tts-model.result == 'success'
     uses: ./.github/workflows/test-tts-ci.yaml
+    with:
+      tts_ci_model: ${{ needs.pick-tts-model.outputs.tts_ci_model }}
     secrets: inherit
 
   qwen3-omni-ci:

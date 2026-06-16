@@ -13,6 +13,7 @@ from sglang_omni.config.placement import build_stage_placement_plan
 from sglang_omni.models.moss_tts_local.config import (
     MossTTSLocalColocatedPipelineConfig,
     MossTTSLocalPipelineConfig,
+    MossTTSLocalSplitPipelineConfig,
 )
 from sglang_omni.models.moss_tts_local.local_transformer import (
     MossTTSLocalTransformer,
@@ -174,14 +175,18 @@ def test_pipeline_stage_wiring():
         assert "moss_tts_local" in stage.factory
     assert stages["preprocessing"].process == "pipeline"
     assert stages["preprocessing"].gpu == 0
-    assert stages["preprocessing"].factory_args["device"] == "cuda:1"
+    assert stages["preprocessing"].factory_args["device"] == "cuda:0"
     assert stages["preprocessing"].factory_args["ref_audio_cache_max_items"] == 8192
     assert config.supports_uploaded_voice_references() is True
     assert stages["tts_engine"].process == "pipeline"
     assert stages["tts_engine"].gpu == 0
+    tts_engine_runtime = stages["tts_engine"].runtime
+    assert tts_engine_runtime.sglang_server_args.mem_fraction_static == pytest.approx(
+        0.85
+    )
     assert stages["vocoder"].process == "pipeline"
     assert stages["vocoder"].gpu == 0
-    assert stages["vocoder"].factory_args["device"] == "cuda:1"
+    assert stages["vocoder"].factory_args["device"] == "cuda:0"
 
     placement = build_stage_placement_plan(config)
     assert placement.stages["tts_engine"].gpu_ids == (0,)
@@ -198,6 +203,12 @@ def test_pipeline_stage_wiring():
         == 8192
     )
     assert colocated_stages["vocoder"].factory_args["device"] == "cuda:0"
+
+    split = MossTTSLocalSplitPipelineConfig(model_path="OpenMOSS-Team/moss-local-test")
+    split_stages = {stage.name: stage for stage in split.stages}
+    assert split_stages["preprocessing"].factory_args["device"] == "cuda:1"
+    assert split_stages["tts_engine"].factory_args["gpu_id"] == 0
+    assert split_stages["vocoder"].factory_args["device"] == "cuda:1"
 
 
 def test_special_token_defaults_match_v15_checkpoint():
@@ -1589,3 +1600,4 @@ def test_async_decode_cli_accepts_moss_local():
     args = resolve_stage_factory_args(stage, config)
     assert args["enable_async_decode"] is True
     assert args["async_decode_min_batch_size"] == 4
+    assert args["server_args_overrides"]["mem_fraction_static"] == pytest.approx(0.85)
