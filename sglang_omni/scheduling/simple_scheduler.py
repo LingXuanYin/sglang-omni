@@ -2,7 +2,7 @@
 """SimpleScheduler — lightweight scheduler for non-AR stages.
 
 For stages that just run a function (preprocessing, encoders, decode, code2wav).
-No KV cache, no batching. Just: inbox.get() → run function → outbox.put().
+No KV cache. Just: inbox.get() → run function or batch function → outbox.put().
 
 Same inbox/outbox interface as OmniScheduler so Stage doesn't need branching.
 """
@@ -23,11 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 class SimpleScheduler:
-    """Process requests one at a time via a callable.
+    """Process simple ``new_request`` messages via a callable.
 
-    Supports sync and async callables for ``new_request`` messages only.
-    Streaming stages should provide a dedicated scheduler implementation
-    (for example ``Code2WavScheduler``) rather than rely on SimpleScheduler.
+    Supports sync and async callables, optional batching, and optional
+    concurrent dispatch. Streaming stages should provide a dedicated scheduler
+    implementation rather than rely on SimpleScheduler.
     """
 
     def __init__(
@@ -54,15 +54,10 @@ class SimpleScheduler:
             max(int(max_batch_cost), 0) if max_batch_cost is not None else None
         )
         # Note (Chenchen, Chenyang):
-        # max_concurrency > 1 spawns N worker coroutines that dispatch compute_fn
-        # via asyncio.to_thread so synchronous chunks do not pin the event loop.
-        # Requires compute_fn to be re-entrant. Mutually exclusive with the
-        # batch_compute_fn path (set one or the other, not both).
+        # max_concurrency > 1 dispatches compute_fn / batch_compute_fn via
+        # asyncio.to_thread so synchronous chunks do not pin the event loop.
+        # Requires compute_fn / batch_compute_fn to be re-entrant when enabled.
         self._max_concurrency = max(int(max_concurrency), 1)
-        if self._max_concurrency > 1 and batch_compute_fn is not None:
-            raise ValueError(
-                "max_concurrency > 1 and batch_compute_fn are mutually exclusive"
-            )
         self._abort_callback = abort_callback
         self._aborted: set[str] = set()
         self._abort_lock = threading.Lock()
@@ -197,11 +192,24 @@ class SimpleScheduler:
     async def _await_result(result: Awaitable[Any]) -> Any:
         return await result
 
-    def _run_compute_in_thread(self, payload: Any) -> Any:
-        result = self._fn(payload)
+    def _resolve_thread_result(self, result: Any) -> Any:
         if inspect.isawaitable(result):
-            result = asyncio.run(self._await_result(result))
+            return asyncio.run(self._await_result(result))
         return result
+
+    def _run_compute_in_thread(self, payload: Any) -> Any:
+        return self._resolve_thread_result(self._fn(payload))
+
+    def _run_batch_compute_in_thread(self, payloads: list[Any]) -> list[Any]:
+        if self._batch_fn is None or len(payloads) <= 1:
+            return [self._run_compute_in_thread(payload) for payload in payloads]
+
+        results = self._resolve_thread_result(self._batch_fn(payloads))
+        if len(results) != len(payloads):
+            raise ValueError(
+                f"batch_compute_fn returned {len(results)} results for {len(payloads)} requests"
+            )
+        return results
 
     def start(self) -> None:
         """Run the processing loop (blocks the thread)."""
@@ -250,6 +258,8 @@ class SimpleScheduler:
 
     async def _run_workers(self, loop: asyncio.AbstractEventLoop) -> None:
         async_inbox: asyncio.Queue[IncomingMessage] = asyncio.Queue()
+        in_flight: set[asyncio.Task] = set()
+        concurrency_limit = asyncio.Semaphore(self._max_concurrency)
 
         async def bridge_inbox() -> None:
             while self._running:
@@ -261,7 +271,69 @@ class SimpleScheduler:
                     continue
                 await async_inbox.put(msg)
 
-        async def worker() -> None:
+        async def collect_batch(first_msg: IncomingMessage) -> list[IncomingMessage]:
+            batch = [first_msg]
+            if self._batch_fn is None or self._max_batch_size <= 1:
+                return batch
+
+            batch_cost = self._message_cost(first_msg)
+            deadline = time.monotonic() + self._max_batch_wait_s
+            while len(batch) < self._max_batch_size:
+                try:
+                    msg = async_inbox.get_nowait()
+                except asyncio.QueueEmpty:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        msg = await asyncio.wait_for(
+                            async_inbox.get(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        break
+
+                if msg.type != "new_request":
+                    continue
+                if self._max_batch_cost is not None:
+                    try:
+                        msg_cost = self._message_cost(msg)
+                    except Exception as exc:
+                        self._emit_error(msg.request_id, exc, self.outbox)
+                        continue
+                    if batch and batch_cost + msg_cost > self._max_batch_cost:
+                        async_inbox.put_nowait(msg)
+                        break
+                    batch_cost += msg_cost
+                batch.append(msg)
+            return batch
+
+        async def run_batch(batch: list[IncomingMessage]) -> None:
+            async with concurrency_limit:
+                active = [
+                    msg for msg in batch if not self._consume_if_aborted(msg.request_id)
+                ]
+                if not active:
+                    return
+                try:
+                    results = await asyncio.to_thread(
+                        self._run_batch_compute_in_thread,
+                        [msg.data for msg in active],
+                    )
+                    for msg, result in zip(active, results):
+                        if self._consume_if_aborted(msg.request_id):
+                            continue
+                        self._emit_result(msg.request_id, result, self.outbox)
+                except Exception as exc:
+                    for msg in active:
+                        if self._consume_if_aborted(msg.request_id):
+                            continue
+                        logger.exception(
+                            "SimpleScheduler: compute_fn failed for %s",
+                            msg.request_id,
+                        )
+                        self._emit_error(msg.request_id, exc, self.outbox)
+
+        async def dispatcher() -> None:
             while self._running:
                 try:
                     msg = await asyncio.wait_for(async_inbox.get(), timeout=0.1)
@@ -272,12 +344,7 @@ class SimpleScheduler:
                 if self._consume_if_aborted(msg.request_id):
                     continue
                 try:
-                    result = await asyncio.to_thread(
-                        self._run_compute_in_thread, msg.data
-                    )
-                    if self._consume_if_aborted(msg.request_id):
-                        continue
-                    self._emit_result(msg.request_id, result, self.outbox)
+                    batch = await collect_batch(msg)
                 except Exception as exc:
                     if self._consume_if_aborted(msg.request_id):
                         continue
@@ -285,16 +352,22 @@ class SimpleScheduler:
                         "SimpleScheduler: compute_fn failed for %s", msg.request_id
                     )
                     self._emit_error(msg.request_id, exc, self.outbox)
+                    continue
+
+                task = asyncio.create_task(run_batch(batch))
+                in_flight.add(task)
+                task.add_done_callback(in_flight.discard)
 
         bridge_task = asyncio.create_task(bridge_inbox())
-        worker_tasks = [
-            asyncio.create_task(worker()) for _ in range(self._max_concurrency)
-        ]
+        dispatcher_task = asyncio.create_task(dispatcher())
         try:
-            await asyncio.gather(bridge_task, *worker_tasks)
+            await asyncio.gather(bridge_task, dispatcher_task)
         except asyncio.CancelledError:
             # Expected during shutdown/task cancellation; suppress intentionally.
             logger.debug("SimpleScheduler: _run_workers cancelled during shutdown")
+        finally:
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
 
     def stop(self) -> None:
         self._running = False

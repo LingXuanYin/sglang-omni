@@ -17,6 +17,9 @@ from sglang_omni.models.fishaudio_s2_pro.request_builders import (
     make_tts_scheduler_adapters,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
+from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
+from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +53,6 @@ def _compile_s2pro_codebook_decoder(model: Any, *, max_batch_size: int) -> None:
     )
 
 
-def _resolve_checkpoint(checkpoint: str) -> str:
-    if os.path.isdir(checkpoint):
-        return checkpoint
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(checkpoint)
-
-
 def _load_codec(checkpoint_dir: str, device: str):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -81,12 +76,11 @@ def _load_codec(checkpoint_dir: str, device: str):
 
 
 def load_state(payload: StagePayload) -> S2ProState:
-    return S2ProState.from_dict(payload.data)
+    return _load_pipeline_state(payload, S2ProState)
 
 
 def store_state(payload: StagePayload, state: S2ProState) -> StagePayload:
-    payload.data = state.to_dict()
-    return payload
+    return _store_pipeline_state(payload, state)
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from sglang_omni.models.tts_streaming import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -196,7 +197,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             "modality": "audio",
             "sample_rate": self._sample_rate,
         }
-        usage = self._build_usage(HiggsTtsState.from_dict(payload.data))
+        usage = build_usage(HiggsTtsState.from_dict(payload.data))
         if usage is not None:
             final_data["usage"] = usage
         messages.append(
@@ -482,7 +483,7 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             modality="audio",
             source_hint="Higgs TTS vocoder",
         )
-        usage = self._build_usage(state)
+        usage = build_usage(state)
         if usage is not None:
             data["usage"] = usage
         payload.data = data
@@ -520,19 +521,6 @@ class HiggsStreamingVocoderScheduler(StreamingSimpleScheduler):
             codes_TN >= codec_vocab, torch.zeros_like(codes_TN), codes_TN
         )
         return self._codec.decode(codes_TN).detach().to(torch.float32)
-
-    @staticmethod
-    def _build_usage(state: HiggsTtsState) -> dict[str, Any] | None:
-        if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
-            return None
-        usage: dict[str, Any] = {
-            "prompt_tokens": state.prompt_tokens,
-            "completion_tokens": state.completion_tokens,
-            "total_tokens": state.prompt_tokens + state.completion_tokens,
-        }
-        if state.engine_time_s:
-            usage["engine_time_s"] = round(state.engine_time_s, 6)
-        return usage
 
     @staticmethod
     def _resolve_samples_per_frame(codec: HiggsAudioCodec) -> int | None:

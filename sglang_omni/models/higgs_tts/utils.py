@@ -17,12 +17,12 @@ from typing import Any
 
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 
 from sglang_omni.models.higgs_tts.audio_codec import HiggsAudioCodec
 from sglang_omni.preprocessing.audio import AudioMediaIO
 from sglang_omni.preprocessing.base import _is_url
 from sglang_omni.preprocessing.resource_connector import global_http_connection
+from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 # Codec-vocab specials (inside the [N*V] codebook space, NOT the text vocab).
 BOC_ID = 1024
@@ -77,13 +77,6 @@ def truncate_rope_to_bf16(model: torch.nn.Module) -> None:
             cache = module.cos_sin_cache
             truncated = cache.to(torch.bfloat16).to(cache.dtype)
             cache.copy_(truncated)
-
-
-def resolve_checkpoint(checkpoint: str) -> str:
-    """Local dir or HF repo id → local snapshot path."""
-    if Path(checkpoint).is_dir():
-        return checkpoint
-    return snapshot_download(checkpoint)
 
 
 def get_or_load_codec(path: str, device: str, dtype: str) -> HiggsAudioCodec:

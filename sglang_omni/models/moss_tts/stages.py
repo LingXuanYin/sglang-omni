@@ -23,8 +23,12 @@ from sglang_omni.models.moss_tts.request_builders import (
     set_moss_tts_preprocessing_context,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.pipeline_state import build_usage
+from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
+from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
+from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
@@ -36,20 +40,11 @@ _MOSS_TTS_INSTALL_HINT = (
 
 
 def load_state(payload: StagePayload) -> MossTTSState:
-    return MossTTSState.from_dict(payload.data)
+    return _load_pipeline_state(payload, MossTTSState)
 
 
 def store_state(payload: StagePayload, state: MossTTSState) -> StagePayload:
-    payload.data = state.to_dict()
-    return payload
-
-
-def _resolve_checkpoint(checkpoint: str) -> str:
-    if os.path.isdir(checkpoint):
-        return checkpoint
-    from huggingface_hub import snapshot_download
-
-    return snapshot_download(checkpoint)
+    return _store_pipeline_state(payload, state)
 
 
 def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
@@ -169,19 +164,6 @@ def _load_moss_processor(
                 kwargs["dtype"] = _torch_dtype(dtype)
             audio_tokenizer.to(**kwargs)
     return processor
-
-
-def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
-    if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
-        return None
-    usage = {
-        "prompt_tokens": int(state.prompt_tokens),
-        "completion_tokens": int(state.completion_tokens),
-        "total_tokens": int(state.prompt_tokens + state.completion_tokens),
-    }
-    if state.engine_time_s:
-        usage["engine_time_s"] = round(float(state.engine_time_s), 6)
-    return usage
 
 
 def create_preprocessing_executor(
@@ -373,7 +355,7 @@ def create_vocoder_executor(
         payload.data.update(audio_payload)
         payload.data["sample_rate"] = state.sample_rate
         payload.data["modality"] = "audio"
-        usage = _build_usage(state)
+        usage = build_usage(state)
         if usage is not None:
             payload.data["usage"] = usage
         return payload

@@ -30,6 +30,7 @@ from sglang_omni.models.tts_streaming import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.messages import OutgoingMessage
+from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 from sglang_omni.utils.audio_payload import audio_waveform_payload
 
@@ -48,19 +49,6 @@ def _resolve_sample_rate(processor: Any) -> int:
         )
         or 48000
     )
-
-
-def _build_usage(state: MossTTSLocalState) -> dict[str, Any] | None:
-    if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
-        return None
-    usage = {
-        "prompt_tokens": int(state.prompt_tokens),
-        "completion_tokens": int(state.completion_tokens),
-        "total_tokens": int(state.prompt_tokens + state.completion_tokens),
-    }
-    if state.engine_time_s:
-        usage["engine_time_s"] = round(float(state.engine_time_s), 6)
-    return usage
 
 
 class _CodecStreamSession:
@@ -367,7 +355,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
             "modality": "audio",
             "sample_rate": self._sample_rate,
         }
-        usage = _build_usage(MossTTSLocalState.from_dict(payload.data))
+        usage = build_usage(MossTTSLocalState.from_dict(payload.data))
         if usage is not None:
             final_data["usage"] = usage
         messages.append(
@@ -586,7 +574,7 @@ class MossTTSLocalStreamingVocoderScheduler(StreamingSimpleScheduler):
         payload.data.update(audio_payload)
         payload.data["sample_rate"] = state.sample_rate
         payload.data["modality"] = "audio"
-        usage = _build_usage(state)
+        usage = build_usage(state)
         if usage is not None:
             payload.data["usage"] = usage
         return payload
