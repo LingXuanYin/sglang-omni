@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.sampling.seed import resolve_row_seed
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -545,6 +546,7 @@ class ModelRunner:
     ) -> Any:
         self._apply_repetition_penalty(logits_output, requests)
         self._apply_codec_suppress_tokens(logits_output, requests)
+        self._install_sampling_seeds(forward_batch, requests)
         wants_rollout_logprob = any(sr.data.return_logprob for sr in requests)
         if wants_rollout_logprob:
             self._enable_sampler_logprobs(forward_batch, len(requests))
@@ -570,6 +572,23 @@ class ModelRunner:
                 requests,
             )
         return next_token_ids
+
+    def _install_sampling_seeds(self, forward_batch: Any, requests: list) -> None:
+        """Install per-row ``seed``s onto ``sampling_info`` so SGLang routes to
+        ``multinomial_with_seed``. No-op when no request set a seed, or when a
+        subclass already installed its own (e.g. Qwen3-TTS).
+        """
+        sampling_info = forward_batch.sampling_info
+        if sampling_info.sampling_seed is not None:
+            return
+        public_seeds = [sr.data.req.sampling_params.sampling_seed for sr in requests]
+        if all(seed is None for seed in public_seeds):
+            return
+        sampling_info.sampling_seed = torch.tensor(
+            [resolve_row_seed(seed) for seed in public_seeds],
+            dtype=torch.long,
+            device=sampling_info.device,
+        )
 
     @staticmethod
     def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:

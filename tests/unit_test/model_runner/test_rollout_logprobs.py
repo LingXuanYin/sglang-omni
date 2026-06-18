@@ -143,9 +143,12 @@ def test_sample_next_token_ids_requires_sampler_logprobs_when_requested() -> Non
             sample=lambda _logits_output, _forward_batch: torch.tensor([44])
         )
     )
-    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[])
+    req = SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=None))
+    data = SimpleNamespace(return_logprob=True, output_token_logprobs=[], req=req)
     request = SimpleNamespace(data=data)
-    forward_batch = SimpleNamespace()
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(device="cpu", sampling_seed=None)
+    )
     logits_output = SimpleNamespace()
 
     with pytest.raises(RuntimeError, match="next_token_logprobs"):
