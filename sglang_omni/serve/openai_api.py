@@ -420,8 +420,7 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
             )
         )
 
-    @app.post("/update_weights_from_disk", dependencies=[Depends(_auth)])
-    async def update_weights_from_disk(
+    async def _update_weights_from_disk_response(
         req: UpdateWeightFromDiskRequest,
     ) -> JSONResponse:
         client: Client = app.state.client
@@ -433,6 +432,16 @@ def _register_admin(app: FastAPI, admin_api_key: str | None = None) -> None:
                 timeout_s=_timeout_or_default(req.timeout_s, 120.0),
             )
         )
+
+    @app.post("/update_weights_from_disk", dependencies=[Depends(_auth)])
+    async def update_weights_from_disk(
+        req: UpdateWeightFromDiskRequest,
+    ) -> JSONResponse:
+        return await _update_weights_from_disk_response(req)
+
+    @app.post("/refit", dependencies=[Depends(_auth)])
+    async def refit(req: UpdateWeightFromDiskRequest) -> JSONResponse:
+        return await _update_weights_from_disk_response(req)
 
     @app.post("/update_weights_from_tensor", dependencies=[Depends(_auth)])
     async def update_weights_from_tensor(

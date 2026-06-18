@@ -1753,6 +1753,7 @@ _ROUTER_ADMIN_PATHS = [
     ("POST", "/model_info"),
     ("POST", "/pause_generation"),
     ("POST", "/continue_generation"),
+    ("POST", "/refit"),
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
     ("POST", "/update_weights_from_distributed"),
@@ -1876,6 +1877,57 @@ def test_router_unimplemented_tensor_weight_update_returns_501() -> None:
         resp = client.post("/update_weights_from_tensor", json={})
     assert resp.status_code == 501
     assert resp.json()["error"]["code"] == "not_implemented"
+
+
+def test_router_refit_broadcasts_with_worker_isolation() -> None:
+    seen_paths: list[str] = []
+    disabled_during_refit: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        seen_paths.append(request.url.path)
+        disabled_during_refit.append(app.state.workers[0].disabled)
+        if request.url.path == "/refit":
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "message": "ok",
+                    "results": [
+                        {
+                            "stage": "decode",
+                            "success": True,
+                            "data": {
+                                "model_path": "/tmp/base-model",
+                                "weight_version": "base-v1",
+                            },
+                        }
+                    ],
+                },
+                request=request,
+            )
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        _router_config(worker_configs=[WorkerConfig(url="http://worker-a:8101")]),
+        client=async_client,
+    )
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/refit",
+            json={"model_path": "/tmp/base-model", "weight_version": "base-v1"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["path"] == "/refit"
+    assert seen_paths == ["/refit"]
+    assert disabled_during_refit == [True]
+    assert app.state.workers[0].disabled is False
 
 
 @pytest.mark.parametrize(

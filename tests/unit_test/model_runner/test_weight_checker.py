@@ -124,6 +124,71 @@ def test_model_worker_update_weights_from_disk_updates_visible_model_info() -> N
     assert runner.model_config.model_path == "/tmp/new-model"
 
 
+def test_disk_refit_replaces_instruct_weights_with_base_sha256() -> None:
+    instruct_model = torch.nn.Sequential(
+        torch.nn.Linear(3, 4, bias=False),
+        torch.nn.Linear(4, 2, bias=False),
+    )
+    base_model = torch.nn.Sequential(
+        torch.nn.Linear(3, 4, bias=False),
+        torch.nn.Linear(4, 2, bias=False),
+    )
+    with torch.no_grad():
+        for tensor in instruct_model.parameters():
+            tensor.fill_(0.25)
+        for tensor in base_model.parameters():
+            tensor.fill_(1.5)
+
+    def checksum(model: torch.nn.Module) -> str:
+        return StrictWeightChecker(SimpleNamespace(model=model)).run("checksum")[
+            "per_gpu_checksum"
+        ]
+
+    base_checksum = checksum(base_model)
+    assert checksum(instruct_model) != base_checksum
+
+    def update_weights_from_disk(
+        model_path: str,
+        load_format: str | None,
+        *,
+        recapture_cuda_graph: bool,
+    ) -> tuple[bool, str]:
+        assert model_path == "/tmp/base-model"
+        assert load_format == "safetensors"
+        assert recapture_cuda_graph is False
+        instruct_model.load_state_dict(base_model.state_dict())
+        return True, "refit complete"
+
+    runner = SimpleNamespace(
+        model=instruct_model,
+        server_args=SimpleNamespace(model_path="/tmp/instruct-model"),
+        model_config=SimpleNamespace(model_path="/tmp/instruct-model"),
+        update_weights_from_disk=update_weights_from_disk,
+    )
+    worker = object.__new__(ModelWorker)
+    worker.server_args = SimpleNamespace(
+        model_path="/tmp/instruct-model",
+        load_format="auto",
+        weight_version="instruct",
+    )
+    worker.model_runner = runner
+
+    success, message = ModelWorker.update_weights_from_disk(
+        worker,
+        {
+            "model_path": "/tmp/base-model",
+            "load_format": "safetensors",
+            "weight_version": "base-v1",
+        },
+    )
+
+    assert success is True
+    assert message == "refit complete"
+    assert checksum(instruct_model) == base_checksum
+    assert worker.server_args.model_path == "/tmp/base-model"
+    assert worker.server_args.weight_version == "base-v1"
+
+
 def test_model_worker_init_weights_update_group_passes_positional_args() -> None:
     calls: list[tuple[Any, ...]] = []
 

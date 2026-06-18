@@ -31,6 +31,7 @@ The worker server supports:
 - `GET|POST /model_info`
 - `POST /pause_generation`
 - `POST /continue_generation`
+- `POST /refit`
 - `POST /update_weights_from_disk`
 - `POST /update_weights_from_tensor`
 - `POST /init_weights_update_group`
@@ -38,6 +39,8 @@ The worker server supports:
 - `POST /update_weights_from_distributed`
 - `GET|POST /weights_checker`
 
+`/refit` is a Miles/UniRL-friendly alias for the from-disk refit path and has
+the same request and response contract as `/update_weights_from_disk`.
 `/update_weights_from_disk` is the primary implemented update path. It pauses
 the target scheduler, optionally aborts active requests, calls the underlying
 SGLang model runner update method, optionally flushes cache, and resumes unless
@@ -85,6 +88,10 @@ indefinitely. If distributed group initialization fails or times out, the target
 worker remains disabled until an operator explicitly re-enables it after
 recovery.
 
+The router exposes `POST /refit` with the same disk-refit body. It broadcasts the
+request to worker `POST /refit` routes, disables target workers while the update
+is in flight, and serializes it through the same admin update lock.
+
 ## Weight Checker
 
 `/weights_checker` supports `snapshot`, `reset_tensors`, `compare`, and
@@ -92,3 +99,23 @@ recovery.
 name, dtype, shape, and raw bytes, then derives a per-rank checksum from the
 sorted tensor digests. Full-model SHA256 checks block inference on that worker
 until the digest completes.
+
+## Refit Validation
+
+Use the focused unit tests for CPU-safe contract checks:
+
+```bash
+pytest tests/unit_test/model_runner/test_weight_checker.py -q
+pytest tests/unit_test/serve/test_openai_api.py -q
+pytest tests/unit_test/router/test_app.py -q
+```
+
+Use the GPU end-to-end test to measure refit efficiency on the production path:
+
+```bash
+pytest tests/test_model/test_rl_distributed_weight_update.py -s
+```
+
+The E2E test launches an instruct server, refits it to a base checkpoint over the
+distributed refit path, prints the measured update latency, and compares SHA256
+digests against a reference base-loaded server.

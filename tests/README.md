@@ -190,9 +190,11 @@ Relevant model CI ownership:
 - `test_rl_distributed_weight_update.py`: launches a Higgs TTS worker on one GPU
   and a rank-0 trainer subprocess on another GPU, initializes the distributed
   weight-update group, broadcasts base-model body weights, verifies the
-  `tts_engine` checksum changes, destroys the update group, and checks the
-  server still serves audio. It is skipped unless two GPUs and the required
-  Higgs base checkpoint are already available in the Hugging Face cache.
+  `tts_engine` checksum changes against a base-loaded reference, prints measured
+  refit latency for efficiency tracking, destroys the update group, and checks
+  the server still serves audio. It is skipped unless two GPUs and the required
+  Higgs base/instruct checkpoints are already available in the Hugging Face
+  cache.
 - CLI flags `--s2pro-stage {nonstream,stream,consistency,all}` and
   `--concurrency {1,2,4,8,16,all}`: scope an S2-Pro CI sweep without editing
   source.
@@ -355,10 +357,12 @@ that happened to contain an older version of the test.
   - worker metadata and health-state contracts
   - request routing, proxying, and streaming relay
   - worker selection policy behavior
+  - RL admin/refit broadcast and worker-isolation behavior
   - managed launcher command construction and cleanup.
 
 - `unit_test/serve/`: In-process serving API unit tests:
   - OpenAI-compatible request/response behavior
+  - RL admin/refit request validation and client forwarding
   - streaming response framing and failure semantics.
 
 - `unit_test/fishaudio_s2_pro/`: FishAudio S2-Pro unit tests:

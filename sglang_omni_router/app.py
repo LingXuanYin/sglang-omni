@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _ADMIN_UPDATE_PATHS = {
     "/pause_generation",
+    "/refit",
     "/update_weights_from_disk",
     "/update_weights_from_distributed",
     "/init_weights_update_group",
@@ -332,6 +333,10 @@ def register_routes(
             request,
             "/update_weights_from_disk",
         )
+
+    @app.post("/refit", dependencies=[Depends(_auth)])
+    async def refit(request: Request) -> JSONResponse:
+        return await _broadcast_admin_request(app, request, "/refit")
 
     @app.post("/update_weights_from_tensor", dependencies=[Depends(_auth)])
     async def update_weights_from_tensor(request: Request) -> JSONResponse:

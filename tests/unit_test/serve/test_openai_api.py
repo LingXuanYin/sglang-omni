@@ -507,6 +507,14 @@ def test_admin_routes_forward_to_client() -> None:
             "abort_all_requests": True,
         },
     )
+    refit = client.post(
+        "/refit",
+        json={
+            "model_path": "/tmp/base-model",
+            "weight_version": "base-v1",
+            "timeout_s": 7,
+        },
+    )
     checksum = client.post("/weights_checker", json={"action": "checksum"})
 
     assert info.status_code == 200
@@ -516,6 +524,7 @@ def test_admin_routes_forward_to_client() -> None:
     assert info.json()["stages"][0]["stage"] == "decode"
     assert pause.status_code == 200
     assert update.status_code == 200
+    assert refit.status_code == 200
     assert checksum.status_code == 200
     assert admin.calls == [
         ("model_info", {}, None, 30.0),
@@ -536,6 +545,22 @@ def test_admin_routes_forward_to_client() -> None:
             },
             None,
             120.0,
+        ),
+        (
+            "update_weights_from_disk",
+            {
+                "model_path": "/tmp/base-model",
+                "abort_all_requests": False,
+                "weight_version": "base-v1",
+                "is_async": False,
+                "torch_empty_cache": False,
+                "keep_pause": False,
+                "recapture_cuda_graph": False,
+                "token_step": 0,
+                "flush_cache": True,
+            },
+            None,
+            7,
         ),
         ("weights_checker", {"action": "checksum"}, None, 120.0),
     ]
@@ -839,6 +864,7 @@ _ADMIN_PATHS_THAT_NEED_AUTH = [
     ("POST", "/model_info"),
     ("POST", "/pause_generation"),
     ("POST", "/continue_generation"),
+    ("POST", "/refit"),
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
     ("POST", "/update_weights_from_distributed"),
@@ -943,6 +969,16 @@ def test_unimplemented_tensor_weight_update_returns_501() -> None:
     assert resp.status_code == 501
     assert resp.json()["error"]["code"] == "not_implemented"
     assert "update_weights_from_disk" in resp.json()["error"]["message"]
+
+
+def test_refit_requires_model_path() -> None:
+    admin = AdminClient()
+    client = TestClient(create_app(admin, model_name="qwen3-omni"))
+
+    resp = client.post("/refit", json={})
+
+    assert resp.status_code == 422
+    assert admin.calls == []
 
 
 def test_distributed_weight_update_routes_forward_to_client() -> None:
