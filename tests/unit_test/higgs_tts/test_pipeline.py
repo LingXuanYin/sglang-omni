@@ -565,6 +565,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
         _cg_active_eoc_countdown=torch.tensor([0], dtype=torch.int32),
         _cg_active_generation_done=torch.tensor([True]),
         _cg_active_last_codes=torch.tensor([[1, 2, 3]]),
+        _cg_active_step_count=torch.zeros(1, dtype=torch.long),
         _cg_was_done=torch.tensor([False]),
         _cg_codes_BN=torch.tensor([[EOC_ID, 1, 2]]),
         _cg_collect_staging=torch.zeros((1, 3 + 2), dtype=torch.long),
@@ -573,6 +574,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             eoc_countdown=torch.zeros(1, dtype=torch.int32),
             generation_done=torch.zeros(1, dtype=torch.bool),
             last_codes=torch.zeros((1, 3), dtype=torch.long),
+            step_count=torch.zeros(1, dtype=torch.long),
         ),
     )
     req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
@@ -609,6 +611,7 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
         # row1's True must NOT leak into the was-done (skipped) request.
         _cg_active_generation_done=torch.tensor([False, True, False, True]),
         _cg_active_last_codes=torch.zeros((n, k), dtype=torch.long),
+        _cg_active_step_count=torch.zeros(n, dtype=torch.long),
         _cg_was_done=torch.tensor([False, True, False, False]),
         _cg_codes_BN=torch.tensor([[1, 1, 1], [7, 8, 9], [20, 1, 2], [EOC_ID, 3, 4]]),
         _cg_collect_staging=torch.zeros((n, k + 2), dtype=torch.long),
@@ -616,6 +619,7 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
             delay_count=torch.zeros(n, dtype=torch.int32),
             eoc_countdown=torch.zeros(n, dtype=torch.int32),
             generation_done=torch.zeros(n, dtype=torch.bool),
+            step_count=torch.zeros(n, dtype=torch.long),
             last_codes=torch.zeros((n, k), dtype=torch.long),
         ),
     )

@@ -40,6 +40,10 @@ class HiggsTTSModelRunner(ModelRunner):
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         forward_batch.req_ids = [req.request_id for req in requests]
+        for req in requests:
+            self.model.set_request_seed(
+                req.request_id, req.data.req.sampling_params.sampling_seed
+            )
         forward_batch.input_embeds = self._build_prefill_input_embeds(
             forward_batch, requests
         )
@@ -180,6 +184,8 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_eoc_countdown[:bs] = pool.eoc_countdown[rows_t]
         model._cg_active_generation_done[:bs] = pool.generation_done[rows_t]
         model._cg_active_last_codes[:bs] = pool.last_codes[rows_t]
+        model._cg_active_seeds[:bs] = pool.seeds[rows_t]
+        model._cg_active_step_count[:bs] = pool.step_count[rows_t]
 
     @staticmethod
     def _extract_decode_sampling_params(forward_batch, n_real: int):
@@ -246,6 +252,7 @@ class HiggsTTSModelRunner(ModelRunner):
         pool.eoc_countdown[rows_t] = model._cg_active_eoc_countdown[:n_real]
         pool.generation_done[rows_t] = model._cg_active_generation_done[:n_real]
         pool.last_codes[rows_t] = model._cg_active_last_codes[:n_real]
+        pool.step_count[rows_t] = model._cg_active_step_count[:n_real]
 
         # Note(Jiaxin): pack the 3 tensors so a single D2H pulls them all back.
         num_codebooks = model._cg_codes_BN.shape[1]
