@@ -196,6 +196,7 @@ def create_preprocessing_executor(
             top_p=params.get("top_p", 0.8),
             top_k=params.get("top_k", 30),
             repetition_penalty=params.get("repetition_penalty", 1.1),
+            seed=params.get("seed"),
         )
         return store_state(payload, state)
 

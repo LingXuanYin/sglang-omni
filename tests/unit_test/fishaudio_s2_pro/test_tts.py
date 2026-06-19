@@ -315,6 +315,8 @@ def test_fish_s2pro_before_decode_uses_gpu_history_buffer() -> None:
         _sampling_top_p=torch.zeros(1),
         _sampling_top_k=torch.zeros(1, dtype=torch.long),
         _sampling_rep_penalty=torch.zeros(1),
+        _sampling_seeds=torch.full((1,), -1, dtype=torch.long),
+        _step_count=torch.zeros(1, dtype=torch.long),
         _ras_temperature=torch.zeros(1),
         _ras_top_p=torch.zeros(1),
         _prev_tokens=torch.zeros(1, 4, dtype=torch.long),
@@ -383,6 +385,8 @@ def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
         _sampling_top_p=torch.zeros(2),
         _sampling_top_k=torch.zeros(2, dtype=torch.long),
         _sampling_rep_penalty=torch.zeros(2),
+        _sampling_seeds=torch.full((2,), -1, dtype=torch.long),
+        _step_count=torch.zeros(2, dtype=torch.long),
         _ras_temperature=torch.zeros(2),
         _ras_top_p=torch.zeros(2),
         _prev_tokens=torch.full((2, 4), 999, dtype=torch.long),
@@ -461,7 +465,19 @@ def test_fish_s2pro_setup_vq_decode_allocates_sampling_state() -> None:
     assert model._vq_ready
 
 
-def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding() -> None:
+def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding(
+    monkeypatch,
+) -> None:
+    # multinomial_with_seed is a GPU-only Triton kernel; this CPU test only
+    # exercises EOS handling, and all rows are unseeded, so stub it out.
+    import sglang_omni.models.fishaudio_s2_pro.sglang_model as _m
+
+    monkeypatch.setattr(
+        _m,
+        "multinomial_with_seed",
+        lambda probs, seeds, pos: probs.argmax(-1, keepdim=True),
+    )
+
     class _AudioDecoder:
         def __init__(self) -> None:
             self.seen_embedding_ids: list[torch.Tensor] = []
@@ -497,6 +513,8 @@ def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding() -> None:
         _ras_top_p=torch.ones(1),
         _sampling_top_p=torch.ones(1),
         _sampling_rep_penalty=torch.ones(1),
+        _sampling_seeds=torch.full((1,), -1, dtype=torch.long),
+        _step_count=torch.zeros(1, dtype=torch.long),
         _rep_positions=torch.arange(4),
         _graph_top_k=30,
         _sampling_top_k=torch.full((1,), 30, dtype=torch.long),
