@@ -34,12 +34,17 @@ def _patch_thinker_startup(monkeypatch) -> list[dict[str, object]]:
     def _fake_server_args_builder(model_path, context_length, **overrides):
         assert model_path == "dummy"
         assert context_length == 8192
-        return SimpleNamespace(mem_fraction_static=overrides["mem_fraction_static"])
+        assert overrides["sampling_backend"] == "pytorch"
+        return SimpleNamespace(
+            mem_fraction_static=overrides["mem_fraction_static"],
+            sampling_backend=overrides["sampling_backend"],
+        )
 
     def _fake_create_thinker_scheduler(server_args, gpu_id, **kwargs):
         scheduler_calls.append(
             {
                 "mem_fraction_static": server_args.mem_fraction_static,
+                "sampling_backend": server_args.sampling_backend,
                 "gpu_id": gpu_id,
                 "total_gpu_memory_fraction": kwargs["total_gpu_memory_fraction"],
             }
@@ -202,6 +207,7 @@ def test_qwen_colocated_thinker_startup_threads_effective_budget(
     assert scheduler_calls == [
         {
             "mem_fraction_static": 0.70,
+            "sampling_backend": "pytorch",
             "gpu_id": 0,
             "total_gpu_memory_fraction": 0.70,
         }
@@ -227,6 +233,7 @@ def test_qwen_colocated_thinker_explicit_mem_fraction_skips_default_reserve(
     assert scheduler_calls == [
         {
             "mem_fraction_static": 0.75,
+            "sampling_backend": "pytorch",
             "gpu_id": 0,
             "total_gpu_memory_fraction": 0.75,
         }

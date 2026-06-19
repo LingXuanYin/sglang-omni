@@ -588,6 +588,7 @@ def test_ming_thinker_factory_registers_hf_config_before_server_args(
 
     assert call_order == ["register", "build_server_args", "create_scheduler"]
     assert captured_server_args_kwargs["trust_remote_code"] is False
+    assert captured_server_args_kwargs["sampling_backend"] == "pytorch"
 
 
 def test_ming_arch_override_uses_composite_llm_config() -> None:

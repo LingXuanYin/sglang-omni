@@ -472,11 +472,13 @@ def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding(
     # exercises EOS handling, and all rows are unseeded, so stub it out.
     import sglang_omni.models.fishaudio_s2_pro.sglang_model as _m
 
-    monkeypatch.setattr(
-        _m,
-        "multinomial_with_seed",
-        lambda probs, seeds, pos: probs.argmax(-1, keepdim=True),
-    )
+    def _fake_multinomial_with_seed(logprobs, seeds, pos):
+        del seeds, pos
+        assert torch.all(logprobs <= 0)
+        assert torch.isneginf(logprobs).any()
+        return logprobs.argmax(-1, keepdim=True)
+
+    monkeypatch.setattr(_m, "multinomial_with_seed", _fake_multinomial_with_seed)
 
     class _AudioDecoder:
         def __init__(self) -> None:

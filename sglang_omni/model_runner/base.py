@@ -22,6 +22,15 @@ from sglang_omni.scheduling.types import (
 logger = logging.getLogger(__name__)
 
 
+def _current_sglang_sampling_backend() -> str | None:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().sampling_backend
+    except ValueError:
+        return None
+
+
 @dataclass
 class _PendingStep:
     """One decode step launched on the GPU but not yet consumed on the host.
@@ -585,10 +594,12 @@ class ModelRunner:
         """
         sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_seed is not None:
+            self._validate_seeded_sampling_supported(sampling_info)
             return
         sampling_params = [sr.data.req.sampling_params for sr in requests]
         if all(sp.sampling_seed is None for sp in sampling_params):
             return
+        self._validate_seeded_sampling_supported(sampling_info)
         row_seeds: list[int] = []
         for sp in sampling_params:
             seed = sp.sampling_seed
@@ -599,6 +610,22 @@ class ModelRunner:
         sampling_info.sampling_seed = torch.tensor(
             row_seeds, dtype=torch.long, device=sampling_info.device
         )
+
+    @staticmethod
+    def _validate_seeded_sampling_supported(sampling_info: Any) -> None:
+        if sampling_info.need_min_p_sampling:
+            raise ValueError(
+                "SGLang seeded sampling does not support min_p yet; set min_p=0 "
+                "or omit request seed"
+            )
+        if not (sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling):
+            return
+        if _current_sglang_sampling_backend() == "flashinfer":
+            raise ValueError(
+                "SGLang flashinfer sampling backend does not support request seed "
+                "with top_p/top_k filtering; configure sampling_backend='pytorch' "
+                "or avoid top_p/top_k with seed"
+            )
 
     @staticmethod
     def _enable_sampler_logprobs(forward_batch: Any, batch_size: int) -> None:

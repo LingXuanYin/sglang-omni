@@ -287,7 +287,9 @@ def _sample_independent_batched(
         cb = torch.arange(N, device=logits_BNV.device).view(1, N).expand(B, N)
         positions = (step_B.view(B, 1) * N + cb).reshape(B * N)
         seeds_flat = seeds_B.clamp_min(0).view(B, 1).expand(B, N).reshape(B * N)
-        seeded_flat = multinomial_with_seed(probs, seeds_flat, positions).squeeze(-1)
+        seeded_flat = multinomial_with_seed(
+            torch.log(probs), seeds_flat, positions
+        ).squeeze(-1)
         has_seed = (seeds_B >= 0).view(B, 1).expand(B, N).reshape(B * N)
         codes_flat = torch.where(has_seed, seeded_flat, codes_flat)
     sampled_BN = codes_flat.view(B, N)

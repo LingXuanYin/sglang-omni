@@ -233,6 +233,7 @@ def create_sglang_thinker_executor_from_config(
     register_ming_hf_config()
 
     overrides = dict(server_args_overrides or {})
+    overrides.setdefault("sampling_backend", "pytorch")
     overrides.setdefault("trust_remote_code", False)
     overrides["tp_size"] = tp_size
     server_args = build_sglang_server_args(

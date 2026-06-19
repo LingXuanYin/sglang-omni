@@ -441,7 +441,7 @@ class S2ProSGLangTextModel(nn.Module):
         seeds = self._sampling_seeds[:bs]
         unseeded_choice = torch.multinomial(probs, num_samples=1)
         seeded_choice = multinomial_with_seed(
-            probs, seeds.clamp_min(0), self._step_count[:bs]
+            torch.log(probs), seeds.clamp_min(0), self._step_count[:bs]
         )
         choice = torch.where((seeds >= 0).unsqueeze(-1), seeded_choice, unseeded_choice)
         semantic_token = top_k_indices.gather(-1, choice).squeeze(-1)

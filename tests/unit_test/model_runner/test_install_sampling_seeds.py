@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -17,9 +18,15 @@ def _req(seed):
     )
 
 
-def _fb(sampling_seed=None):
+def _fb(sampling_seed=None, *, top_p=False, top_k=False, min_p=False):
     return SimpleNamespace(
-        sampling_info=SimpleNamespace(device="cpu", sampling_seed=sampling_seed)
+        sampling_info=SimpleNamespace(
+            device="cpu",
+            sampling_seed=sampling_seed,
+            need_top_p_sampling=top_p,
+            need_top_k_sampling=top_k,
+            need_min_p_sampling=min_p,
+        )
     )
 
 
@@ -55,3 +62,30 @@ def test_unseeded_row_seed_is_resolved_once_and_cached():
     assert cached is not None  # minted + cached back
     runner._install_sampling_seeds(_fb(), requests)  # next step
     assert requests[1].data.req.sampling_params.sampling_seed == cached  # reused
+
+
+def test_rejects_seeded_min_p_before_upstream_sampler():
+    runner = object.__new__(ModelRunner)
+    with pytest.raises(ValueError, match="min_p"):
+        runner._install_sampling_seeds(_fb(min_p=True), [_req(42)])
+
+
+def test_rejects_seeded_flashinfer_top_p_before_upstream_sampler(monkeypatch):
+    monkeypatch.setattr(
+        "sglang_omni.model_runner.base._current_sglang_sampling_backend",
+        lambda: "flashinfer",
+    )
+    runner = object.__new__(ModelRunner)
+    with pytest.raises(ValueError, match="flashinfer"):
+        runner._install_sampling_seeds(_fb(top_p=True), [_req(42)])
+
+
+def test_allows_seeded_pytorch_top_p(monkeypatch):
+    monkeypatch.setattr(
+        "sglang_omni.model_runner.base._current_sglang_sampling_backend",
+        lambda: "pytorch",
+    )
+    runner = object.__new__(ModelRunner)
+    fb = _fb(top_p=True)
+    runner._install_sampling_seeds(fb, [_req(42)])
+    assert int(fb.sampling_info.sampling_seed[0]) == 42

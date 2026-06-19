@@ -60,3 +60,18 @@ def test_per_row_seed_isolation():
         step_B=torch.full((1,), 3, dtype=torch.long, device="cuda"),
     )
     assert torch.equal(alone[0], full[0])
+
+
+def test_seeded_sampler_preserves_probability_distribution():
+    batch = 20_000
+    probs = torch.tensor([0.9, 0.1], device="cuda")
+    logits = probs.log().view(1, 1, 2).expand(batch, 1, 2).contiguous()
+    sampled = _sample_independent_batched(
+        logits,
+        temperature=torch.ones(batch, device="cuda"),
+        top_p=None,
+        seeds_B=torch.arange(1, batch + 1, device="cuda"),
+        step_B=torch.zeros(batch, dtype=torch.long, device="cuda"),
+    )
+    token0_rate = (sampled[:, 0] == 0).float().mean().item()
+    assert 0.87 < token0_rate < 0.93

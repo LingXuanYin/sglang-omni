@@ -95,6 +95,7 @@ def create_sglang_dllm_thinker_executor_from_config(
     overrides: dict[str, Any] = {
         "attention_backend": "flashinfer",
         "disable_cuda_graph": True,
+        "sampling_backend": "pytorch",
     }
     overrides.update(server_args_overrides or {})
 
