@@ -1780,3 +1780,62 @@ def test_build_talker_request_wall_clock(seq_len: int) -> None:
     mean_ms = (time.perf_counter() - t0) / 20 * 1000
 
     print(f"\n[seq_len={seq_len}] mean={mean_ms:.2f}ms  floats={seq_len * 2048:,}")
+
+
+def _talker_seed_self(max_bs: int = 4, vocab: int = 8) -> SimpleNamespace:
+    """Minimal stand-in carrying only the buffers prepare_decode_buffers writes."""
+    return SimpleNamespace(
+        _repetition_mask=torch.zeros(max_bs, vocab, dtype=torch.bool),
+        _suppress_mask=torch.zeros(max_bs, vocab, dtype=torch.bool),
+        _repetition_penalties=torch.ones(max_bs, 1),
+        _sampling_temperatures=torch.ones(max_bs, 1),
+        _sampling_top_ps=torch.ones(max_bs),
+        _sampling_top_ks=torch.ones(max_bs, dtype=torch.long),
+        _sampling_min_ps=torch.zeros(max_bs),
+        _sampling_seeds=torch.zeros(max_bs, dtype=torch.long),
+    )
+
+
+def _talker_seed_req(seed: int | None, rid: str) -> SimpleNamespace:
+    sp = SimpleNamespace(
+        repetition_penalty=1.0,  # keep rep/suppress branches off
+        temperature=0.8,
+        top_p=0.9,
+        top_k=20,
+        min_p=0.0,
+        sampling_seed=seed,
+    )
+    req = SimpleNamespace(
+        sampling_params=sp, output_ids=[], _codec_suppress_tokens=None, rid=rid
+    )
+    return SimpleNamespace(data=SimpleNamespace(req=req, suppress_tokens=None))
+
+
+def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
+    # Unseeded rows must get a rank-shared (request-id-derived) seed, not
+    # os.urandom, or TP ranks desync.
+    from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, derive_sampling_seed
+
+    fake = _talker_seed_self()
+    seeded = _talker_seed_req(123, "seeded")
+    unseeded = _talker_seed_req(None, "unseeded")
+    out_of_range = _talker_seed_req(0xFFFFFFFF, "oor")
+    requests = [seeded, unseeded, out_of_range]
+
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    seeds = fake._sampling_seeds
+
+    assert int(seeds[0]) == 123
+    assert seeded.data.req.sampling_params.sampling_seed == 123
+    assert int(seeds[1]) == derive_sampling_seed("sglang-omni-unseeded-row", "unseeded")
+    assert unseeded.data.req.sampling_params.sampling_seed is None  # not cached
+    assert int(seeds[2]) == (0xFFFFFFFF & SAMPLING_SEED_MASK)
+    assert out_of_range.data.req.sampling_params.sampling_seed == (
+        0xFFFFFFFF & SAMPLING_SEED_MASK
+    )
+
+    # stable across decode steps
+    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
+    assert int(fake._sampling_seeds[1]) == derive_sampling_seed(
+        "sglang-omni-unseeded-row", "unseeded"
+    )

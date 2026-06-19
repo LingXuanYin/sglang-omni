@@ -25,7 +25,11 @@ from sglang_omni.models.qwen3_omni.hf_config import (
 from sglang_omni.models.qwen3_omni.quantization import (
     convert_fp8_weight_scale_inv_for_sglang,
 )
-from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, resolve_row_seed
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    resolve_row_seed,
+)
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import tensor_model_parallel_all_reduce
 from sglang_omni.vendor.sglang.layers import (
@@ -923,12 +927,12 @@ class Qwen3OmniTalker(nn.Module):
             top_ps.append(float(sp.top_p))
             top_ks.append(int(sp.top_k))
             min_ps.append(float(sp.min_p))
-            # Same seed scheme as the base runner / thinker: masked user seed, or
-            # a fresh random seed when unseeded (not a fixed 0). Resolve once and
-            # cache onto sampling_params so an unseeded row reuses one random seed
-            # across its decode steps instead of re-minting via os.urandom each step.
+            # Unseeded: rank-shared seed from the request id (same on every TP
+            # rank), not os.urandom, else the ranks desync.
             seed = sp.sampling_seed
-            if seed is None or not (0 <= seed <= SAMPLING_SEED_MASK):
+            if seed is None:
+                seed = derive_sampling_seed("sglang-omni-unseeded-row", req.rid)
+            elif not (0 <= seed <= SAMPLING_SEED_MASK):
                 seed = resolve_row_seed(seed)
                 sp.sampling_seed = seed
             sampling_seeds.append(seed)
