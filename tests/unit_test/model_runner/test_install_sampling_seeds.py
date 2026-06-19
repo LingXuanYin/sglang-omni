@@ -43,3 +43,15 @@ def test_does_not_clobber_subclass_installed_seed():
     fb = _fb(sampling_seed=preset)
     runner._install_sampling_seeds(fb, [_req(42), _req(42), _req(42)])
     assert fb.sampling_info.sampling_seed is preset
+
+
+def test_unseeded_row_seed_is_resolved_once_and_cached():
+    """An unseeded row in a seeded batch mints ONE random seed (cached on
+    sampling_params), reused across decode steps — no per-step os.urandom."""
+    runner = object.__new__(ModelRunner)
+    requests = [_req(42), _req(None)]
+    runner._install_sampling_seeds(_fb(), requests)
+    cached = requests[1].data.req.sampling_params.sampling_seed
+    assert cached is not None  # minted + cached back
+    runner._install_sampling_seeds(_fb(), requests)  # next step
+    assert requests[1].data.req.sampling_params.sampling_seed == cached  # reused

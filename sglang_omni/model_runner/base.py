@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from sglang_omni.sampling.seed import resolve_row_seed
+from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, resolve_row_seed
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -577,17 +577,27 @@ class ModelRunner:
         """Install per-row ``seed``s onto ``sampling_info`` so SGLang routes to
         ``multinomial_with_seed``. No-op when no request set a seed, or when a
         subclass already installed its own (e.g. Qwen3-TTS).
+
+        Runs once per decode step. The resolved seed is a per-request constant, so
+        it is resolved once and cached back onto ``sampling_params.sampling_seed``
+        (an unseeded row mints one random seed for its whole generation); later
+        steps reuse it instead of re-running ``os.urandom`` / re-masking per step.
         """
         sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_seed is not None:
             return
-        public_seeds = [sr.data.req.sampling_params.sampling_seed for sr in requests]
-        if all(seed is None for seed in public_seeds):
+        sampling_params = [sr.data.req.sampling_params for sr in requests]
+        if all(sp.sampling_seed is None for sp in sampling_params):
             return
+        row_seeds: list[int] = []
+        for sp in sampling_params:
+            seed = sp.sampling_seed
+            if seed is None or not (0 <= seed <= SAMPLING_SEED_MASK):
+                seed = resolve_row_seed(seed)  # random for None, mask otherwise
+                sp.sampling_seed = seed  # cache: stable across this request's steps
+            row_seeds.append(seed)
         sampling_info.sampling_seed = torch.tensor(
-            [resolve_row_seed(seed) for seed in public_seeds],
-            dtype=torch.long,
-            device=sampling_info.device,
+            row_seeds, dtype=torch.long, device=sampling_info.device
         )
 
     @staticmethod
