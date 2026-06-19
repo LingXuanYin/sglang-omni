@@ -6,6 +6,7 @@ import queue
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.fish_scheduler import (
@@ -546,6 +547,81 @@ def test_fish_s2pro_decode_codebooks_keeps_eos_out_of_audio_embedding(
     assert int(model._output_semantic_ids[0].item()) == 30
     assert int(model._output_codes[0, 0].item()) == 30
     assert int(audio_decoder.seen_embedding_ids[0][0].item()) == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="multinomial_with_seed needs CUDA"
+)
+def test_fish_s2pro_seeded_sampler_preserves_probability_distribution() -> None:
+    batch = 20_000
+    device = torch.device("cuda")
+    semantic_begin_id = 10
+    im_end_token_id = 39
+    vocab_size = 40
+
+    class _AudioDecoder:
+        def reset_caches(self) -> None:
+            pass
+
+        def project_in(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return hidden_states
+
+        def forward_kvcached(
+            self,
+            hidden_states: torch.Tensor,
+            *,
+            codebook_idx: int,
+        ) -> torch.Tensor:
+            del codebook_idx
+            return torch.zeros(
+                hidden_states.shape[0], 1, 8, device=hidden_states.device
+            )
+
+        def embeddings(self, ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(ids.shape[0], 4, device=ids.device)
+
+    semantic_bias = torch.full((vocab_size,), -float("inf"), device=device)
+    semantic_bias[semantic_begin_id : semantic_begin_id + 2] = 0.0
+    semantic_bias[im_end_token_id] = 0.0
+    logits = torch.full((batch, vocab_size), -float("inf"), device=device)
+    logits[:, semantic_begin_id] = torch.log(torch.tensor(0.9, device=device))
+    logits[:, semantic_begin_id + 1] = torch.log(torch.tensor(0.1, device=device))
+
+    model = SimpleNamespace(
+        _semantic_bias=semantic_bias,
+        _prev_token_count=torch.zeros(batch, dtype=torch.long, device=device),
+        _ras_range=torch.arange(4, 0, -1, device=device),
+        _prev_tokens=torch.zeros(batch, 4, dtype=torch.long, device=device),
+        _ras_temperature=torch.ones(batch, device=device),
+        _sampling_temperature=torch.ones(batch, device=device),
+        _ras_top_p=torch.ones(batch, device=device),
+        _sampling_top_p=torch.ones(batch, device=device),
+        _sampling_rep_penalty=torch.ones(batch, device=device),
+        _sampling_seeds=torch.arange(1, batch + 1, dtype=torch.long, device=device),
+        _step_count=torch.zeros(batch, dtype=torch.long, device=device),
+        _rep_positions=torch.arange(4, device=device),
+        _graph_top_k=30,
+        _sampling_top_k=torch.full((batch,), 2, dtype=torch.long, device=device),
+        _top_k_positions=torch.arange(30, device=device),
+        _audio_decoder=_AudioDecoder(),
+        _semantic_begin_id=semantic_begin_id,
+        _im_end_token_id=im_end_token_id,
+        _codebook_size=8,
+        _num_codebooks=1,
+        _output_codes=torch.zeros(batch, 2, dtype=torch.long, device=device),
+        _output_semantic_ids=torch.zeros(batch, dtype=torch.long, device=device),
+    )
+
+    S2ProSGLangTextModel._decode_codebooks(
+        model,
+        logits,
+        torch.zeros(batch, 4, device=device),
+    )
+
+    token0_rate = (
+        (model._output_semantic_ids == semantic_begin_id).float().mean().item()
+    )
+    assert 0.87 < token0_rate < 0.93
 
 
 def test_fish_s2pro_terminal_im_end_is_not_audio_codebook_frame() -> None:

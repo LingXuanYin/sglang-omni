@@ -28,6 +28,7 @@ from sglang_omni.models.qwen3_tts.request_builders import (
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.sampling import seed as sampling_seed
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.speaker_cache import (
@@ -1005,7 +1006,7 @@ def test_qwen3_tts_request_data_uses_private_sampling_seeds(
     install_fake_sglang(monkeypatch)
     urandom_values = iter([b"\x39\x30\x00\x00", b"\x32\x09\x01\x00"])
     monkeypatch.setattr(
-        qwen3_request_builders.os,
+        sampling_seed.os,
         "urandom",
         lambda size: next(urandom_values) if size == 4 else b"\x00" * size,
     )

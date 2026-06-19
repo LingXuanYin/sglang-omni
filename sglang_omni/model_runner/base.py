@@ -12,7 +12,11 @@ from typing import Any
 
 import torch
 
-from sglang_omni.sampling.seed import SAMPLING_SEED_MASK, resolve_row_seed
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    resolve_row_seed,
+)
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     RequestOutput,
@@ -29,6 +33,18 @@ def _current_sglang_sampling_backend() -> str | None:
         return get_global_server_args().sampling_backend
     except ValueError:
         return None
+
+
+def _rank_shared_unseeded_sampling_seed(request: Any, row_idx: int) -> int:
+    request_id = getattr(request, "request_id", None)
+    if request_id is None:
+        request_id = getattr(getattr(request, "data", None), "request_id", None)
+    if request_id is None:
+        req = getattr(getattr(request, "data", None), "req", None)
+        request_id = getattr(req, "rid", None)
+    if request_id is None:
+        request_id = f"row-{row_idx}"
+    return derive_sampling_seed("sglang-omni-unseeded-row", request_id)
 
 
 @dataclass
@@ -587,10 +603,11 @@ class ModelRunner:
         ``multinomial_with_seed``. No-op when no request set a seed, or when a
         subclass already installed its own (e.g. Qwen3-TTS).
 
-        Runs once per decode step. The resolved seed is a per-request constant, so
-        it is resolved once and cached back onto ``sampling_params.sampling_seed``
-        (an unseeded row mints one random seed for its whole generation); later
-        steps reuse it instead of re-running ``os.urandom`` / re-masking per step.
+        Runs once per decode step. User-provided seeds are resolved once and
+        cached back onto ``sampling_params.sampling_seed``. In a mixed
+        seeded/unseeded batch the SGLang sampler is batch-wide, so unseeded rows
+        receive a request-id-derived fallback seed instead of a rank-local random
+        seed; this keeps TP ranks in sync without mutating the public request seed.
         """
         sampling_info = forward_batch.sampling_info
         if sampling_info.sampling_seed is not None:
@@ -601,11 +618,13 @@ class ModelRunner:
             return
         self._validate_seeded_sampling_supported(sampling_info)
         row_seeds: list[int] = []
-        for sp in sampling_params:
+        for row_idx, (sp, request) in enumerate(zip(sampling_params, requests)):
             seed = sp.sampling_seed
-            if seed is None or not (0 <= seed <= SAMPLING_SEED_MASK):
-                seed = resolve_row_seed(seed)  # random for None, mask otherwise
-                sp.sampling_seed = seed  # cache: stable across this request's steps
+            if seed is None:
+                seed = _rank_shared_unseeded_sampling_seed(request, row_idx)
+            elif not (0 <= seed <= SAMPLING_SEED_MASK):
+                seed = resolve_row_seed(seed)  # mask and cache user seed
+                sp.sampling_seed = seed
             row_seeds.append(seed)
         sampling_info.sampling_seed = torch.tensor(
             row_seeds, dtype=torch.long, device=sampling_info.device

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -15,6 +14,11 @@ import torch
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.proto import StagePayload
+from sglang_omni.sampling.seed import (
+    SAMPLING_SEED_MASK,
+    derive_sampling_seed,
+    new_random_sampling_seed,
+)
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.speaker_cache import (
     SpeakerCacheKey,
@@ -49,11 +53,11 @@ _IMPLICIT_SAMPLING_DEFAULTS = {
     "repetition_penalty": {1.0, 1.1},
 }
 
-_QWEN3_TTS_SAMPLING_SEED_MASK = 0x7FFFFFFF
+_QWEN3_TTS_SAMPLING_SEED_MASK = SAMPLING_SEED_MASK
 
 
 def _new_qwen3_tts_sampling_seed() -> int:
-    return int.from_bytes(os.urandom(4), "little") & _QWEN3_TTS_SAMPLING_SEED_MASK
+    return new_random_sampling_seed()
 
 
 def _normalize_qwen3_tts_seed(seed: Any) -> int:
@@ -69,11 +73,7 @@ def _normalize_qwen3_tts_seed(seed: Any) -> int:
 
 
 def _derive_qwen3_tts_child_seed(seed: int, label: str) -> int:
-    digest = hashlib.blake2b(
-        f"qwen3-tts:{seed}:{label}".encode("utf-8"),
-        digest_size=8,
-    ).digest()
-    return int.from_bytes(digest, "little") & _QWEN3_TTS_SAMPLING_SEED_MASK
+    return derive_sampling_seed("qwen3-tts", seed, label)
 
 
 def derive_qwen3_tts_sampling_seeds(seed: int) -> tuple[int, int]:

@@ -9,12 +9,14 @@ import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.sampling.seed import derive_sampling_seed
 
 
-def _req(seed):
+def _req(seed, request_id="req"):
     sp = SimpleNamespace(sampling_seed=seed)
     return SimpleNamespace(
-        data=SimpleNamespace(req=SimpleNamespace(sampling_params=sp))
+        request_id=request_id,
+        data=SimpleNamespace(req=SimpleNamespace(sampling_params=sp)),
     )
 
 
@@ -32,12 +34,16 @@ def _fb(sampling_seed=None, *, top_p=False, top_k=False, min_p=False):
 
 def test_installs_per_row_seeds_and_noops_without_one():
     runner = object.__new__(ModelRunner)
-    # seeded rows -> per-row int64 seed tensor; unseeded row stays in range
+    # seeded rows -> per-row int64 seed tensor; mixed unseeded rows get a
+    # rank-shared fallback derived from the request id.
     fb = _fb()
-    runner._install_sampling_seeds(fb, [_req(42), _req(None)])
+    requests = [_req(42, "seeded"), _req(None, "unseeded")]
+    runner._install_sampling_seeds(fb, requests)
     ss = fb.sampling_info.sampling_seed
     assert isinstance(ss, torch.Tensor) and ss.dtype == torch.long
     assert int(ss[0]) == 42 and ss.shape == (2,)
+    assert int(ss[1]) == derive_sampling_seed("sglang-omni-unseeded-row", "unseeded")
+    assert requests[1].data.req.sampling_params.sampling_seed is None
     # no seed anywhere -> left unseeded (preserves random sampling)
     fb2 = _fb()
     runner._install_sampling_seeds(fb2, [_req(None), _req(None)])
@@ -52,16 +58,18 @@ def test_does_not_clobber_subclass_installed_seed():
     assert fb.sampling_info.sampling_seed is preset
 
 
-def test_unseeded_row_seed_is_resolved_once_and_cached():
-    """An unseeded row in a seeded batch mints ONE random seed (cached on
-    sampling_params), reused across decode steps — no per-step os.urandom."""
+def test_unseeded_row_in_seeded_batch_uses_rank_shared_fallback():
     runner = object.__new__(ModelRunner)
-    requests = [_req(42), _req(None)]
-    runner._install_sampling_seeds(_fb(), requests)
-    cached = requests[1].data.req.sampling_params.sampling_seed
-    assert cached is not None  # minted + cached back
-    runner._install_sampling_seeds(_fb(), requests)  # next step
-    assert requests[1].data.req.sampling_params.sampling_seed == cached  # reused
+    requests = [_req(42, "seeded"), _req(None, "unseeded")]
+    fb = _fb()
+    runner._install_sampling_seeds(fb, requests)
+    fallback = int(fb.sampling_info.sampling_seed[1])
+    assert requests[1].data.req.sampling_params.sampling_seed is None
+
+    fb_next = _fb()
+    runner._install_sampling_seeds(fb_next, requests)
+    assert int(fb_next.sampling_info.sampling_seed[1]) == fallback
+    assert requests[1].data.req.sampling_params.sampling_seed is None
 
 
 def test_rejects_seeded_min_p_before_upstream_sampler():
