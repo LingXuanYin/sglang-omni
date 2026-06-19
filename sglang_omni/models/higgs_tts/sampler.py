@@ -356,10 +356,10 @@ def batched_step_direct(
     last_codes: torch.Tensor,
     *,
     temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    step_count: torch.Tensor,
     top_p: torch.Tensor | None = None,
     top_k_buf: torch.Tensor | None = None,
-    seeds: torch.Tensor | None = None,
-    step_count: torch.Tensor | None = None,
     boc_id: int = BOC_ID,
     eoc_id: int = EOC_ID,
 ) -> tuple[
@@ -420,9 +420,7 @@ def batched_step_direct(
     update_codes = (active & (~done_this_step)).unsqueeze(-1)
     new_last_codes = torch.where(update_codes, codes_BN, last_codes)
 
-    new_step_count = (
-        None if step_count is None else step_count + active.to(step_count.dtype)
-    )
+    new_step_count = step_count + active.to(step_count.dtype)
 
     stop = torch.full_like(codes_BN, STOP_CODE)
     out_codes = torch.where(generation_done.unsqueeze(-1), stop, codes_BN)
