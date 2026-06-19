@@ -25,6 +25,7 @@ from sglang_omni.models.qwen3_omni.hf_config import (
 from sglang_omni.models.qwen3_omni.quantization import (
     convert_fp8_weight_scale_inv_for_sglang,
 )
+from sglang_omni.sampling.seed import resolve_row_seed
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import tensor_model_parallel_all_reduce
 from sglang_omni.vendor.sglang.layers import (
@@ -922,8 +923,9 @@ class Qwen3OmniTalker(nn.Module):
             top_ps.append(float(sp.top_p))
             top_ks.append(int(sp.top_k))
             min_ps.append(float(sp.min_p))
-            seed = sp.sampling_seed
-            sampling_seeds.append(int(seed) if seed is not None else 0)
+            # Same seed scheme as the base runner / thinker: masked user seed, or
+            # a fresh random seed when unseeded (not a fixed 0).
+            sampling_seeds.append(resolve_row_seed(sp.sampling_seed))
 
             if penalty != 1.0 and req.output_ids:
                 unique = {
