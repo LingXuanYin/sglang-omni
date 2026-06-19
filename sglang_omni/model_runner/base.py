@@ -632,12 +632,14 @@ class ModelRunner:
 
     @staticmethod
     def _validate_seeded_sampling_supported(sampling_info: Any) -> None:
-        if sampling_info.need_min_p_sampling:
+        if getattr(sampling_info, "need_min_p_sampling", False):
             raise ValueError(
                 "SGLang seeded sampling does not support min_p yet; set min_p=0 "
                 "or omit request seed"
             )
-        if not (sampling_info.need_top_p_sampling or sampling_info.need_top_k_sampling):
+        need_top_p_sampling = getattr(sampling_info, "need_top_p_sampling", False)
+        need_top_k_sampling = getattr(sampling_info, "need_top_k_sampling", False)
+        if not (need_top_p_sampling or need_top_k_sampling):
             return
         if _current_sglang_sampling_backend() == "flashinfer":
             raise ValueError(

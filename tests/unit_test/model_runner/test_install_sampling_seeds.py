@@ -58,6 +58,14 @@ def test_does_not_clobber_subclass_installed_seed():
     assert fb.sampling_info.sampling_seed is preset
 
 
+def test_preinstalled_seed_allows_missing_sampling_mode_flags():
+    runner = object.__new__(ModelRunner)
+    preset = torch.tensor([1, 2])
+    fb = SimpleNamespace(sampling_info=SimpleNamespace(sampling_seed=preset))
+    runner._install_sampling_seeds(fb, [_req(42), _req(42)])
+    assert fb.sampling_info.sampling_seed is preset
+
+
 def test_unseeded_row_in_seeded_batch_uses_rank_shared_fallback():
     runner = object.__new__(ModelRunner)
     requests = [_req(42, "seeded"), _req(None, "unseeded")]
