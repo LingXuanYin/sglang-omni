@@ -17,11 +17,7 @@ import torch
 
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.proto import StagePayload
-from sglang_omni.sampling.seed import (
-    SAMPLING_SEED_MASK,
-    derive_sampling_seed,
-    new_random_sampling_seed,
-)
+from sglang_omni.sampling.seed import derive_sampling_seed, new_random_sampling_seed
 from sglang_omni.scheduling.types import ARRequestData
 from sglang_omni.utils.audio_payload import audio_data_uri_from_reference
 
@@ -31,7 +27,6 @@ _TOKEN_PREFIX_RE = re.compile(r"^\$\{token:(\d+)\}")
 _TOKEN_PREFIX_START_RE = re.compile(r"^\$\{token:")
 _DATA_URI_RE = re.compile(r"^data:audio/[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _INF_DELAY = -1
-_MOSS_TTS_SAMPLING_SEED_MASK = SAMPLING_SEED_MASK
 
 
 def _new_moss_tts_sampling_seed() -> int:
