@@ -163,6 +163,80 @@ def test_health_checks_use_separate_client_from_data_plane_client() -> None:
     assert data_paths == ["/v1/chat/completions"]
 
 
+def test_generate_is_forwarded_opaquely_to_a_worker() -> None:
+    data_paths: list[str] = []
+
+    def data_handler(request: httpx.Request) -> httpx.Response:
+        data_paths.append(request.url.path)
+        if request.url.path == "/generate":
+            return httpx.Response(
+                200, json={"text": "hi", "meta_info": {}}, request=request
+            )
+        raise AssertionError(f"data-plane client should not call {request.url.path}")
+
+    def health_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        raise AssertionError(f"health client should not call {request.url.path}")
+
+    data_client = httpx.AsyncClient(transport=httpx.MockTransport(data_handler))
+    health_client = httpx.AsyncClient(transport=httpx.MockTransport(health_handler))
+    app = create_app(
+        _router_config(worker_configs=[WorkerConfig(url="http://worker-a:8101")]),
+        client=data_client,
+        health_client=health_client,
+    )
+
+    with TestClient(app) as client:
+        ready = client.get("/ready")
+        response = client.post(
+            "/generate",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "sampling_params": {},
+            },
+        )
+
+    assert ready.status_code == 200
+    assert response.status_code == 200
+    assert response.json()["text"] == "hi"
+    assert data_paths == ["/generate"]
+
+
+def test_generate_audio_output_routes_to_audio_worker() -> None:
+    seen_workers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/generate":
+            seen_workers.append(_request_netloc(request))
+            return httpx.Response(
+                200, json={"text": "hi", "meta_info": {}}, request=request
+            )
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    worker_configs = [
+        WorkerConfig(url="http://worker-a:8101", capabilities={"chat"}),
+        WorkerConfig(url="http://worker-b:8102", capabilities={"chat", "audio_output"}),
+    ]
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(_router_config(worker_configs=worker_configs), client=async_client)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/generate",
+            json={
+                "messages": [{"role": "user", "content": "say hi"}],
+                "sampling_params": {},
+                "output_modalities": ["audio"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert seen_workers == ["worker-b:8102"]
+
+
 def test_router_liveness_does_not_wait_for_worker_health_probe() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -1682,6 +1756,8 @@ _ROUTER_ADMIN_PATHS = [
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
     ("POST", "/update_weights_from_distributed"),
+    ("POST", "/init_weights_update_group"),
+    ("POST", "/destroy_weights_update_group"),
     ("GET", "/weights_checker"),
     ("POST", "/weights_checker"),
 ]
@@ -1794,25 +1870,95 @@ def test_router_admin_env_key(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_router_unimplemented_tensor_weight_update_returns_501() -> None:
+    app = _admin_router_app()
+    with TestClient(app) as client:
+        resp = client.post("/update_weights_from_tensor", json={})
+    assert resp.status_code == 501
+    assert resp.json()["error"]["code"] == "not_implemented"
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
-        ("/update_weights_from_tensor", {}),
         (
             "/update_weights_from_distributed",
-            {"names": [], "dtypes": [], "shapes": []},
+            {"names": ["w.0"], "dtypes": ["bfloat16"], "shapes": [[2, 2]]},
         ),
+        ("/destroy_weights_update_group", {"group_name": "weight_update_group"}),
     ],
 )
-def test_router_unimplemented_weight_update_endpoints_return_501(
+def test_router_distributed_weight_update_routes_broadcast(
     path: str,
     payload: dict[str, Any],
 ) -> None:
     app = _admin_router_app()
     with TestClient(app) as client:
         resp = client.post(path, json=payload)
-    assert resp.status_code == 501
-    assert resp.json()["error"]["code"] == "not_implemented"
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+
+_INIT_GROUP_PAYLOAD = {
+    "master_address": "localhost",
+    "master_port": 12355,
+    "world_size": 2,
+    "rank_offset": 1,
+    "group_name": "weight_update_group",
+    "backend": "nccl",
+}
+
+
+def test_router_init_weights_update_group_single_replica_broadcasts() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        return httpx.Response(
+            200, json={"success": True, "message": "ok", "results": []}, request=request
+        )
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        _router_config(worker_configs=[WorkerConfig(url="http://worker-a:8101")]),
+        client=async_client,
+    )
+    with TestClient(app) as client:
+        resp = client.post("/init_weights_update_group", json=_INIT_GROUP_PAYLOAD)
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+    assert app.state.workers[0].disabled is False
+
+
+def test_router_init_weights_update_group_failure_keeps_worker_disabled() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "healthy"}, request=request)
+        if request.url.path == "/init_weights_update_group":
+            return httpx.Response(
+                504,
+                json={"success": False, "message": "rendezvous timed out"},
+                request=request,
+            )
+        raise AssertionError(f"unexpected request path: {request.url.path}")
+
+    async_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app = create_app(
+        _router_config(worker_configs=[WorkerConfig(url="http://worker-a:8101")]),
+        client=async_client,
+    )
+    with TestClient(app) as client:
+        resp = client.post("/init_weights_update_group", json=_INIT_GROUP_PAYLOAD)
+    assert resp.status_code == 502
+    assert resp.json()["success"] is False
+    assert app.state.workers[0].disabled is True
+
+
+def test_router_init_weights_update_group_rejects_multiple_replicas() -> None:
+    app = _admin_router_app()
+    with TestClient(app) as client:
+        resp = client.post("/init_weights_update_group", json=_INIT_GROUP_PAYLOAD)
+    assert resp.status_code == 422
+    assert "single-replica" in resp.json()["error"]["message"]
 
 
 # ---------------------------------------------------------------------------

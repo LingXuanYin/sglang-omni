@@ -958,6 +958,7 @@ def create_sglang_thinker_executor_from_config(
         "disable_cuda_graph": False,
         "enable_mixed_chunk": True,
         "chunked_prefill_size": 8192,
+        "sampling_backend": "pytorch",
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)

@@ -550,6 +550,32 @@ def test_speech_service_rejects_unknown_required_uploaded_voice(
         service.parse_request({"input": "hello", "voice": "missing"})
 
 
+def test_speech_service_rejects_batch_default_uploaded_voice_task_type(
+    tmp_path: Path,
+) -> None:
+    store = SpeakerSampleStore(root_dir=tmp_path)
+    store.upload(
+        name="Anchor",
+        consent="consent",
+        audio_bytes=_reference_wav(),
+        filename="anchor.wav",
+        content_type="audio/wav",
+    )
+    service = SpeechRequestValidator(
+        default_model="public-tts-name",
+        voice_store=store,
+    )
+
+    with pytest.raises(SpeechAPIError, match="uploaded voice requests require"):
+        service.parse_batch_request(
+            {
+                "voice": "Anchor",
+                "task_type": "VoiceDesign",
+                "items": [{"input": "hello"}],
+            }
+        )
+
+
 def test_speech_service_preserves_preset_voice_names(tmp_path: Path) -> None:
     store = SpeakerSampleStore(root_dir=tmp_path)
     service = SpeechRequestValidator(

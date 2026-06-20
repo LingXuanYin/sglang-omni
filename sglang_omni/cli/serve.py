@@ -11,6 +11,7 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.preprocessing.resource_connector import (
     resolve_allowed_local_media_path,
 )
+from sglang_omni.serve.protocol import DEFAULT_TTS_BATCH_MAX_ITEMS
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +238,12 @@ def _normalize_allowed_media_domains(values: list[str] | None) -> list[str]:
             part.strip().lower() for part in value.split(",") if part.strip()
         )
     return domains
+
+
+def _validate_tts_batch_max_items(value: int) -> int:
+    if value < 1:
+        raise typer.BadParameter("tts batch max items must be greater than 0")
+    return value
 
 
 def apply_mem_fraction_cli_overrides(
@@ -875,11 +882,18 @@ def serve(
             "--allowed_media_domain",
             help=(
                 "Restrict remote media references to this domain. Repeat the "
-                "flag to allow multiple domains. Remote HTTP(S) references "
-                "are disabled when this is omitted."
+                "flag to allow multiple domains. When omitted, remote HTTP(S) "
+                "references from any public host are allowed."
             ),
         ),
     ] = None,
+    tts_batch_max_items: Annotated[
+        int,
+        typer.Option(
+            "--tts-batch-max-items",
+            help="Maximum number of items accepted by /v1/audio/speech/batch.",
+        ),
+    ] = DEFAULT_TTS_BATCH_MAX_ITEMS,
     mem_fraction_static: Annotated[
         float | None,
         typer.Option(
@@ -1183,4 +1197,5 @@ def serve(
             allowed_local_media_path
         ),
         allowed_media_domains=_normalize_allowed_media_domains(allowed_media_domain),
+        tts_batch_max_items=_validate_tts_batch_max_items(tts_batch_max_items),
     )

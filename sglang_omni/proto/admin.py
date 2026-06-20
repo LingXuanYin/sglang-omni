@@ -12,6 +12,8 @@ ADMIN_CONTINUE_GENERATION = "continue_generation"
 ADMIN_UPDATE_WEIGHTS_FROM_DISK = "update_weights_from_disk"
 ADMIN_UPDATE_WEIGHTS_FROM_TENSOR = "update_weights_from_tensor"
 ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED = "update_weights_from_distributed"
+ADMIN_INIT_WEIGHTS_UPDATE_GROUP = "init_weights_update_group"
+ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP = "destroy_weights_update_group"
 ADMIN_WEIGHTS_CHECKER = "weights_checker"
 
 
@@ -90,6 +92,8 @@ class AdminResult:
 
 def is_update_action(action: str) -> bool:
     return action in {
+        ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
+        ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
         ADMIN_UPDATE_WEIGHTS_FROM_DISK,
         ADMIN_UPDATE_WEIGHTS_FROM_TENSOR,
         ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED,

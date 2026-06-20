@@ -671,7 +671,9 @@ class Stage:
             try:
                 follower_msgs = await self._tp_fanout.collect_admin_results(
                     operation.op_id,
-                    timeout_s=float(operation.timeout_s or 60.0),
+                    timeout_s=float(
+                        60.0 if operation.timeout_s is None else operation.timeout_s
+                    ),
                 )
             except Exception as exc:
                 local.success = False

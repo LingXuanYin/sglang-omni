@@ -186,6 +186,21 @@ class PrefetchedBlockingStreamingSpeechClient:
         self.aborted.append(request_id)
 
 
+class BlockingFirstAudioStreamingSpeechClient:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.aborted: list[str] = []
+
+    async def generate(self, request: Any, request_id: str | None = None):
+        del request, request_id
+        self.started.set()
+        await asyncio.Future()
+        yield GenerateChunk(request_id="speech-1")
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
 class BlockingNonStreamingSpeechClient:
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -304,6 +319,38 @@ class AdminClient:
         timeout_s: float = 120.0,
     ) -> dict[str, Any]:
         self.calls.append(("update_weights_from_disk", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def init_weights_update_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(("init_weights_update_group", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def destroy_weights_update_group(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(("destroy_weights_update_group", payload, stages, timeout_s))
+        return {"success": True, "message": "ok", "results": []}
+
+    async def update_weights_from_distributed(
+        self,
+        payload: dict[str, Any],
+        *,
+        stages: list[str] | None = None,
+        timeout_s: float = 300.0,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("update_weights_from_distributed", payload, stages, timeout_s)
+        )
         return {"success": True, "message": "ok", "results": []}
 
     async def admin(
@@ -588,6 +635,7 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
     async def _drive() -> None:
         client = PrefetchedBlockingStreamingSpeechClient()
         response = await _speech_audio_response(
+            request=ConnectedRequest(),
             client=client,
             gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
             request_id="req-1",
@@ -596,6 +644,28 @@ def test_raw_pcm_response_close_aborts_inner_speech_stream() -> None:
         body = response.body_iterator
         assert await anext(body) == encode_pcm([0.0, 0.1, -0.1, 0.0], 24000)
         await body.aclose()
+        assert client.aborted == ["req-1"]
+
+    asyncio.run(_drive())
+
+
+def test_raw_pcm_response_disconnect_before_first_chunk_aborts_request() -> None:
+    async def _drive() -> None:
+        client = BlockingFirstAudioStreamingSpeechClient()
+        request = DisconnectingRequest()
+        task = asyncio.create_task(
+            _speech_audio_response(
+                request=request,
+                client=client,
+                gen_req=GenerateRequest(model="s2-pro", prompt="hello", stream=True),
+                request_id="req-1",
+                speed=1.0,
+            )
+        )
+        await client.started.wait()
+        request.disconnected.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert client.aborted == ["req-1"]
 
     asyncio.run(_drive())
@@ -810,6 +880,8 @@ _ADMIN_PATHS_THAT_NEED_AUTH = [
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
     ("POST", "/update_weights_from_distributed"),
+    ("POST", "/init_weights_update_group"),
+    ("POST", "/destroy_weights_update_group"),
     ("GET", "/weights_checker"),
     ("POST", "/weights_checker"),
 ]
@@ -901,38 +973,98 @@ def test_admin_routes_env_key_is_used_when_no_explicit_key(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("path", "payload"),
-    [
-        ("/update_weights_from_tensor", {}),
-        (
-            "/update_weights_from_distributed",
-            {"names": [], "dtypes": [], "shapes": []},
-        ),
-    ],
-)
-def test_unimplemented_weight_update_endpoints_return_501(
-    path: str,
-    payload: dict[str, Any],
-) -> None:
+def test_unimplemented_tensor_weight_update_returns_501() -> None:
     admin = AdminClient()
     client = TestClient(create_app(admin, model_name="qwen3-omni"))
 
-    resp = client.post(path, json=payload)
+    resp = client.post("/update_weights_from_tensor", json={})
     assert resp.status_code == 501
     assert resp.json()["error"]["code"] == "not_implemented"
     assert "update_weights_from_disk" in resp.json()["error"]["message"]
 
 
-def test_stub_endpoints_also_check_auth_before_501() -> None:
-    """Auth check fires before the 501 body."""
+def test_distributed_weight_update_routes_forward_to_client() -> None:
+    admin = AdminClient()
+    client = TestClient(create_app(admin, model_name="qwen3-omni"))
+
+    init = client.post(
+        "/init_weights_update_group",
+        json={
+            "master_address": "10.0.0.1",
+            "master_port": 12355,
+            "world_size": 2,
+            "rank_offset": 1,
+            "stages": ["talker"],
+            "timeout_s": 0,
+        },
+    )
+    update = client.post(
+        "/update_weights_from_distributed",
+        json={
+            "names": ["w.0"],
+            "dtypes": ["bfloat16"],
+            "shapes": [[2, 2]],
+            "group_name": "weight_update_group",
+            "weight_version": "v2",
+            "timeout_s": 0,
+        },
+    )
+    destroy = client.post(
+        "/destroy_weights_update_group",
+        json={
+            "group_name": "weight_update_group",
+            "stages": ["talker"],
+            "timeout_s": 0,
+        },
+    )
+
+    assert init.status_code == 200
+    assert update.status_code == 200
+    assert destroy.status_code == 200
+    assert admin.calls == [
+        (
+            "init_weights_update_group",
+            {
+                "master_address": "10.0.0.1",
+                "master_port": 12355,
+                "world_size": 2,
+                "rank_offset": 1,
+                "group_name": "weight_update_group",
+                "backend": "nccl",
+            },
+            ["talker"],
+            0,
+        ),
+        (
+            "update_weights_from_distributed",
+            {
+                "names": ["w.0"],
+                "dtypes": ["bfloat16"],
+                "shapes": [[2, 2]],
+                "group_name": "weight_update_group",
+                "flush_cache": True,
+                "abort_all_requests": False,
+                "weight_version": "v2",
+                "torch_empty_cache": False,
+            },
+            None,
+            0,
+        ),
+        (
+            "destroy_weights_update_group",
+            {"group_name": "weight_update_group"},
+            ["talker"],
+            0,
+        ),
+    ]
+
+
+def test_stub_endpoint_checks_auth_before_501() -> None:
+    """Auth check fires before the tensor stub 501 body."""
     admin = AdminClient()
     client = TestClient(
         create_app(admin, model_name="qwen3-omni", admin_api_key=_ADMIN_API_KEY)
     )
 
     resp = client.post("/update_weights_from_tensor", json={})
-    assert resp.status_code == 401
-
-    resp = client.post("/update_weights_from_distributed", json={})
     assert resp.status_code == 401

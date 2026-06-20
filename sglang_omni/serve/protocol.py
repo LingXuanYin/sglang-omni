@@ -146,6 +146,95 @@ class ChatCompletionStreamResponse(BaseModel):
     usage: UsageResponse | None = None
 
 
+class RolloutSamplingParams(BaseModel):
+    """Typed sampling params for ``POST /generate``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = None
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
+    stop: str | list[str] | None = None
+    stop_token_ids: list[int] | None = None
+    seed: int | None = None
+    max_new_tokens: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+
+
+class RolloutMessage(BaseModel):
+    """Chat message for ``POST /generate`` (role and content required)."""
+
+    role: str = Field(min_length=1)
+    content: str | list[Any]
+
+
+class RolloutGenerateRequest(BaseModel):
+    """Rollout request for ``POST /generate``; set exactly one of
+    ``input_ids``, ``prompt``, ``messages``."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+
+    input_ids: list[int] | None = None
+    prompt: str | None = None
+    messages: list[RolloutMessage] | None = None
+
+    sampling_params: RolloutSamplingParams = Field(
+        default_factory=RolloutSamplingParams
+    )
+    stream: bool = False
+    stage_sampling: dict[str, RolloutSamplingParams] | None = None
+    stage_params: dict[str, dict[str, Any]] | None = None
+    output_modalities: list[str] | None = None
+
+    metadata: dict[str, Any] | None = None
+
+    return_logprob: bool = True
+    return_omni_rollout: bool = False
+    return_routed_experts: bool = False
+    return_indexer_topk: bool = False
+
+
+class GenerateFinishReason(BaseModel):
+    """Finish status for a rollout generation."""
+
+    type: str
+    length: int | None = None
+
+
+class GenerateAudio(BaseModel):
+    """Audio payload for a rollout generation."""
+
+    data: str | None = None
+    path: str | None = None
+    format: str | None = None
+    sample_rate: int | None = None
+
+
+class GenerateMetaInfo(BaseModel):
+    """Rollout meta_info block."""
+
+    finish_reason: GenerateFinishReason
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_tokens: int = 0
+    weight_version: str | None = None
+    request_metadata: dict[str, Any] | None = None
+    output_token_logprobs: list[Any] | None = None
+    omni_rollout: dict[str, Any] | None = None
+
+
+class GenerateResponse(BaseModel):
+    """Response body for ``POST /generate``."""
+
+    text: str = ""
+    audio: GenerateAudio | None = None
+    meta_info: GenerateMetaInfo
+
+
 SUPPORTED_TTS_RESPONSE_FORMATS = frozenset({"wav", "mp3", "flac", "pcm", "aac", "opus"})
 SUPPORTED_TTS_LANGUAGES = frozenset(
     {
@@ -165,6 +254,7 @@ SUPPORTED_TTS_LANGUAGES = frozenset(
 SUPPORTED_TTS_TASK_TYPES = frozenset({"Base", "CustomVoice", "VoiceDesign"})
 TTS_SPEED_MIN = 0.25
 TTS_SPEED_MAX = 4.0
+DEFAULT_TTS_BATCH_MAX_ITEMS = 32
 
 
 class SpeechReference(BaseModel):
@@ -222,6 +312,126 @@ class CreateSpeechRequest(BaseModel):
     seed: int | None = None
 
     # Per-stage overrides (sglang-omni specific)
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class SpeechBatchItem(BaseModel):
+    """One item in a batch text-to-speech request."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    model: Any = None
+    input: Any = None
+    voice: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: Any = None
+    speed: Any = None
+    stream: Any = None
+    task_type: Any = None
+    language: Any = None
+    instructions: Any = None
+    ref_audio: Any = None
+    ref_text: Any = None
+    references: Any = None
+    x_vector_only_mode: Any = None
+    token_count: Any = None
+    duration_tokens: Any = None
+    max_new_tokens: Any = None
+    initial_codec_chunk_frames: Any = None
+    temperature: Any = None
+    top_p: Any = None
+    top_k: Any = None
+    repetition_penalty: Any = None
+    seed: Any = None
+    stage_params: Any = None
+
+
+class CreateSpeechBatchRequest(BaseModel):
+    """Batch text-to-speech request with shared defaults and item overrides."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    items: list[SpeechBatchItem]
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "wav"
+    speed: float = 1.0
+    stream: bool = False
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    references: list[SpeechReference] | None = None
+    x_vector_only_mode: bool | None = None
+    token_count: int | None = None
+    duration_tokens: int | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
+    stage_params: dict[str, dict[str, Any]] | None = None
+
+
+class SpeechBatchResult(BaseModel):
+    """One item result in a batch text-to-speech response."""
+
+    index: int
+    status: str
+    audio_data: str | None = None
+    format: str | None = None
+    media_type: str | None = None
+    error: dict[str, Any] | None = None
+
+
+class SpeechBatchResponse(BaseModel):
+    """Batch text-to-speech response preserving item order."""
+
+    id: str
+    results: list[SpeechBatchResult]
+    total: int
+    succeeded: int
+    failed: int
+
+
+class SpeechStreamSessionConfig(BaseModel):
+    """Configuration for /v1/audio/speech/stream WebSocket sessions."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    model: str | None = None
+    voice: str = Field(
+        default="default",
+        validation_alias=AliasChoices("voice", "speaker"),
+    )
+    response_format: str = "pcm"
+    speed: float = 1.0
+    stream_audio: bool = False
+    split_granularity: str = "sentence"
+    task_type: str | None = None
+    language: str | None = None
+    instructions: str | None = None
+    ref_audio: str | None = None
+    ref_text: str | None = None
+    references: list[SpeechReference] | None = None
+    x_vector_only_mode: bool | None = None
+    token_count: int | None = None
+    duration_tokens: int | None = None
+    max_new_tokens: int | None = None
+    initial_codec_chunk_frames: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    seed: int | None = None
     stage_params: dict[str, dict[str, Any]] | None = None
 
 
@@ -283,11 +493,6 @@ class ModelList(BaseModel):
     data: list[ModelCard] = Field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Administrative APIs
-# ---------------------------------------------------------------------------
-
-
 class AdminRequestBase(BaseModel):
     """Common admin request routing controls."""
 
@@ -337,6 +542,19 @@ class UpdateWeightsFromDistributedRequest(AdminRequestBase):
     weight_version: str | None = None
     load_format: str | None = None
     torch_empty_cache: bool = False
+
+
+class InitWeightsUpdateGroupRequest(AdminRequestBase):
+    master_address: str
+    master_port: int
+    world_size: int
+    rank_offset: int = 0
+    group_name: str = "weight_update_group"
+    backend: str = "nccl"
+
+
+class DestroyWeightsUpdateGroupRequest(AdminRequestBase):
+    group_name: str = "weight_update_group"
 
 
 class WeightsCheckerRequest(AdminRequestBase):

@@ -33,6 +33,8 @@ from sglang.srt.utils import broadcast_pyobj
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto.admin import (
     ADMIN_CONTINUE_GENERATION,
+    ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP,
+    ADMIN_INIT_WEIGHTS_UPDATE_GROUP,
     ADMIN_MODEL_INFO,
     ADMIN_PAUSE_GENERATION,
     ADMIN_UPDATE_WEIGHTS_FROM_DISK,
@@ -357,6 +359,13 @@ class OmniScheduler:
         from types import SimpleNamespace
 
         self.session_controller = SimpleNamespace(sessions={})
+        self.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        device = getattr(self, "device", None)
+        self.device_module = (
+            torch.get_device_module(device)
+            if device is not None
+            else torch.get_device_module()
+        )
 
     def self_check_during_idle(self) -> None:
         self.new_token_ratio = self.init_new_token_ratio
@@ -773,6 +782,7 @@ class OmniScheduler:
             # Build result payload from the Req
             data = req._omni_data
             data.output_ids = list(req.output_ids)
+            data.weight_version = getattr(self.server_args, "weight_version", None)
             finished_reason = req.finished_reason
             data.finish_reason = (
                 finished_reason.to_json().get("type")
@@ -945,6 +955,10 @@ class OmniScheduler:
             return self._admin_update_weights_from_tensor(payload)
         if action == ADMIN_UPDATE_WEIGHTS_FROM_DISTRIBUTED:
             return self._admin_update_weights_from_distributed(payload)
+        if action == ADMIN_INIT_WEIGHTS_UPDATE_GROUP:
+            return self._admin_init_weights_update_group(payload)
+        if action == ADMIN_DESTROY_WEIGHTS_UPDATE_GROUP:
+            return self._admin_destroy_weights_update_group(payload)
         if action == ADMIN_WEIGHTS_CHECKER:
             return self._admin_weights_checker(payload)
         return {
@@ -1023,62 +1037,91 @@ class OmniScheduler:
                 "message": "stage does not support update_weights_from_disk",
                 "data": {"skipped": True, "unsupported": True},
             }
+        return self._run_weight_update_with_lifecycle(
+            payload,
+            self.model_worker.update_weights_from_disk,
+            {
+                "model_path": payload.get("model_path"),
+                "weight_version": payload.get("weight_version"),
+                "token_step": payload.get("token_step"),
+            },
+        )
+
+    def _run_weight_update_with_lifecycle(
+        self,
+        payload: dict[str, Any],
+        update_fn,
+        result_data: dict[str, Any],
+        *,
+        keep_pause_on_failure: bool = False,
+    ) -> dict[str, Any]:
+        keep_pause = bool(payload.get("keep_pause", False))
+        keep_engine_paused = keep_pause
         with self._admin_lock:
             previous_pause_state = self._engine_paused
             self._engine_paused = True
-            self._resolve_pending_async()
-            self._resolve_pending_overlap_results()
-            num_paused = 0
-            abort_all_requests = bool(payload.get("abort_all_requests", False))
-            if abort_all_requests:
-                num_paused = self._abort_all_requests()
-            else:
-                active_request_ids = self._active_request_ids()
-                if active_request_ids and not self._can_update_active_requests(
-                    previous_pause_state
-                ):
-                    if not bool(payload.get("keep_pause", False)):
-                        self._engine_paused = previous_pause_state
-                    return {
-                        "success": False,
-                        "message": (
-                            "active requests are present; set "
-                            "abort_all_requests=true or pause_generation with "
-                            "mode=retract before updating weights"
-                        ),
-                        "error": "active requests present during weight update",
-                        "data": {
-                            "active_request_count": len(active_request_ids),
-                            "active_request_ids": active_request_ids[:16],
-                            "abort_all_requests": abort_all_requests,
-                            "pause_mode": getattr(self, "_last_pause_mode", None),
-                            "engine_paused": self._engine_paused,
-                        },
-                    }
+            try:
+                self._resolve_pending_async()
+                self._resolve_pending_overlap_results()
+                num_paused = 0
+                abort_all_requests = bool(payload.get("abort_all_requests", False))
+                if abort_all_requests:
+                    num_paused = self._abort_all_requests()
+                else:
+                    active_request_ids = self._active_request_ids()
+                    if active_request_ids and not self._can_update_active_requests(
+                        previous_pause_state
+                    ):
+                        if not keep_pause:
+                            self._engine_paused = previous_pause_state
+                        return {
+                            "success": False,
+                            "message": (
+                                "active requests are present; set "
+                                "abort_all_requests=true or pause_generation with "
+                                "mode=retract before updating weights"
+                            ),
+                            "error": "active requests present during weight update",
+                            "data": {
+                                "active_request_count": len(active_request_ids),
+                                "active_request_ids": active_request_ids[:16],
+                                "abort_all_requests": abort_all_requests,
+                                "pause_mode": getattr(self, "_last_pause_mode", None),
+                                "engine_paused": self._engine_paused,
+                            },
+                        }
 
-            success, message = self.model_worker.update_weights_from_disk(payload)
-            flush_success: bool | None = None
-            if success and bool(payload.get("flush_cache", True)):
-                flush_success = self._flush_cache_after_update()
-                success = success and bool(flush_success)
-                if not flush_success:
-                    message = f"{message}; cache flush failed"
+                try:
+                    success, message = update_fn(payload)
+                except Exception:
+                    if keep_pause_on_failure:
+                        keep_engine_paused = True
+                    raise
+                flush_success: bool | None = None
+                if success and bool(payload.get("flush_cache", True)):
+                    flush_success = self._flush_cache_after_update()
+                    success = success and bool(flush_success)
+                    if not flush_success:
+                        message = f"{message}; cache flush failed"
 
-            if bool(payload.get("torch_empty_cache", False)):
-                self._empty_torch_cache()
-            if not bool(payload.get("keep_pause", False)):
-                self._engine_paused = previous_pause_state
+                if keep_pause_on_failure and not success:
+                    keep_engine_paused = True
+                if bool(payload.get("torch_empty_cache", False)):
+                    self._empty_torch_cache()
+            finally:
+                if keep_engine_paused:
+                    self._engine_paused = True
+                else:
+                    self._engine_paused = previous_pause_state
 
         data = {
             "num_paused_requests": num_paused,
             "flush_cache": payload.get("flush_cache", True),
             "flush_success": flush_success,
-            "keep_pause": bool(payload.get("keep_pause", False)),
+            "keep_pause": keep_pause,
             "engine_paused": self._engine_paused,
-            "model_path": payload.get("model_path"),
-            "weight_version": payload.get("weight_version"),
-            "token_step": payload.get("token_step"),
         }
+        data.update(result_data)
         return {
             "success": bool(success),
             "message": str(message),
@@ -1115,17 +1158,60 @@ class OmniScheduler:
                 "message": "stage does not support update_weights_from_distributed",
                 "data": {"skipped": True, "unsupported": True},
             }
+        return self._run_weight_update_with_lifecycle(
+            payload,
+            self.model_worker.update_weights_from_distributed,
+            {
+                "group_name": payload.get("group_name"),
+                "names": payload.get("names", []),
+            },
+            keep_pause_on_failure=True,
+        )
+
+    def _admin_init_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not hasattr(self.model_worker, "init_weights_update_group"):
+            return {
+                "success": True,
+                "message": "stage does not support init_weights_update_group",
+                "data": {"skipped": True, "unsupported": True},
+            }
+        # Note (Xuesong): init blocks on a NCCL/TCP rendezvous and runs on the
+        # scheduler serving thread (admin is drained inline in the event loop), so
+        # the serving loop is frozen until the trainer (rank 0) joins. sglang's
+        # init_weights_update_group exposes no timeout, so a missing trainer
+        # stalls inference up to NCCL's own timeout. Call this only in
+        # coordination with the trainer (the router takes the worker out of
+        # routing for the duration).
         with self._admin_lock:
-            success, message = self.model_worker.update_weights_from_distributed(
-                payload
-            )
+            success, message = self.model_worker.init_weights_update_group(payload)
         return {
             "success": bool(success),
             "message": str(message),
             "data": {
                 "group_name": payload.get("group_name"),
-                "names": payload.get("names", []),
+                "world_size": payload.get("world_size"),
+                "rank_offset": payload.get("rank_offset"),
             },
+            "error": None if success else str(message),
+        }
+
+    def _admin_destroy_weights_update_group(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not hasattr(self.model_worker, "destroy_weights_update_group"):
+            return {
+                "success": True,
+                "message": "stage does not support destroy_weights_update_group",
+                "data": {"skipped": True, "unsupported": True},
+            }
+        with self._admin_lock:
+            success, message = self.model_worker.destroy_weights_update_group(payload)
+        return {
+            "success": bool(success),
+            "message": str(message),
+            "data": {"group_name": payload.get("group_name")},
             "error": None if success else str(message),
         }
 

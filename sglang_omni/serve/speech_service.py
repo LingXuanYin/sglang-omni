@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -12,27 +14,41 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 
-from sglang_omni.client import GenerateRequest, SamplingParams
+from sglang_omni.client import ClientError, GenerateRequest, SamplingParams
 from sglang_omni.client.audio import audio_encoding_unavailable_reason
 from sglang_omni.models.tts_streaming import INITIAL_CODEC_CHUNK_FRAMES_PARAM
 from sglang_omni.preprocessing.base import MediaIO
 from sglang_omni.preprocessing.resource_connector import MultiModalResourceConnector
 from sglang_omni.serve.protocol import (
+    DEFAULT_TTS_BATCH_MAX_ITEMS,
     SUPPORTED_TTS_LANGUAGES,
     SUPPORTED_TTS_RESPONSE_FORMATS,
     SUPPORTED_TTS_TASK_TYPES,
     TTS_SPEED_MAX,
     TTS_SPEED_MIN,
+    CreateSpeechBatchRequest,
     CreateSpeechRequest,
+    SpeechBatchItem,
+    SpeechBatchResponse,
+    SpeechBatchResult,
     SpeechReference,
 )
-from sglang_omni.serve.speech_errors import bad_request, service_unavailable
+from sglang_omni.serve.speech_errors import (
+    SpeechAPIError,
+    bad_request,
+    internal_error,
+    openai_error_payload,
+    service_unavailable,
+)
 
 if TYPE_CHECKING:
+    from sglang_omni.client import Client
     from sglang_omni.serve.speech_voices import (
         SpeakerSampleStore,
         UploadedVoiceReference,
     )
+
+logger = logging.getLogger(__name__)
 
 _TTS_LANGUAGE_ALIASES = {
     language.lower(): language for language in SUPPORTED_TTS_LANGUAGES
@@ -45,11 +61,19 @@ MAX_SPEECH_INPUT_CHARS = 4096
 MAX_REFERENCE_AUDIO_BYTES = 10 * 1024 * 1024
 _REFERENCE_AUDIO_FIELDS = ("audio_path", "ref_audio", "audio")
 RAW_PCM_DEFAULT_INITIAL_CODEC_CHUNK_FRAMES = 1
+_ReferenceCacheKey = tuple[Any, ...]
 
 
 @dataclass(frozen=True)
 class PreparedSpeechRequest:
     request: CreateSpeechRequest
+    reference_descriptors: list[dict[str, Any]]
+    uploaded_voice: "UploadedVoiceReference | None" = None
+
+
+@dataclass(frozen=True)
+class PreparedSpeechReferences:
+    request_updates: dict[str, Any]
     reference_descriptors: list[dict[str, Any]]
     uploaded_voice: "UploadedVoiceReference | None" = None
 
@@ -66,7 +90,10 @@ class SpeechRequestValidator:
         allowed_local_media_path: str | Path | None = None,
         allowed_media_domains: list[str] | None = None,
         voice_store: "SpeakerSampleStore | None" = None,
+        tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
     ) -> None:
+        if tts_batch_max_items < 1:
+            raise ValueError("tts_batch_max_items must be greater than 0")
         self.default_model = default_model
         self.requires_uploaded_voice_for_named_voice = (
             requires_uploaded_voice_for_named_voice
@@ -79,14 +106,48 @@ class SpeechRequestValidator:
         self.reference_connector = MultiModalResourceConnector(
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
-            allow_remote_media_without_domains=False,
+            allow_remote_media_without_domains=True,
             reject_unsafe_remote_addresses=True,
         )
+        self.tts_batch_max_items = int(tts_batch_max_items)
 
     def parse_request(self, payload: Any) -> CreateSpeechRequest:
         """Parse and validate a raw HTTP payload."""
 
         return self.prepare_request(self._parse_raw_request(payload))
+
+    def parse_batch_request(self, payload: Any) -> CreateSpeechBatchRequest:
+        """Parse and validate a raw batch speech payload."""
+
+        if not isinstance(payload, dict):
+            raise bad_request("speech batch request body must be a JSON object")
+        default_payload = {
+            key: value for key, value in payload.items() if key != "items"
+        }
+        self._validate_raw_payload(default_payload)
+        try:
+            request = CreateSpeechBatchRequest.model_validate(payload)
+        except ValidationError as exc:
+            raise bad_request(_validation_error_message(exc)) from exc
+        if not request.items:
+            raise bad_request("items must contain at least one request", param="items")
+        if len(request.items) > self.tts_batch_max_items:
+            raise bad_request(
+                f"items must contain at most {self.tts_batch_max_items} requests",
+                param="items",
+            )
+        if request.stream:
+            raise bad_request(
+                "stream is not supported for batch speech requests",
+                param="stream",
+            )
+        self._validate_batch_defaults(request)
+        return request
+
+    def validate_raw_speech_fields(self, payload: dict[str, Any]) -> None:
+        """Validate speech fields before Pydantic can coerce JSON values."""
+
+        self._validate_raw_payload(payload)
 
     def parse_generation_request(self, payload: Any) -> PreparedSpeechRequest:
         """Parse and prepare a raw HTTP payload for GenerateRequest lowering."""
@@ -113,10 +174,17 @@ class SpeechRequestValidator:
     ) -> PreparedSpeechRequest:
         """Validate a parsed request and build backend reference descriptors."""
 
-        updates: dict[str, Any] = {}
-        reference_descriptors: list[dict[str, Any]] = []
+        updates = self._prepare_generation_updates(request)
+        prepared_references = self._prepare_reference_fields(request)
+        updates.update(prepared_references.request_updates)
+        prepared_request = request.model_copy(update=updates)
+        return PreparedSpeechRequest(
+            request=prepared_request,
+            reference_descriptors=prepared_references.reference_descriptors,
+            uploaded_voice=prepared_references.uploaded_voice,
+        )
 
-        input_text = request.input
+    def validate_input_text(self, input_text: str) -> None:
         if not isinstance(input_text, str) or not input_text.strip():
             raise bad_request("input must be a non-empty string", param="input")
         if len(input_text) > MAX_SPEECH_INPUT_CHARS:
@@ -125,6 +193,11 @@ class SpeechRequestValidator:
                 param="input",
             )
 
+    def _prepare_generation_updates(
+        self, request: CreateSpeechRequest
+    ) -> dict[str, Any]:
+        self.validate_input_text(request.input)
+        updates: dict[str, Any] = {}
         response_format = _normalize_response_format(request.response_format)
         if request.stream and response_format != "pcm":
             raise bad_request(
@@ -153,6 +226,13 @@ class SpeechRequestValidator:
             param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
         )
         _validate_non_negative_int(request.seed, param="seed")
+        return updates
+
+    def _prepare_reference_fields(
+        self, request: CreateSpeechRequest
+    ) -> PreparedSpeechReferences:
+        updates: dict[str, Any] = {}
+        reference_descriptors: list[dict[str, Any]] = []
         uploaded_voice = self._resolve_uploaded_voice_reference(request)
 
         ref_audio = request.ref_audio
@@ -184,9 +264,8 @@ class SpeechRequestValidator:
             reference_descriptors.append(descriptor)
             updates["task_type"] = "Base"
 
-        prepared_request = request.model_copy(update=updates)
-        return PreparedSpeechRequest(
-            request=prepared_request,
+        return PreparedSpeechReferences(
+            request_updates=updates,
             reference_descriptors=reference_descriptors,
             uploaded_voice=uploaded_voice,
         )
@@ -225,6 +304,235 @@ class SpeechRequestValidator:
                 ),
             },
         )
+
+    async def create_speech_batch(
+        self,
+        client: "Client",
+        batch: CreateSpeechBatchRequest,
+        *,
+        request_id: str,
+    ) -> SpeechBatchResponse:
+        """Run a batch speech request through the normal speech path."""
+
+        results: list[SpeechBatchResult | None] = [None] * len(batch.items)
+        tasks: list[asyncio.Task[SpeechBatchResult]] = []
+        task_indexes: list[int] = []
+        task_request_ids: list[str] = []
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ] = {}
+        reference_task_lock = asyncio.Lock()
+
+        for index, item in enumerate(batch.items):
+            try:
+                request = self._build_batch_item_request(batch, item, index=index)
+            except SpeechAPIError as exc:
+                results[index] = _batch_error_result(
+                    index, _batch_item_error(exc, index=index)
+                )
+                continue
+            item_request_id = f"{request_id}-{index}"
+            task = asyncio.create_task(
+                self._run_batch_item(
+                    client,
+                    request,
+                    request_id=item_request_id,
+                    index=index,
+                    reference_tasks=reference_tasks,
+                    reference_task_lock=reference_task_lock,
+                )
+            )
+            tasks.append(task)
+            task_indexes.append(index)
+            task_request_ids.append(item_request_id)
+
+        if tasks:
+            try:
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                await self._cancel_batch_items(client, tasks, task_request_ids)
+                raise
+            for index, task_result in zip(task_indexes, task_results, strict=True):
+                if isinstance(task_result, SpeechBatchResult):
+                    results[index] = task_result
+                elif isinstance(task_result, SpeechAPIError):
+                    results[index] = _batch_error_result(
+                        index, _batch_item_error(task_result, index=index)
+                    )
+                else:
+                    results[index] = _batch_error_result(
+                        index, internal_error(str(task_result))
+                    )
+
+        final_results = [result for result in results if result is not None]
+        succeeded = sum(1 for result in final_results if result.status == "success")
+        failed = len(final_results) - succeeded
+        return SpeechBatchResponse(
+            id=request_id,
+            results=final_results,
+            total=len(final_results),
+            succeeded=succeeded,
+            failed=failed,
+        )
+
+    async def _run_batch_item(
+        self,
+        client: "Client",
+        request: CreateSpeechRequest,
+        *,
+        request_id: str,
+        index: int,
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ],
+        reference_task_lock: asyncio.Lock,
+    ) -> SpeechBatchResult:
+        prepared = await self._prepare_batch_item_request(
+            request,
+            reference_tasks=reference_tasks,
+            reference_task_lock=reference_task_lock,
+        )
+        gen_req = self.build_generate_request(
+            prepared.request,
+            validate=False,
+            reference_descriptors=prepared.reference_descriptors,
+            uploaded_voice=prepared.uploaded_voice,
+        )
+        try:
+            result = await client.speech(
+                gen_req,
+                request_id=request_id,
+                response_format=prepared.request.response_format,
+                speed=prepared.request.speed,
+                allow_format_fallback=False,
+            )
+        except ClientError as exc:
+            raise internal_error(str(exc)) from exc
+        return SpeechBatchResult(
+            index=index,
+            status="success",
+            audio_data=base64.b64encode(result.audio_bytes).decode("ascii"),
+            format=result.format,
+            media_type=result.mime_type,
+        )
+
+    async def _prepare_batch_item_request(
+        self,
+        request: CreateSpeechRequest,
+        *,
+        reference_tasks: dict[
+            _ReferenceCacheKey, asyncio.Task[PreparedSpeechReferences]
+        ],
+        reference_task_lock: asyncio.Lock,
+    ) -> PreparedSpeechRequest:
+        updates = self._prepare_generation_updates(request)
+        cache_key = _batch_reference_cache_key(request)
+        async with reference_task_lock:
+            task = reference_tasks.get(cache_key)
+            if task is None:
+                task = asyncio.create_task(
+                    asyncio.to_thread(self._prepare_reference_fields, request)
+                )
+                reference_tasks[cache_key] = task
+
+        prepared_references = await task
+        updates.update(prepared_references.request_updates)
+        return PreparedSpeechRequest(
+            request=request.model_copy(update=updates),
+            reference_descriptors=prepared_references.reference_descriptors,
+            uploaded_voice=prepared_references.uploaded_voice,
+        )
+
+    async def _cancel_batch_items(
+        self,
+        client: "Client",
+        tasks: list[asyncio.Task[SpeechBatchResult]],
+        request_ids: list[str],
+    ) -> None:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for request_id in request_ids:
+            try:
+                await client.abort(request_id)
+            except Exception:
+                logger.warning(
+                    "Failed to abort speech batch item request %s",
+                    request_id,
+                    exc_info=True,
+                )
+
+    def _build_batch_item_request(
+        self,
+        batch: CreateSpeechBatchRequest,
+        item: SpeechBatchItem,
+        *,
+        index: int,
+    ) -> CreateSpeechRequest:
+        payload = batch.model_dump(exclude={"items"}, exclude_none=True)
+        item_payload = item.model_dump(exclude_none=True)
+        payload.update(item_payload)
+        self._validate_raw_payload(payload)
+        if item_payload.get("stream"):
+            raise bad_request(
+                "stream is not supported for batch speech requests",
+                param=f"items.{index}.stream",
+            )
+        payload.pop("stream", None)
+        try:
+            return CreateSpeechRequest.model_validate(payload)
+        except ValidationError as exc:
+            raise bad_request(
+                _validation_error_message(exc),
+                param=_validation_error_param(exc, prefix=f"items.{index}"),
+            ) from exc
+
+    def _validate_batch_defaults(self, batch: CreateSpeechBatchRequest) -> None:
+        response_format = _normalize_response_format(batch.response_format)
+        self._validate_encoder_dependency(response_format)
+        if not TTS_SPEED_MIN <= float(batch.speed) <= TTS_SPEED_MAX:
+            raise bad_request(
+                f"speed must be between {TTS_SPEED_MIN} and {TTS_SPEED_MAX}",
+                param="speed",
+            )
+        task_type = (
+            _normalize_task_type(batch.task_type)
+            if batch.task_type is not None
+            else None
+        )
+        if batch.language is not None:
+            _normalize_language(batch.language)
+        for field_name in ("max_new_tokens", "token_count", "duration_tokens"):
+            _validate_positive_int(getattr(batch, field_name), param=field_name)
+        _validate_non_negative_int(
+            batch.initial_codec_chunk_frames,
+            param=INITIAL_CODEC_CHUNK_FRAMES_PARAM,
+        )
+        _validate_non_negative_int(batch.seed, param="seed")
+        if (
+            self.voice_store is not None
+            and self.supports_uploaded_voice_references
+            and batch.ref_audio is None
+            and not batch.references
+            and batch.voice
+            and batch.voice.lower() != "default"
+        ):
+            uploaded_voice = self.voice_store.resolve_reference(batch.voice)
+            if uploaded_voice is None and self.requires_uploaded_voice_for_named_voice:
+                raise bad_request(
+                    f"Unknown voice '{batch.voice}'. Upload a voice first via "
+                    "POST /v1/audio/voices, or use ref_audio + ref_text.",
+                    param="voice",
+                )
+            if (
+                uploaded_voice is not None
+                and task_type is not None
+                and task_type != "Base"
+            ):
+                raise bad_request(
+                    "uploaded voice requests require task_type='Base'",
+                    param="task_type",
+                )
 
     def _resolve_uploaded_voice_reference(
         self, request: CreateSpeechRequest
@@ -339,7 +647,7 @@ class SpeechRequestValidator:
                     f"{param} must be an http, https, data, file:// URL, or local path",
                     param=param,
                 )
-            value = Path(value).expanduser().resolve().as_uri()
+            return {"audio_path": str(Path(value).expanduser().resolve())}
         try:
             return self.reference_connector.load_resource(
                 value,
@@ -546,6 +854,55 @@ def _uploaded_voice_reference_dict(
     return ref
 
 
+def _batch_error_result(index: int, error: SpeechAPIError) -> SpeechBatchResult:
+    return SpeechBatchResult(
+        index=index,
+        status="error",
+        error=openai_error_payload(
+            error.message,
+            error_type=error.error_type,
+            param=error.param,
+            code=error.code,
+        )["error"],
+    )
+
+
+def _batch_item_error(error: SpeechAPIError, *, index: int) -> SpeechAPIError:
+    if error.param is None or error.param.startswith("items."):
+        return error
+    return SpeechAPIError(
+        message=error.message,
+        status_code=error.status_code,
+        error_type=error.error_type,
+        param=f"items.{index}.{error.param}",
+        code=error.code,
+    )
+
+
+def _batch_reference_cache_key(request: CreateSpeechRequest) -> _ReferenceCacheKey:
+    references = tuple(
+        _freeze_reference_value(reference.model_dump(mode="json", exclude_none=True))
+        for reference in request.references or ()
+    )
+    return (
+        request.voice,
+        request.task_type,
+        request.ref_audio,
+        request.ref_text,
+        references,
+    )
+
+
+def _freeze_reference_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(
+            (key, _freeze_reference_value(item)) for key, item in sorted(value.items())
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_reference_value(item) for item in value)
+    return value
+
+
 def _validate_positive_int(value: int | None, *, param: str) -> None:
     if value is not None and value <= 0:
         raise bad_request(f"{param} must be greater than 0", param=param)
@@ -616,3 +973,13 @@ def _validation_error_message(exc: ValidationError) -> str:
     location = ".".join(str(item) for item in first_error.get("loc", ()))
     message = first_error.get("msg") or "invalid speech request"
     return f"{location}: {message}" if location else str(message)
+
+
+def _validation_error_param(
+    exc: ValidationError, *, prefix: str | None = None
+) -> str | None:
+    first_error = exc.errors()[0] if exc.errors() else {}
+    location = ".".join(str(item) for item in first_error.get("loc", ()))
+    if not location:
+        return prefix
+    return f"{prefix}.{location}" if prefix else location

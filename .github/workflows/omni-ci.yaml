@@ -42,6 +42,8 @@ jobs:
     name: omni-ci-gate
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      labels: ${{ steps.pr.outputs.labels || '[]' }}
     steps:
       - name: Fetch latest PR gate state
         if: ${{ github.event_name == 'pull_request' }}
@@ -137,14 +139,17 @@ jobs:
 
   pick-tts-model:
     name: pick TTS model
-    needs: setup
-    if: needs.setup.result == 'success'
+    needs: [preflight, setup]
+    if: needs.preflight.result == 'success' && needs.setup.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       tts_ci_model: ${{ steps.pick.outputs.tts_ci_model }}
     steps:
       - id: pick
         env:
+          PR_LABELS: ${{ needs.preflight.outputs.labels || '[]' }}
+          RUN_HIGGS_LABEL: ${{ contains(fromJson(needs.preflight.outputs.labels || '[]'), 'run-higgs') }}
+          RUN_MOSS_LABEL: ${{ contains(fromJson(needs.preflight.outputs.labels || '[]'), 'run-moss') }}
           TTS_CI_MODEL_OVERRIDE: ${{ github.event.inputs.tts_ci_model }}
         run: |
           models=(higgs moss)
@@ -162,7 +167,21 @@ jobs:
               exit 1
             fi
           else
+            if [[ "${RUN_HIGGS_LABEL}" == "true" && "${RUN_MOSS_LABEL}" == "true" ]]; then
+              echo "::error::Multiple TTS model labels found in PR labels ${PR_LABELS}. Keep only one of: run-higgs run-moss"
+              exit 1
+            fi
+            if [[ "${RUN_HIGGS_LABEL}" == "true" ]]; then
+              selected="higgs"
+            elif [[ "${RUN_MOSS_LABEL}" == "true" ]]; then
+              selected="moss"
+            fi
+          fi
+          if [[ -z "${selected}" ]]; then
+            seed="$(date +%s%N)"
+            RANDOM=$((seed % 32768))
             selected="${models[$((RANDOM % ${#models[@]}))]}"
+            echo "Random seed for TTS CI model: ${seed}"
           fi
           echo "Selected TTS CI model: ${selected}"
           echo "tts_ci_model=${selected}" >> "$GITHUB_OUTPUT"

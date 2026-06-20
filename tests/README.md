@@ -7,6 +7,7 @@ tests/
 ├── data/
 ├── test_model/
 │   ├── conftest.py
+│   ├── test_rl_distributed_weight_update.py
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
@@ -186,6 +187,12 @@ Relevant model CI ownership:
   with `--enable-realtime` and drives `/v1/realtime` through a real WebSocket
   client to cover text responses, server VAD transcription, and disconnect
   teardown.
+- `test_rl_distributed_weight_update.py`: launches a Higgs TTS worker on one GPU
+  and a rank-0 trainer subprocess on another GPU, initializes the distributed
+  weight-update group, broadcasts base-model body weights, verifies the
+  `tts_engine` checksum changes, destroys the update group, and checks the
+  server still serves audio. It is skipped unless two GPUs and the required
+  Higgs base checkpoint are already available in the Hugging Face cache.
 - CLI flags `--s2pro-stage {nonstream,stream,consistency,all}` and
   `--concurrency {1,2,4,8,16,all}`: scope an S2-Pro CI sweep without editing
   source.

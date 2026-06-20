@@ -208,8 +208,6 @@ def test_file_reference_requires_allowlist() -> None:
 @pytest.mark.parametrize(
     ("ref_audio", "expected_param"),
     [
-        ("/tmp/reference.wav", "ref_audio"),
-        ("relative/reference.wav", "ref_audio"),
         ("ftp://example.com/reference.wav", "ref_audio"),
         ("data:audio/wav;base64", "ref_audio"),
         ("data:audio/wav,AAAA", "ref_audio"),
@@ -282,6 +280,87 @@ def test_reference_audio_accepts_allowed_https(
     }
 
 
+def test_reference_audio_accepts_public_https_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SpeechRequestValidator(default_model="tts")
+    monkeypatch.setattr(
+        resource_connector,
+        "_resolve_remote_addresses",
+        _public_test_addresses,
+    )
+    service.reference_connector.connection = _MockHTTPConnection(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "audio/wav"},
+            content=b"RIFF",
+        )
+    )
+
+    request = service.parse_request(
+        {"input": "hello", "ref_audio": "https://example.com/reference.wav"}
+    )
+
+    assert request.ref_audio == "data:audio/wav;base64,UklGRg=="
+
+
+def test_reference_audio_accepts_local_path_by_default(tmp_path: Path) -> None:
+    ref_audio = tmp_path / "reference.wav"
+    ref_audio.write_bytes(b"RIFF")
+    service = SpeechRequestValidator(default_model="tts")
+
+    prepared = service.parse_generation_request(
+        {"input": "hello", "ref_audio": str(ref_audio), "ref_text": "reference text"}
+    )
+    gen_req = service.build_generate_request(
+        prepared.request,
+        validate=False,
+        reference_descriptors=prepared.reference_descriptors,
+    )
+
+    assert prepared.request.ref_audio == str(ref_audio.resolve())
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [
+            {"audio_path": str(ref_audio.resolve()), "text": "reference text"}
+        ],
+    }
+
+
+def test_reference_audio_accepts_relative_local_path_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ref_audio = tmp_path / "relative" / "reference.wav"
+    ref_audio.parent.mkdir()
+    ref_audio.write_bytes(b"RIFF")
+    monkeypatch.chdir(tmp_path)
+    service = SpeechRequestValidator(default_model="tts")
+
+    prepared = service.parse_generation_request(
+        {
+            "input": "hello",
+            "references": [
+                {"audio_path": "relative/reference.wav", "text": "reference text"}
+            ],
+        }
+    )
+    gen_req = service.build_generate_request(
+        prepared.request,
+        validate=False,
+        reference_descriptors=prepared.reference_descriptors,
+    )
+
+    assert prepared.request.references is not None
+    assert prepared.request.references[0].audio_path == str(ref_audio.resolve())
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [
+            {"audio_path": str(ref_audio.resolve()), "text": "reference text"}
+        ],
+    }
+
+
 def test_reference_audio_rejects_http_status_with_speech_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,19 +402,6 @@ def test_reference_audio_honors_allowed_media_domains() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.param == "ref_audio"
-
-
-def test_reference_audio_requires_allowed_media_domain() -> None:
-    service = SpeechRequestValidator(default_model="tts")
-
-    with pytest.raises(SpeechAPIError) as exc_info:
-        service.parse_request(
-            {"input": "hello", "ref_audio": "https://example.com/reference.wav"}
-        )
-
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "ref_audio"
-    assert "allowed-media-domain" in exc_info.value.message
 
 
 def test_reference_audio_rejects_private_remote_addresses() -> None:
@@ -380,6 +446,41 @@ def test_reference_audio_revalidates_redirect_domains(
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.param == "ref_audio"
+
+
+def test_reference_audio_allows_configured_domain_suffix_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SpeechRequestValidator(
+        default_model="tts",
+        allowed_media_domains=["huggingface.co", ".hf.co"],
+    )
+    monkeypatch.setattr(
+        resource_connector,
+        "_resolve_remote_addresses",
+        _public_test_addresses,
+    )
+    service.reference_connector.connection = _MockHTTPConnection(
+        lambda request: (
+            httpx.Response(
+                302,
+                headers={"location": "https://us.aws.cdn.hf.co/reference.wav"},
+            )
+            if request.url.host == "huggingface.co"
+            else httpx.Response(
+                200,
+                content=b"RIFF",
+                headers={"content-type": "audio/wav"},
+            )
+        )
+    )
+
+    request = service.parse_request(
+        {"input": "hello", "ref_audio": "https://huggingface.co/reference.wav"}
+    )
+
+    assert request.ref_audio is not None
+    assert request.ref_audio.startswith("data:audio/wav;base64,")
 
 
 def test_reference_audio_revalidates_redirect_addresses(
@@ -477,19 +578,23 @@ def test_speech_service_rejects_oversized_input(
     assert exc_info.value.param == "input"
 
 
-def test_reference_list_rejects_raw_local_path() -> None:
+def test_reference_list_accepts_raw_local_path(tmp_path: Path) -> None:
+    audio_path = tmp_path / "reference.wav"
+    audio_path.write_bytes(b"RIFF")
     service = SpeechRequestValidator(default_model="tts")
 
-    with pytest.raises(SpeechAPIError) as exc_info:
-        service.parse_request(
-            {
-                "input": "hello",
-                "references": [{"audio_path": "/tmp/reference.wav"}],
-            }
-        )
+    request = service.parse_request(
+        {
+            "input": "hello",
+            "references": [{"audio_path": str(audio_path)}],
+        }
+    )
+    gen_req = service.build_generate_request(request, validate=False)
 
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.param == "references.audio_path"
+    assert gen_req.prompt == {
+        "text": "hello",
+        "references": [{"audio_path": str(audio_path.resolve())}],
+    }
 
 
 def test_reference_list_rejects_invalid_base64_data_url() -> None:

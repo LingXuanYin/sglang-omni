@@ -44,6 +44,15 @@ Usage:
         --output-dir results/moss_tts_en \
         --lang en --max-concurrency 16
 
+    python -m benchmarks.eval.benchmark_tts_seedtts \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
+        --model OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --port 8000 \
+        --ref-format references \
+        --token-count auto \
+        --output-dir results/moss_tts_en \
+        --lang en --max-concurrency 16
+
+
 3. For CI settings, separate the generate and transcribe phases into two runs.
 
 Usage (CI):

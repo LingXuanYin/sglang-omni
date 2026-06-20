@@ -149,6 +149,14 @@ def _unsafe_remote_address_category(
     return None
 
 
+def _is_allowed_remote_domain(hostname: str, allowed_domain: str) -> bool:
+    allowed_domain = allowed_domain.rstrip(".").lower()
+    if allowed_domain.startswith("."):
+        suffix = allowed_domain[1:]
+        return hostname == suffix or hostname.endswith(allowed_domain)
+    return hostname == allowed_domain
+
+
 def _read_limited_response_bytes(
     response: httpx.Response, *, max_bytes: int | None
 ) -> bytes:
@@ -243,9 +251,9 @@ class MultiModalResourceConnector:
             raise ValueError(
                 "Remote media URLs require --allowed-media-domain to be configured."
             )
-        if (
-            self.allowed_media_domains
-            and normalized_hostname not in self.allowed_media_domains
+        if self.allowed_media_domains and not any(
+            _is_allowed_remote_domain(normalized_hostname, domain)
+            for domain in self.allowed_media_domains
         ):
             raise ValueError(f"Domain {hostname} is not allowed.")
 
