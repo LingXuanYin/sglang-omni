@@ -13,6 +13,7 @@ from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
+from sglang_omni.models.higgs_tts.sampler import K_MAX
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     HiggsStreamingVocoderScheduler,
@@ -676,6 +677,63 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     assert datas[3].output_codes[0].tolist() == [EOC_ID, 3, 4]
     assert reqs[3].finished_reason.to_json() == {"type": "stop", "matched": EOC_ID}
     assert all(reqs[i].finished_reason is None for i in (0, 1, 2))
+
+
+def test_higgs_populate_cg_buffers_copies_tensor_sampling_params() -> None:
+    """Tensor-native SGLang sampling_info should populate CG buffers directly."""
+    bs = 4
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._async_enabled = False
+
+    class FakePool:
+        def __init__(self) -> None:
+            self.delay_count = torch.arange(bs, dtype=torch.int32)
+            self.eoc_countdown = torch.full((bs,), -1, dtype=torch.int32)
+            self.generation_done = torch.tensor([False, True, False, False])
+            self.last_codes = torch.arange(bs * 3, dtype=torch.long).reshape(bs, 3)
+            self.seeds = torch.arange(10, 10 + bs, dtype=torch.long)
+            self.step_count = torch.arange(20, 20 + bs, dtype=torch.long)
+
+        def reset_row(self, row: int) -> None:
+            self.delay_count[row] = 0
+            self.generation_done[row] = False
+
+    rid_to_row = {"req-0": 0, "req-1": 1}
+    runner.model = SimpleNamespace(
+        _padding_row=3,
+        _sampler_pool=FakePool(),
+        acquire_row=lambda rid: rid_to_row[rid],
+        _cg_row_indices=torch.zeros(bs, dtype=torch.long),
+        _cg_temperature=torch.zeros(bs, dtype=torch.float32),
+        _cg_top_p=torch.zeros(bs, dtype=torch.float32),
+        _cg_top_k_buf=torch.zeros(bs, dtype=torch.long),
+        _cg_active_delay_count=torch.zeros(bs, dtype=torch.int32),
+        _cg_active_eoc_countdown=torch.zeros(bs, dtype=torch.int32),
+        _cg_active_generation_done=torch.zeros(bs, dtype=torch.bool),
+        _cg_active_last_codes=torch.zeros((bs, 3), dtype=torch.long),
+        _cg_active_seeds=torch.zeros(bs, dtype=torch.long),
+        _cg_active_step_count=torch.zeros(bs, dtype=torch.long),
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=bs,
+        sampling_info=SimpleNamespace(
+            temperatures=torch.tensor([0.7, 0.8], dtype=torch.float32),
+            top_ps=torch.tensor([0.91, 0.92], dtype=torch.float32),
+            top_ks=torch.tensor([0, 17], dtype=torch.long),
+        ),
+    )
+
+    runner._populate_cg_buffers(
+        forward_batch,
+        [SimpleNamespace(request_id="req-0"), SimpleNamespace(request_id="req-1")],
+    )
+
+    model = runner.model
+    assert model._cg_row_indices.tolist() == [0, 1, 3, 3]
+    assert torch.allclose(model._cg_temperature, torch.tensor([0.7, 0.8, 1.0, 1.0]))
+    assert torch.allclose(model._cg_top_p, torch.tensor([0.91, 0.92, 1.0, 1.0]))
+    assert model._cg_top_k_buf.tolist() == [K_MAX, 17, K_MAX, K_MAX]
+    assert model._cg_active_seeds.tolist() == [10, 11, 13, 13]
 
 
 def test_higgs_model_runner_skips_already_finished_eager_request() -> None:

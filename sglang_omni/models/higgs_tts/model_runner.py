@@ -17,7 +17,6 @@ import torch
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.higgs_tts.model import _flat_sampling_attr
 from sglang_omni.models.higgs_tts.sampler import K_MAX
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID
@@ -160,22 +159,10 @@ class HiggsTTSModelRunner(ModelRunner):
                 done, torch.full_like(rows_t_real, model._padding_row), rows_t_real
             )
 
-        temps, top_ps, top_ks = self._extract_decode_sampling_params(
-            forward_batch, n_real
-        )
-        temps.extend([1.0] * (bs - n_real))
-        top_ps.extend([1.0] * (bs - n_real))
-        model._cg_temperature[:bs] = torch.tensor(
-            temps, dtype=torch.float32, device=model._cg_temperature.device
-        )
-        model._cg_top_p[:bs] = torch.tensor(
-            top_ps, dtype=torch.float32, device=model._cg_top_p.device
-        )
-
-        top_k_vals = [(tk if (tk is not None and tk > 0) else K_MAX) for tk in top_ks]
-        top_k_vals.extend([K_MAX] * (bs - n_real))
-        model._cg_top_k_buf[:bs] = torch.tensor(
-            top_k_vals, dtype=torch.long, device=model._cg_top_k_buf.device
+        self._populate_decode_sampling_buffers(
+            forward_batch=forward_batch,
+            n_real=n_real,
+            bs=bs,
         )
 
         rows_t = model._cg_row_indices[:bs]
@@ -187,32 +174,120 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
 
-    @staticmethod
-    def _extract_decode_sampling_params(forward_batch, n_real: int):
-        """Pull per-row temperature / top_p / top_k off sglang's
-        ``sampling_info`` with safe defaults. ``top_k`` values outside
-        ``(0, K_MAX)`` (including sglang's ``TOP_K_ALL`` sentinel for
-        unspecified top_k) are normalized to ``None`` — the downstream
-        buffer maps that to ``K_MAX`` = no-op filter.
+    def _populate_decode_sampling_buffers(
+        self,
+        *,
+        forward_batch: Any,
+        n_real: int,
+        bs: int,
+    ) -> None:
+        """Copy decode sampling params into reusable CG buffers.
+
+        SGLang often exposes these values as tensors already. Keep that path
+        tensor-native so decode setup does not force a CPU list conversion before
+        immediately sending the same values back to the GPU.
         """
+        model = self.model
+        model._cg_temperature[:bs].fill_(1.0)
+        model._cg_top_p[:bs].fill_(1.0)
+        model._cg_top_k_buf[:bs].fill_(K_MAX)
+
         sampling_info = getattr(forward_batch, "sampling_info", None)
         if sampling_info is None or n_real == 0:
-            return ([1.0] * n_real, [1.0] * n_real, [None] * n_real)
+            return
 
-        temps_raw = _flat_sampling_attr(sampling_info, "temperatures") or [1.0] * n_real
-        top_ps_raw = _flat_sampling_attr(sampling_info, "top_ps") or [1.0] * n_real
-        top_ks_raw = _flat_sampling_attr(sampling_info, "top_ks")
+        self._copy_sampling_attr(
+            sampling_info,
+            "temperatures",
+            out=model._cg_temperature,
+            n_real=n_real,
+            dtype=torch.float32,
+            default=1.0,
+        )
+        self._copy_sampling_attr(
+            sampling_info,
+            "top_ps",
+            out=model._cg_top_p,
+            n_real=n_real,
+            dtype=torch.float32,
+            default=1.0,
+        )
+        top_k = self._sampling_attr_tensor(
+            sampling_info,
+            "top_ks",
+            n_real=n_real,
+            dtype=torch.long,
+            device=model._cg_top_k_buf.device,
+            default=K_MAX,
+            allow_none=True,
+        )
+        if top_k is not None:
+            top_k = torch.where(
+                (top_k > 0) & (top_k < K_MAX),
+                top_k,
+                torch.full_like(top_k, K_MAX),
+            )
+            model._cg_top_k_buf[:n_real].copy_(top_k)
 
-        temps = [float(t) for t in temps_raw[:n_real]]
-        top_ps = [float(t) for t in top_ps_raw[:n_real]]
-        if top_ks_raw is None:
-            top_ks: list[int | None] = [None] * n_real
+    @staticmethod
+    def _copy_sampling_attr(
+        sampling_info: Any,
+        attr: str,
+        *,
+        out: torch.Tensor,
+        n_real: int,
+        dtype: torch.dtype,
+        default: float,
+    ) -> None:
+        values = HiggsTTSModelRunner._sampling_attr_tensor(
+            sampling_info,
+            attr,
+            n_real=n_real,
+            dtype=dtype,
+            device=out.device,
+            default=default,
+            allow_none=False,
+        )
+        if values is not None:
+            out[:n_real].copy_(values)
+
+    @staticmethod
+    def _sampling_attr_tensor(
+        sampling_info: Any,
+        attr: str,
+        *,
+        n_real: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        default: float | int,
+        allow_none: bool,
+    ) -> torch.Tensor | None:
+        raw = getattr(sampling_info, attr, None)
+        if raw is None:
+            return (
+                None
+                if allow_none
+                else torch.full((n_real,), default, dtype=dtype, device=device)
+            )
+
+        if isinstance(raw, torch.Tensor):
+            values = raw.detach().flatten()[:n_real].to(device=device, dtype=dtype)
         else:
-            top_ks = [
-                int(t) if (t is not None and 0 < int(t) < K_MAX) else None
-                for t in top_ks_raw[:n_real]
-            ]
-        return temps, top_ps, top_ks
+            if allow_none:
+                normalized = [
+                    default if value is None else value for value in list(raw)[:n_real]
+                ]
+            else:
+                normalized = list(raw)[:n_real]
+            values = torch.as_tensor(normalized, dtype=dtype, device=device).flatten()
+
+        if values.numel() >= n_real:
+            return values[:n_real]
+
+        padded = torch.full((n_real,), default, dtype=dtype, device=device)
+        if values.numel() > 0:
+            padded[: values.numel()].copy_(values)
+        return padded
 
     def _collect_step_outputs_cg(
         self, result: Any, forward_batch: Any, requests: list
