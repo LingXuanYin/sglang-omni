@@ -126,6 +126,10 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     assert config.terminal_stages == ["vocoder"]
     assert config.gpu_placement == {"tts_engine": 0, "vocoder": 0}
     assert {stage.process for stage in config.stages} == {"pipeline"}
+    preprocessing = next(
+        stage for stage in config.stages if stage.name == "preprocessing"
+    )
+    assert preprocessing.factory_args == {"device": "cuda:0", "dtype": "float32"}
     assert config.supports_uploaded_voice_references() is True
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
@@ -137,6 +141,31 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     assert MossTTSPipelineConfig.talker_sglang_role_to_stage() == {
         "talker": "tts_engine"
     }
+
+
+def test_moss_preprocessing_executor_prefers_gpu_with_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import stages
+
+    captured: list[tuple[str, str]] = []
+
+    def fake_load_processor(model_path, *, device, dtype):
+        del model_path
+        captured.append((device, dtype))
+        return object()
+
+    monkeypatch.setattr(stages, "_load_moss_processor", fake_load_processor)
+    try:
+        monkeypatch.setattr(stages.torch.cuda, "is_available", lambda: True)
+        stages.create_preprocessing_executor("ckpt")
+        assert captured[-1] == ("cuda:0", "float32")
+
+        monkeypatch.setattr(stages.torch.cuda, "is_available", lambda: False)
+        stages.create_preprocessing_executor("ckpt", device="cuda:1", dtype="bfloat16")
+        assert captured[-1] == ("cpu", "bfloat16")
+    finally:
+        clear_moss_tts_preprocessing_context()
 
 
 def test_moss_tts_engine_uses_auto_mem_fraction_by_default(monkeypatch) -> None:
