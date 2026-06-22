@@ -1697,6 +1697,70 @@ def test_write_feedback_buffers_records_decode_input_history() -> None:
     )
 
 
+def test_write_feedback_buffers_avoids_batch_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The decode hot path writes rows directly instead of stacking a temp batch."""
+    feedback_buffer = torch.zeros(2, 2)
+    feedback_mask = torch.zeros(2, dtype=torch.bool)
+    requests = [
+        _sched_req(
+            pending_feedback_queue=deque([torch.tensor([1.0, 2.0])]),
+            pending_text_queue=deque([torch.tensor([10.0, 20.0])]),
+            decode_input_embeds=[],
+        ),
+        _sched_req(
+            pending_feedback_queue=deque([torch.tensor([3.0, 4.0])]),
+            pending_text_queue=deque([torch.tensor([30.0, 40.0])]),
+            decode_input_embeds=[],
+        ),
+    ]
+    runner = object.__new__(QwenTalkerModelRunner)
+    runner.model = SimpleNamespace(
+        _feedback_buffer=feedback_buffer,
+        _feedback_mask=feedback_mask,
+    )
+
+    def fail_stack(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("decode feedback path should not call torch.stack")
+
+    monkeypatch.setattr(torch, "stack", fail_stack)
+
+    runner._write_feedback_buffers(requests)
+
+    assert feedback_mask.tolist() == [True, True]
+    assert torch.equal(feedback_buffer[0], torch.tensor([11.0, 22.0]))
+    assert torch.equal(feedback_buffer[1], torch.tensor([33.0, 44.0]))
+
+
+def test_project_assistant_chunk_uses_cached_single_token_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Token-id chunks should not build a one-token batch when cache is warm."""
+    builder = object.__new__(TalkerPrefillBuilder)
+    builder._thinker_embed_cache = {7: torch.tensor([1.0, 2.0])}
+    builder._device = torch.device("cpu")
+    builder._dtype = torch.float32
+    builder._model = SimpleNamespace(text_projection=lambda tensor: tensor + 1.0)
+
+    def fail_load(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("cached token chunk should not load embedding rows")
+
+    monkeypatch.setattr(
+        "sglang_omni.models.qwen3_omni.components.talker_prefill."
+        "load_thinker_embedding_rows",
+        fail_load,
+    )
+
+    projected = builder.project_assistant_chunk(
+        SimpleNamespace(metadata={"token_id": 7}, data=None)
+    )
+
+    assert torch.equal(projected, torch.tensor([2.0, 3.0]))
+
+
 def test_projected_prefill_retract_replays_generated_decode_inputs() -> None:
     """Retracted prefill can span prompt suffix and generated codec tokens."""
     full_embeds = torch.arange(20, dtype=torch.float32).reshape(10, 2)

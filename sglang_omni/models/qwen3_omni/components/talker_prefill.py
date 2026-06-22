@@ -293,9 +293,7 @@ class TalkerPrefillBuilder:
         metadata = chunk.metadata or {}
         token_id = metadata.get("token_id")
         if token_id is not None:
-            chunk_tensor = self._load_prompt_token_embeddings(
-                torch.tensor([int(token_id)], dtype=torch.long)
-            )
+            chunk_tensor = self._load_prompt_token_embedding(int(token_id))
         else:
             chunk_tensor = chunk.data.to(
                 device=self._device, dtype=self._dtype
@@ -372,6 +370,17 @@ class TalkerPrefillBuilder:
         )
 
         return prompt_ids, prompt_embed, prompt_hidden, prompt_model_inputs
+
+    def _load_prompt_token_embedding(self, token_id: int) -> torch.Tensor:
+        cached = self._thinker_embed_cache.get(token_id)
+        if cached is None:
+            loaded = load_thinker_embedding_rows(self._model_path, [token_id]).to(
+                device=self._device,
+                dtype=self._dtype,
+            )
+            cached = loaded[0].detach().clone()
+            self._thinker_embed_cache[token_id] = cached
+        return cached.unsqueeze(0)
 
     def _load_prompt_token_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids = token_ids.to(dtype=torch.long).view(-1).cpu()
