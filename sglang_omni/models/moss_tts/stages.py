@@ -176,6 +176,15 @@ def _load_moss_processor(
     return processor
 
 
+def _resolve_preprocessing_device(device: str) -> str:
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        logger.warning(
+            "CUDA is unavailable; loading MOSS-TTS preprocessing processor on CPU"
+        )
+        return "cpu"
+    return device
+
+
 def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
     if not (state.prompt_tokens or state.completion_tokens or state.engine_time_s):
         return None
@@ -190,17 +199,15 @@ def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int = 8
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+    device: str = "cuda:0",
+    dtype: str = "float32",
 ) -> SimpleScheduler:
-    processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
+    device = _resolve_preprocessing_device(device)
+    processor = _load_moss_processor(model_path, device=device, dtype=dtype)
     set_moss_tts_preprocessing_context(processor=processor)
-    # Preprocessing is CPU-heavy: every request tokenizes text and encodes the
-    # reference audio through the MOSS audio tokenizer. Serial execution
-    # (max_concurrency=1) lets the codec encode dominate wall-clock and starves
-    # the AR engine to batch size 1 (the dominant RTF cost). Run several in
-    # parallel — threads release the GIL during the torch codec forward — so the
-    # AR OmniScheduler receives a steady, batchable request stream. Mirrors the
-    # fishaudio_s2_pro preprocessing stage, which encodes references the same way.
     return SimpleScheduler(
         preprocess_moss_tts_payload,
         abort_callback=cleanup_prepared_moss_tts_request,

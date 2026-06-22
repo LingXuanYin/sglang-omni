@@ -39,6 +39,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
+            factory_args={"device": "cuda:0", "dtype": "float32"},
             next="tts_engine",
         ),
         StageConfig(
