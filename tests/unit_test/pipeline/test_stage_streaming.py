@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import multiprocessing
 import pickle
 import queue
-import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -17,8 +15,9 @@ from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
 from sglang_omni.pipeline import relay_io
 from sglang_omni.pipeline.stage.runtime import Stage
-from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
+from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
+from sglang_omni.relay.shm import ShmRelay
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 
@@ -97,55 +96,60 @@ def _payload_metadata(payload: StagePayload) -> dict:
     }
 
 
-def _cuda_ipc_stage_receiver(msg_queue, result_queue) -> None:
-    try:
-        torch.cuda.set_device(0)
-        msg = msg_queue.get(timeout=30)
+# Stream chunks now always move through the transport router's relay (CUDA-IPC on
+# GPU, shm on CPU). These helpers build real relay-backed messages over an
+# in-process ShmRelay so the receive path is exercised end to end, matching what
+# ``relay_io.send_stream_chunk`` / ``write_payload`` produce on the wire.
 
-        async def _run() -> None:
-            scheduler = SimpleNamespace(
-                outbox=queue.Queue(),
-                inbox=queue.Queue(),
-                abort=lambda request_id: None,
-            )
-            stage = Stage(
-                name="vocoder",
-                role="single",
-                get_next=lambda request_id, output: None,
-                gpu_id=0,
-                endpoints={},
-                control_plane=_FakeControlPlane(),
-                relay=_FakeRelay(),
-                scheduler=scheduler,
-            )
-            stage._stream_queue = StreamQueue(max_pending=4096)
-            stage._stream_queue.open("req")
 
-            await stage._on_stream_chunk(msg)
+async def _make_relay_chunk(
+    relay,
+    *,
+    request_id: str,
+    from_stage: str,
+    to_stage: str,
+    chunk_id: int,
+    data,
+    metadata: dict | None = None,
+) -> DataReadyMessage:
+    blob_key = f"{request_id}:stream:{from_stage}:{to_stage}:{chunk_id}"
+    relay_metadata, op = await relay_io.write_blob(relay, blob_key, data)
+    await op.wait_for_completion()
+    if metadata:
+        cleaned, tensor_dict = relay_io.extract_tensors(metadata)
+        relay_metadata["chunk_metadata"] = cleaned
+        if tensor_dict:
+            refs: dict = {}
+            for idx, (key, tensor) in enumerate(tensor_dict.items()):
+                meta_key = f"{blob_key}:meta:{idx}"
+                meta_meta, meta_op = await relay_io.write_blob(relay, meta_key, tensor)
+                await meta_op.wait_for_completion()
+                refs[key] = {"blob_key": meta_key, "relay_metadata": meta_meta}
+            relay_metadata["chunk_metadata_tensors"] = refs
+    return DataReadyMessage(
+        request_id=request_id,
+        from_stage=from_stage,
+        to_stage=to_stage,
+        shm_metadata=relay_metadata,
+        chunk_id=chunk_id,
+    )
 
-            queued = scheduler.inbox.get_nowait()
-            item = queued.data
-            result_queue.put(
-                {
-                    "message_type": queued.type,
-                    "chunk_id": item.chunk_id,
-                    "data": item.data.detach().cpu().tolist(),
-                    "modality": item.metadata["modality"],
-                    "nested_hidden": item.metadata["nested"]["layer_hidden"]
-                    .detach()
-                    .cpu()
-                    .tolist(),
-                    "pair_tensor": item.metadata["pair"][0].detach().cpu().tolist(),
-                    "pair_value": item.metadata["pair"][1],
-                }
-            )
 
-            del item, queued, stage, scheduler
-            torch.cuda.synchronize()
-
-        asyncio.run(_run())
-    except BaseException:
-        result_queue.put({"error": traceback.format_exc()})
+async def _make_relay_payload(
+    relay,
+    payload: StagePayload,
+    *,
+    from_stage: str = "tts_engine",
+    to_stage: str = "vocoder",
+) -> DataReadyMessage:
+    metadata, op = await relay_io.write_payload(relay, payload.request_id, payload)
+    await op.wait_for_completion()
+    return DataReadyMessage(
+        request_id=payload.request_id,
+        from_stage=from_stage,
+        to_stage=to_stage,
+        shm_metadata=metadata,
+    )
 
 
 def test_terminal_scheduler_stream_routes_to_coordinator() -> None:
@@ -265,6 +269,7 @@ def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
+        relay = ShmRelay(engine_id="t", device="cpu")
         stage = Stage(
             name="vocoder",
             role="single",
@@ -272,19 +277,20 @@ def test_stage_fails_pre_payload_stream_chunk_by_default() -> None:
             gpu_id=None,
             endpoints={},
             control_plane=control_plane,
-            relay=_AbortOnReadRelay(lambda: None),
+            relay=relay,
             scheduler=scheduler,
         )
         stage._stream_queue = StreamQueue(max_pending=4096)
         codes = torch.arange(11, dtype=torch.float32)
 
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata=relay_io.serialize_ipc_chunk(codes, None),
                 chunk_id=0,
+                data=codes,
             )
         )
 
@@ -304,6 +310,7 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
+        relay = ShmRelay(engine_id="t", device="cpu")
         stage = Stage(
             name="vocoder",
             role="single",
@@ -311,7 +318,7 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
             gpu_id=None,
             endpoints={},
             control_plane=control_plane,
-            relay=_AbortOnReadRelay(lambda: None),
+            relay=relay,
             scheduler=scheduler,
         )
         stage._stream_queue = StreamQueue(max_pending=4096)
@@ -320,22 +327,16 @@ def test_stage_routes_stream_chunk_after_payload_by_default() -> None:
             request=OmniRequest(inputs="hello"),
             data={"ready": True},
         )
-        await stage._on_data_ready(
-            DataReadyMessage(
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                shm_metadata=_payload_metadata(payload),
-            )
-        )
+        await stage._on_data_ready(await _make_relay_payload(relay, payload))
         codes = torch.arange(11, dtype=torch.float32)
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata=relay_io.serialize_ipc_chunk(codes, None),
                 chunk_id=0,
+                data=codes,
             )
         )
         payload_msg = scheduler.inbox.get_nowait()
@@ -355,6 +356,7 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
+        relay = ShmRelay(engine_id="t", device="cpu")
         stage = Stage(
             name="vocoder",
             role="single",
@@ -362,7 +364,7 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             gpu_id=None,
             endpoints={},
             control_plane=control_plane,
-            relay=_AbortOnReadRelay(lambda: None),
+            relay=relay,
             scheduler=scheduler,
             can_accept_stream_before_payload=True,
         )
@@ -370,14 +372,14 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
         codes = torch.arange(11, dtype=torch.float32)
 
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata=relay_io.serialize_ipc_chunk(
-                    codes, {"modality": "audio_codes"}
-                ),
                 chunk_id=0,
+                data=codes,
+                metadata={"modality": "audio_codes"},
             )
         )
 
@@ -405,71 +407,13 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
             request=OmniRequest(inputs="hello"),
             data={"ready": True},
         )
-        await stage._on_data_ready(
-            DataReadyMessage(
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                shm_metadata=_payload_metadata(payload),
-            )
-        )
+        await stage._on_data_ready(await _make_relay_payload(relay, payload))
         payload_msg = scheduler.inbox.get_nowait()
         assert payload_msg.request_id == "req"
         assert payload_msg.type == "new_request"
         assert payload_msg.data.data == {"ready": True}
 
     asyncio.run(_run())
-
-
-def test_stage_stream_chunk_received_after_ipc_materialization(monkeypatch) -> None:
-    """The paired receive event marks scheduler-ready chunks, not control arrival."""
-    order: list[str] = []
-
-    def fake_deserialize(msg):
-        order.append("deserialized")
-        return StreamItem(
-            chunk_id=msg.chunk_id,
-            data="chunk",
-            from_stage=msg.from_stage,
-            metadata=None,
-        )
-
-    async def fake_route(self, request_id, item):
-        del self, request_id, item
-        order.append("routed")
-
-    monkeypatch.setattr(Stage, "_deserialize_ipc_chunk", staticmethod(fake_deserialize))
-    monkeypatch.setattr(Stage, "_route_stream_item_or_fail", fake_route)
-    monkeypatch.setattr(
-        "sglang_omni.pipeline.stage.runtime._emit_event",
-        lambda **kwargs: order.append(kwargs["event_name"]),
-    )
-
-    async def _run() -> None:
-        stage = Stage(
-            name="vocoder",
-            role="single",
-            get_next=lambda request_id, output: None,
-            gpu_id=None,
-            endpoints={},
-            control_plane=_FakeControlPlane(),
-            relay=_FakeRelay(),
-            scheduler=SimpleNamespace(outbox=queue.Queue()),
-            can_accept_stream_before_payload=True,
-        )
-        await stage._on_stream_chunk(
-            DataReadyMessage(
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                shm_metadata={"_ipc": True, "tensor_bytes": b"unused"},
-                chunk_id=0,
-            )
-        )
-
-    asyncio.run(_run())
-
-    assert order == ["deserialized", "stage_stream_chunk_received", "routed"]
 
 
 def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) -> None:
@@ -481,8 +425,8 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
         order.append("blob")
         return "chunk"
 
-    async def fake_read_metadata(self, shm_metadata, blob_key):
-        del self, shm_metadata, blob_key
+    async def fake_read_metadata(self, relay, shm_metadata, blob_key):
+        del self, relay, shm_metadata, blob_key
         order.append("metadata")
         return {"modality": "audio_codes"}
 
@@ -591,378 +535,6 @@ def test_send_stream_chunk_uses_relay() -> None:
         }
 
     asyncio.run(_run())
-
-
-def test_send_stream_chunk_uses_relay_for_cpu_same_gpu_chunk() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            same_gpu_targets={"vocoder"},
-        )
-
-        assert len(relay.puts) == 1
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
-
-    asyncio.run(_run())
-
-
-def test_send_stream_chunk_uses_ipc_for_detected_cuda_same_gpu_chunk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
-
-        monkeypatch.setattr(relay_io, "_is_cuda_tensor", lambda data: data is codes)
-        monkeypatch.setattr(
-            relay_io,
-            "serialize_ipc_chunk",
-            lambda data, metadata: {
-                "_ipc": True,
-                "data": data.tolist(),
-                "metadata": metadata,
-            },
-        )
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            metadata={"modality": "audio_codes"},
-            same_gpu_targets={"vocoder"},
-        )
-
-        assert relay.puts == []
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert msg.shm_metadata == {
-            "_ipc": True,
-            "data": codes.tolist(),
-            "metadata": {"modality": "audio_codes"},
-        }
-
-    asyncio.run(_run())
-
-
-def test_send_stream_chunk_falls_back_to_relay_for_cpu_tensor_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
-        metadata = {"modality": "audio_codes", "stats": torch.arange(3)}
-
-        monkeypatch.setattr(relay_io, "_is_cuda_tensor", lambda data: data is codes)
-        monkeypatch.setattr(
-            relay_io,
-            "serialize_ipc_chunk",
-            lambda data, metadata: pytest.fail("CPU tensor metadata must use relay"),
-        )
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            metadata=metadata,
-            same_gpu_targets={"vocoder"},
-        )
-
-        assert len(relay.puts) == 2
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
-        assert msg.shm_metadata["chunk_metadata"] == {
-            "modality": "audio_codes",
-            "stats": {
-                "_tensor_placeholder": "stats",
-                "shape": [3],
-                "dtype": "torch.int64",
-                "device": "cpu",
-            },
-        }
-        assert set(msg.shm_metadata["chunk_metadata_tensors"]) == {"stats"}
-
-    asyncio.run(_run())
-
-
-def test_send_stream_chunk_falls_back_to_relay_for_large_inline_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
-        transcript = "x" * (128 * 1024)
-
-        monkeypatch.setattr(relay_io, "_is_cuda_tensor", lambda data: data is codes)
-        monkeypatch.setattr(
-            relay_io,
-            "serialize_ipc_chunk",
-            lambda data, metadata: pytest.fail("large metadata must use relay"),
-        )
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            metadata={"modality": "audio_codes", "transcript": transcript},
-            same_gpu_targets={"vocoder"},
-        )
-
-        assert len(relay.puts) == 1
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
-        assert msg.shm_metadata["chunk_metadata"] == {
-            "modality": "audio_codes",
-            "transcript": transcript,
-        }
-
-    asyncio.run(_run())
-
-
-def test_send_stream_chunk_falls_back_to_relay_for_large_python_container_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32)
-        token_ids = list(range(128 * 1024))
-
-        monkeypatch.setattr(relay_io, "_is_cuda_tensor", lambda data: data is codes)
-        monkeypatch.setattr(
-            relay_io,
-            "serialize_ipc_chunk",
-            lambda data, metadata: pytest.fail("large metadata must use relay"),
-        )
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            metadata={"modality": "audio_codes", "token_ids": token_ids},
-            same_gpu_targets={"vocoder"},
-        )
-
-        assert len(relay.puts) == 1
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
-        assert msg.shm_metadata["chunk_metadata"] == {
-            "modality": "audio_codes",
-            "token_ids": token_ids,
-        }
-
-    asyncio.run(_run())
-
-
-def test_send_stream_chunk_rejects_mixed_cuda_cpu_data_object_graph(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        cuda_codes = torch.arange(11, dtype=torch.float32)
-        cpu_stats = torch.arange(3)
-
-        monkeypatch.setattr(
-            relay_io,
-            "_is_cuda_tensor",
-            lambda data: data is cuda_codes,
-        )
-        monkeypatch.setattr(
-            relay_io,
-            "serialize_ipc_chunk",
-            lambda data, metadata: pytest.fail("mixed data must not use IPC"),
-        )
-
-        with pytest.raises(ValueError, match="mixed object graphs"):
-            await relay_io.send_stream_chunk(
-                relay,
-                control_plane,
-                request_id="req",
-                data={"codes": cuda_codes, "stats": cpu_stats},
-                target_stage="vocoder",
-                target_endpoint="inproc://vocoder",
-                from_stage="tts_engine",
-                chunk_id=0,
-                metadata={"modality": "audio_codes"},
-                same_gpu_targets={"vocoder"},
-            )
-
-        assert relay.puts == []
-        assert control_plane.stage_messages == []
-
-    asyncio.run(_run())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_send_stream_chunk_uses_cuda_ipc_for_cuda_same_gpu_chunk() -> None:
-    async def _run() -> None:
-        ctx = multiprocessing.get_context("spawn")
-        msg_queue = ctx.Queue()
-        result_queue = ctx.Queue()
-        receiver = ctx.Process(
-            target=_cuda_ipc_stage_receiver,
-            args=(msg_queue, result_queue),
-        )
-        receiver.start()
-
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32, device="cuda")
-        hidden = torch.ones(2, dtype=torch.float32, device="cuda")
-        pair_hidden = hidden + 1
-        metadata = {
-            "modality": "audio_codes",
-            "nested": {"layer_hidden": hidden},
-            "pair": (pair_hidden, "kept"),
-        }
-
-        try:
-            await relay_io.send_stream_chunk(
-                relay,
-                control_plane,
-                request_id="req",
-                data=codes,
-                target_stage="vocoder",
-                target_endpoint="inproc://vocoder",
-                from_stage="tts_engine",
-                chunk_id=0,
-                metadata=metadata,
-                same_gpu_targets={"vocoder"},
-            )
-
-            assert relay.puts == []
-            assert len(control_plane.stage_messages) == 1
-            _, _, msg = control_plane.stage_messages[0]
-            assert msg.shm_metadata["_ipc"] is True
-            assert "relay_info" not in msg.shm_metadata
-
-            msg_queue.put(msg)
-            result = result_queue.get(timeout=30)
-        finally:
-            receiver.join(timeout=30)
-            if receiver.is_alive():
-                receiver.terminate()
-                receiver.join(timeout=10)
-            msg_queue.close()
-            result_queue.close()
-
-        assert receiver.exitcode == 0
-        assert "error" not in result, result.get("error")
-        assert result == {
-            "message_type": "stream_chunk",
-            "chunk_id": 0,
-            "data": codes.detach().cpu().tolist(),
-            "modality": "audio_codes",
-            "nested_hidden": hidden.detach().cpu().tolist(),
-            "pair_tensor": pair_hidden.detach().cpu().tolist(),
-            "pair_value": "kept",
-        }
-
-    asyncio.run(_run())
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_send_stream_chunk_uses_relay_for_cuda_non_same_gpu_chunk() -> None:
-    async def _run() -> None:
-        control_plane = _FakeControlPlane()
-        relay = _FakeRelay()
-        codes = torch.arange(11, dtype=torch.float32, device="cuda")
-
-        await relay_io.send_stream_chunk(
-            relay,
-            control_plane,
-            request_id="req",
-            data=codes,
-            target_stage="vocoder",
-            target_endpoint="inproc://vocoder",
-            from_stage="tts_engine",
-            chunk_id=0,
-            metadata={"modality": "audio_codes"},
-            same_gpu_targets={"other_stage"},
-        )
-
-        assert len(relay.puts) == 1
-        assert len(control_plane.stage_messages) == 1
-        _, _, msg = control_plane.stage_messages[0]
-        assert "_ipc" not in msg.shm_metadata
-        assert msg.shm_metadata["chunk_metadata"] == {"modality": "audio_codes"}
-
-    asyncio.run(_run())
-
-
-def test_ipc_stream_chunk_survives_control_plane_serialization() -> None:
-    pytest.importorskip("msgpack")
-    from sglang_omni.pipeline.control_plane import (
-        deserialize_message,
-        serialize_message,
-    )
-
-    codes = torch.arange(3, dtype=torch.float32)
-    hidden = torch.tensor([4.0, 5.0])
-    msg = DataReadyMessage(
-        request_id="req",
-        from_stage="tts_engine",
-        to_stage="vocoder",
-        shm_metadata=relay_io.serialize_ipc_chunk(
-            codes,
-            {
-                "modality": "audio_codes",
-                "nested": {"hidden": hidden},
-                "items": [hidden + 1],
-                "pair": (hidden + 2, "kept"),
-            },
-        ),
-        chunk_id=0,
-    )
-
-    round_tripped = deserialize_message(serialize_message(msg))
-    item = Stage._deserialize_ipc_chunk(round_tripped)
-
-    assert torch.equal(item.data, codes)
-    assert item.metadata["modality"] == "audio_codes"
-    assert torch.equal(item.metadata["nested"]["hidden"], hidden)
-    assert torch.equal(item.metadata["items"][0], hidden + 1)
-    assert torch.equal(item.metadata["pair"][0], hidden + 2)
-    assert item.metadata["pair"][1] == "kept"
 
 
 def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
@@ -1107,7 +679,7 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
     asyncio.run(_run())
 
 
-def test_stage_routes_ipc_stream_chunk_to_scheduler() -> None:
+def test_stage_routes_relay_stream_chunk_to_scheduler() -> None:
     async def _run() -> None:
         control_plane = _FakeControlPlane()
         codes = torch.arange(2048, dtype=torch.float32)
@@ -1116,6 +688,7 @@ def test_stage_routes_ipc_stream_chunk_to_scheduler() -> None:
             inbox=queue.Queue(),
             abort=lambda request_id: None,
         )
+        relay = ShmRelay(engine_id="t", device="cpu")
         stage = Stage(
             name="vocoder",
             role="single",
@@ -1123,21 +696,21 @@ def test_stage_routes_ipc_stream_chunk_to_scheduler() -> None:
             gpu_id=None,
             endpoints={},
             control_plane=control_plane,
-            relay=_FakeRelay(),
+            relay=relay,
             scheduler=scheduler,
         )
         stage._stream_queue = StreamQueue(max_pending=4096)
         stage._stream_queue.open("req")
 
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata=relay_io.serialize_ipc_chunk(
-                    codes, {"modality": "audio_codes"}
-                ),
                 chunk_id=0,
+                data=codes,
+                metadata={"modality": "audio_codes"},
             )
         )
 

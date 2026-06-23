@@ -15,7 +15,7 @@ from typing import Any
 
 from sglang_omni.config.placement import (
     StagePlacementPlan,
-    resolve_same_gpu_stream_targets,
+    resolve_gpu_stage_names,
     resolve_stage_gpu_ids,
 )
 from sglang_omni.config.runtime import resolve_stage_factory_args
@@ -65,6 +65,16 @@ def _build_stage_groups(
 
     nccl_port_counter = _NcclPortAllocator()
 
+    # GPU-resident stages, shared by every stage so the transport router can
+    # decide CUDA-IPC vs SHM per edge from static placement alone. Include the
+    # pre-fusion aliases so lookups work whether an edge names a stage by its
+    # raw or canonical (fused) name.
+    gpu_canonical = resolve_gpu_stage_names(placement_plan)
+    gpu_stage_names = set(gpu_canonical)
+    for raw_name, canonical_name in name_map.items():
+        if canonical_name in gpu_canonical:
+            gpu_stage_names.add(raw_name)
+
     single_stage_specs: dict[str, StageLaunchConfig] = {}
     tp_groups: list[StageGroup] = []
     for stage_cfg in stages_cfg:
@@ -72,10 +82,6 @@ def _build_stage_groups(
         gpu_ids = resolve_stage_gpu_ids(placement_plan, stage_cfg)
         nccl_port = nccl_port_counter.allocate() if tp_size > 1 else None
 
-        same_gpu_targets = resolve_same_gpu_stream_targets(
-            placement_plan,
-            stage_cfg,
-        )
         same_process_targets = _resolve_same_process_targets(
             stage_cfg,
             stage_cfg_by_name,
@@ -105,7 +111,7 @@ def _build_stage_groups(
             stage_endpoints=stage_endpoints,
             stream_targets=list(stage_cfg.stream_to),
             stream_done_to_fn=stage_cfg.stream_done_to_fn,
-            same_gpu_targets=same_gpu_targets,
+            gpu_stage_names=gpu_stage_names,
             same_process_targets=same_process_targets,
             is_stream_receiver=stage_cfg.name in stream_receivers,
             can_accept_stream_before_payload=stage_cfg.can_accept_stream_before_payload,

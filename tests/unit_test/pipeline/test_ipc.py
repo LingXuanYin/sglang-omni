@@ -13,7 +13,6 @@ from fastapi.testclient import TestClient
 
 import sglang_omni.pipeline.mp_runner as mp_runner
 import sglang_omni.pipeline.runtime_config as runtime_config
-import sglang_omni.pipeline.stage.runtime as stage_runtime
 from sglang_omni.config.schema import EndpointsConfig, PipelineConfig, StageConfig
 from sglang_omni.profiler.event_recorder import get_recorder
 from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext, FakeRelay
@@ -76,9 +75,9 @@ def _make_config(base_path: Path) -> PipelineConfig:
 
 @pytest.fixture(autouse=True)
 def _fake_stage_relay(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Relay construction now lives in the transport router, not the stage module.
     monkeypatch.setattr(
-        stage_runtime,
-        "create_relay",
+        "sglang_omni.pipeline.transport.create_relay",
         lambda relay_type, **kwargs: FakeRelay(device=kwargs.get("device", "cpu")),
     )
 

@@ -9,9 +9,7 @@ Extracted from worker/data_plane.py and worker/runtime.py.
 from __future__ import annotations
 
 import base64
-import io
 import pickle
-from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
 import torch
@@ -250,122 +248,6 @@ async def read_blob(
 # Stream chunk send
 # ---------------------------------------------------------------------------
 
-_IPC_INLINE_CPU_BYTES_LIMIT = 64 * 1024
-
-
-def _is_cuda_tensor(obj: Any) -> bool:
-    return isinstance(obj, torch.Tensor) and obj.is_cuda
-
-
-def _contains_cuda_tensor(obj: Any) -> bool:
-    if _is_cuda_tensor(obj):
-        return True
-    if isinstance(obj, torch.Tensor):
-        return False
-    if isinstance(obj, dict):
-        return any(_contains_cuda_tensor(value) for value in obj.values())
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return any(_contains_cuda_tensor(value) for value in obj)
-    return False
-
-
-def _contains_cpu_tensor(obj: Any, seen: set[int] | None = None) -> bool:
-    if obj is None:
-        return False
-    seen = set() if seen is None else seen
-    obj_id = id(obj)
-    if obj_id in seen:
-        return False
-    seen.add(obj_id)
-
-    if isinstance(obj, torch.Tensor):
-        return not _is_cuda_tensor(obj)
-    if isinstance(obj, dict):
-        return any(_contains_cpu_tensor(value, seen) for value in obj.values())
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return any(_contains_cpu_tensor(value, seen) for value in obj)
-    return False
-
-
-def _inline_cpu_pickle_size(obj: Any, seen: set[int] | None = None) -> int:
-    if obj is None:
-        return 0
-    seen = set() if seen is None else seen
-    obj_id = id(obj)
-    if obj_id in seen:
-        return 0
-    seen.add(obj_id)
-
-    if isinstance(obj, torch.Tensor):
-        return 0
-    if isinstance(obj, dict):
-        return sum(
-            _inline_cpu_pickle_size(key, seen) + _inline_cpu_pickle_size(value, seen)
-            for key, value in obj.items()
-        )
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return sum(_inline_cpu_pickle_size(value, seen) for value in obj)
-
-    try:
-        return len(pickle.dumps(obj))
-    except Exception:
-        return _IPC_INLINE_CPU_BYTES_LIMIT + 1
-
-
-def _should_use_cuda_ipc_stream_chunk(data: Any, metadata: dict | None) -> bool:
-    if not _contains_cuda_tensor(data):
-        return False
-    if _contains_cpu_tensor(data) or _contains_cpu_tensor(metadata):
-        return False
-    inline_size = _inline_cpu_pickle_size(data) + _inline_cpu_pickle_size(metadata)
-    return inline_size <= _IPC_INLINE_CPU_BYTES_LIMIT
-
-
-def ipc_pickle(obj: Any) -> bytes:
-    """Serialize via ForkingPickler only when CUDA IPC tensor handles are needed."""
-    if not _contains_cuda_tensor(obj):
-        return pickle.dumps(obj)
-    buf = io.BytesIO()
-    ForkingPickler(buf, 2).dump(obj)
-    return buf.getvalue()
-
-
-def _serialize_ipc_metadata_value(value: Any) -> Any:
-    if isinstance(value, torch.Tensor):
-        return {"_ipc_tensor": ipc_pickle(value)}
-    if isinstance(value, dict):
-        return {key: _serialize_ipc_metadata_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_serialize_ipc_metadata_value(item) for item in value]
-    if isinstance(value, tuple):
-        return {"_ipc_tuple": [_serialize_ipc_metadata_value(item) for item in value]}
-    return value
-
-
-def serialize_ipc_chunk(
-    data: Any,
-    metadata: dict | None,
-) -> dict[str, Any]:
-    ipc_metadata: dict[str, Any] = {"_ipc": True}
-    ipc_metadata["tensor_bytes"] = ipc_pickle(data)
-
-    if metadata:
-        ipc_metadata["metadata"] = _serialize_ipc_metadata_value(metadata)
-
-    return ipc_metadata
-
-
-def deserialize_ipc_metadata(value: Any) -> Any:
-    if isinstance(value, dict):
-        if set(value) == {"_ipc_tensor"}:
-            return pickle.loads(value["_ipc_tensor"])
-        if set(value) == {"_ipc_tuple"}:
-            return tuple(deserialize_ipc_metadata(item) for item in value["_ipc_tuple"])
-        return {key: deserialize_ipc_metadata(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [deserialize_ipc_metadata(item) for item in value]
-    return value
-
 
 async def send_stream_chunk(
     relay: Relay,
@@ -378,39 +260,14 @@ async def send_stream_chunk(
     from_stage: str,
     chunk_id: int,
     metadata: dict | None = None,
-    same_gpu_targets: set[str] | None = None,
 ) -> None:
-    """Send a streaming chunk to a downstream stage."""
-    # Keep CUDA IPC limited to CUDA-dominant chunks with no CPU tensors and only
-    # small inline Python metadata; otherwise the relay path keeps CPU-heavy
-    # pieces out of the IPC control-plane pickle.
-    if (
-        same_gpu_targets
-        and target_stage in same_gpu_targets
-        and _should_use_cuda_ipc_stream_chunk(data, metadata)
-    ):
-        msg = DataReadyMessage(
-            request_id=request_id,
-            from_stage=from_stage,
-            to_stage=target_stage,
-            shm_metadata=serialize_ipc_chunk(data, metadata),
-            chunk_id=chunk_id,
-        )
-        await control_plane.send_to_stage(target_stage, target_endpoint, msg)
-        return
+    """Send a streaming chunk to a downstream stage over the given relay.
 
-    if (
-        same_gpu_targets
-        and target_stage in same_gpu_targets
-        and _contains_cuda_tensor(data)
-        and not isinstance(data, torch.Tensor)
-    ):
-        raise ValueError(
-            "CUDA IPC stream chunks with mixed object graphs must not carry "
-            "CPU-heavy data through the control plane; use tensor data with "
-            "relay-backed metadata instead"
-        )
-
+    The caller selects ``relay`` via the transport router, so this function is
+    transport-agnostic: for a CUDA-IPC relay the bulk rides an IPC handle (and
+    the handle travels in the control-plane metadata, no extra round-trip); for
+    shm it rides host shared memory.
+    """
     blob_key = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
 
     pending_ops = []

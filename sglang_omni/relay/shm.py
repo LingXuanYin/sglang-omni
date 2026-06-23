@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Host shared-memory relay.
+
+This is the host-memory transport: it carries CPU tensors between same-node
+processes. GPU-to-GPU edges go through the cuda_ipc relay (NVLink), so the
+transport router only selects shm for host-resident data and always builds it
+with ``device="cpu"``. Buffers therefore arrive here already on the host.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +24,7 @@ logger = logging.getLogger(__name__)
 
 def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
     """Creates a SHM block and writes tensor data into it (optimized single copy)."""
-    t_cpu = tensor.cpu() if tensor.is_cuda else tensor
-    t_np = t_cpu.numpy().reshape(-1)
+    t_np = tensor.numpy().reshape(-1)
     size = t_np.nbytes
 
     # 1. Create SHM directly
@@ -101,9 +107,6 @@ class ShmGetOperation(ShmOperation):
                 dest_view = self._dest_tensor.view(torch.uint8).reshape(-1)
                 copy_len = min(dest_view.numel(), size)
                 dest_view[:copy_len].copy_(src_tensor[:copy_len])
-
-                if self._dest_tensor.is_cuda:
-                    torch.cuda.synchronize(self._dest_tensor.device)
 
             finally:
                 # 3. Cleanup (Receiver owns lifecycle)

@@ -44,6 +44,8 @@ def create_relay(relay_type: str, **kwargs) -> Relay:
         try:
             if relay_type == "nccl":
                 from .nccl import NcclRelay  # noqa
+            elif relay_type == "cuda_ipc":
+                from .cuda_ipc import CudaIpcRelay  # noqa
             elif relay_type == "shm":
                 from .shm import ShmRelay  # noqa
             elif relay_type == "nixl":

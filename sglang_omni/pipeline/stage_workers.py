@@ -78,7 +78,8 @@ class StageLaunchConfig:
     # Stream wiring
     stream_targets: list[str] = field(default_factory=list)
     stream_done_to_fn: str | None = None
-    same_gpu_targets: set[str] = field(default_factory=set)
+    # GPU-resident stage names (for the transport router to pick CUDA-IPC vs SHM).
+    gpu_stage_names: set[str] = field(default_factory=set)
     is_stream_receiver: bool = False
     can_accept_stream_before_payload: bool = False
 
@@ -613,7 +614,7 @@ def _construct_stage(
         project_payload=project_payload or None,
         stream_targets=spec.stream_targets or None,
         get_stream_done_targets=get_stream_done_targets,
-        same_gpu_targets=spec.same_gpu_targets or None,
+        gpu_stage_names=spec.gpu_stage_names or None,
         same_process_targets=spec.same_process_targets or None,
         local_dispatcher=local_dispatcher,
         can_accept_stream_before_payload=spec.can_accept_stream_before_payload,

@@ -21,6 +21,7 @@ from sglang_omni.pipeline import relay_io
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
+from sglang_omni.pipeline.transport import TransportRouter
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
@@ -39,7 +40,7 @@ from sglang_omni.proto import (
     StreamMessage,
     SubmitMessage,
 )
-from sglang_omni.relay.base import Relay, create_relay
+from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ class Stage:
         project_payload: dict[str, Callable[[Any], Any]] | None = None,
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
-        same_gpu_targets: set[str] | None = None,
+        gpu_stage_names: set[str] | None = None,
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
         can_accept_stream_before_payload: bool = False,
@@ -98,7 +99,6 @@ class Stage:
         self._project_payload = project_payload or {}
         self._stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
-        self._same_gpu_targets = same_gpu_targets or set()
         self._same_process_targets = same_process_targets or set()
         self._local_dispatcher = local_dispatcher
         self._can_accept_stream_before_payload = can_accept_stream_before_payload
@@ -106,31 +106,17 @@ class Stage:
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
 
-        # --- Relay ---
-        if relay is not None:
-            self.relay = relay
-        else:
-            config = relay_config or {}
-            engine_id = config.get("worker_id", f"{name}_relay")
-            relay_type = config.get("relay_type", "nixl").lower()
-            gpu_id = config.get("gpu_id")
-            if gpu_id is not None:
-                device = f"cuda:{gpu_id}"
-            else:
-                device = "cpu"
-                if relay_type == "nccl":
-                    device = "cuda"
-            self.relay = create_relay(
-                relay_type,
-                engine_id=engine_id,
-                slot_size_mb=config.get("slot_size_mb", 64),
-                credits=config.get("credits", 2),
-                device=device,
-                rank=config.get("rank"),
-                world_size=config.get("world_size"),
-                send_to_ranks=config.get("send_to_ranks", []),
-                recv_from_ranks=config.get("recv_from_ranks", []),
-            )
+        # --- Transport router: the single place that decides how each edge
+        # moves data (local object / cuda_ipc / shm), derived from placement. ---
+        self._router = TransportRouter(
+            stage_name=name,
+            gpu_id=self.gpu_id,
+            same_process_targets=self._same_process_targets,
+            gpu_stage_names=gpu_stage_names or set(),
+            local_dispatcher=local_dispatcher,
+            relay_config=relay_config or {},
+            injected_relay=relay,
+        )
 
         # --- State ---
         self._running = False
@@ -198,7 +184,7 @@ class Stage:
         self.control_plane.close()
         if self._tp_fanout is not None:
             self._tp_fanout.close()
-        self.relay.close()
+        self._router.close()
         logger.info("Stage %s stopped", self.name)
 
     async def run(self) -> None:
@@ -299,16 +285,16 @@ class Stage:
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
             self._stream_queue.open(request_id)
 
-        # Read payload from relay
+        # Read payload using the transport the sender used (derived from
+        # placement, so both sides agree without a per-message tag).
+        relay = self._router.inbound_relay(msg.from_stage)
         try:
-            payload = await relay_io.read_payload(
-                self.relay, request_id, msg.shm_metadata
-            )
+            payload = await relay_io.read_payload(relay, request_id, msg.shm_metadata)
         except Exception as exc:
             logger.exception(
                 "Stage %s: relay read failed for %s", self.name, request_id
             )
-            self.relay.cleanup(request_id)
+            relay.cleanup(request_id)
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
 
@@ -399,34 +385,13 @@ class Stage:
             return
         self._active_requests.add(request_id)
 
-        # Same-GPU CUDA IPC
-        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
-            try:
-                item = self._deserialize_ipc_chunk(msg)
-            except Exception as exc:
-                logger.error(
-                    "Stage %s: IPC deserialize failed for %s: %s",
-                    self.name,
-                    request_id,
-                    exc,
-                )
-                await self._queue_stream_error(request_id, msg.from_stage, exc)
-                return
-            if request_id in self._aborted:
-                return
-            self._emit_stream_chunk_received(
-                request_id=msg.request_id,
-                from_stage=msg.from_stage,
-                chunk_id=msg.chunk_id,
-            )
-            await self._route_stream_item_or_fail(request_id, item)
-            return
-
-        # Cross-GPU: relay
+        relay = self._router.inbound_relay(msg.from_stage)
         blob_key = f"{request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         try:
-            data = await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
-            metadata = await self._read_chunk_metadata(msg.shm_metadata, blob_key)
+            data = await relay_io.read_blob(relay, blob_key, msg.shm_metadata)
+            metadata = await self._read_chunk_metadata(
+                relay, msg.shm_metadata, blob_key
+            )
         except Exception as exc:
             logger.error(
                 "Stage %s: stream chunk read failed for %s: %s",
@@ -504,7 +469,7 @@ class Stage:
         await self._send_failure(request_id, str(error))
 
     async def _read_chunk_metadata(
-        self, shm_metadata: dict, blob_key: str
+        self, relay: Relay, shm_metadata: dict, blob_key: str
     ) -> dict | None:
         metadata = {}
         chunk_meta = (
@@ -528,7 +493,7 @@ class Stage:
                 meta_metadata = info.get("relay_metadata")
                 if isinstance(meta_blob_key, str) and isinstance(meta_metadata, dict):
                     tensor_dict[path] = await relay_io.read_blob(
-                        self.relay, meta_blob_key, meta_metadata
+                        relay, meta_blob_key, meta_metadata
                     )
             if tensor_dict:
                 metadata = relay_io.restore_tensors(metadata, tensor_dict)
@@ -536,8 +501,9 @@ class Stage:
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
+        relay = self._router.inbound_relay(msg.from_stage)
         try:
-            await relay_io.read_payload(self.relay, request_id, msg.shm_metadata)
+            await relay_io.read_payload(relay, request_id, msg.shm_metadata)
         except Exception:
             logger.debug(
                 "Stage %s: failed to drain aborted payload for %s",
@@ -545,19 +511,18 @@ class Stage:
                 request_id,
                 exc_info=True,
             )
-            self.relay.cleanup(request_id)
+            relay.cleanup(request_id)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
-        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
-            return
         if msg.chunk_id is None:
             return
+        relay = self._router.inbound_relay(msg.from_stage)
         blob_key = (
             f"{msg.request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         )
         try:
-            await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
-            await self._read_chunk_metadata(msg.shm_metadata, blob_key)
+            await relay_io.read_blob(relay, blob_key, msg.shm_metadata)
+            await self._read_chunk_metadata(relay, msg.shm_metadata, blob_key)
         except Exception:
             logger.debug(
                 "Stage %s: failed to drain aborted stream chunk for %s",
@@ -624,23 +589,6 @@ class Stage:
         self._active_requests.add(request_id)
         self._stream_queue.open(request_id)
         return True
-
-    @staticmethod
-    def _deserialize_ipc_chunk(msg: DataReadyMessage) -> StreamItem:
-        import pickle as _pickle
-
-        ipc_meta = msg.shm_metadata
-        data = _pickle.loads(ipc_meta["tensor_bytes"])
-        metadata = {}
-        raw_meta = ipc_meta.get("metadata", {})
-        if isinstance(raw_meta, dict):
-            metadata = relay_io.deserialize_ipc_metadata(raw_meta)
-        return StreamItem(
-            chunk_id=msg.chunk_id,
-            data=data,
-            from_stage=msg.from_stage,
-            metadata=metadata or None,
-        )
 
     def _route_stream_item(self, request_id: str, item: StreamItem) -> None:
         self.scheduler.inbox.put(
@@ -975,8 +923,9 @@ class Stage:
             )
             return
 
+        _, relay = self._router.relay_for(target)
         metadata, op = await relay_io.write_payload(
-            self.relay, request_id, projected_payload
+            relay, request_id, projected_payload
         )
         msg = DataReadyMessage(
             request_id=request_id,
@@ -1142,8 +1091,9 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
+        _, relay = self._router.relay_for(target)
         await relay_io.send_stream_chunk(
-            self.relay,
+            relay,
             self.control_plane,
             request_id=request_id,
             data=data,
@@ -1152,7 +1102,6 @@ class Stage:
             from_stage=self.name,
             chunk_id=chunk_id,
             metadata=metadata,
-            same_gpu_targets=self._same_gpu_targets,
         )
 
     async def _send_stream_signal_to_target(
@@ -1296,7 +1245,7 @@ class Stage:
                 self.scheduler.abort(request_id)
             await self._send_failure(request_id, error)
             with suppress(Exception):
-                self.relay.cleanup(request_id)
+                self._router.cleanup(request_id)
         self.control_plane.close()
 
     async def _abort_listener(self) -> None:
@@ -1322,7 +1271,7 @@ class Stage:
 
     def _on_abort(self, request_id: str) -> None:
         self._record_aborted_request_id(request_id)
-        self.relay.cleanup(request_id)
+        self._router.cleanup(request_id)
         self._clear_request_state(request_id)
         self.scheduler.abort(request_id)
 
