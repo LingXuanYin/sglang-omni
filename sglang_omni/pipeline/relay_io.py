@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Relay IO utilities for inter-stage data transfer.
-
-Handles payload serialization (tensor extraction/restoration), relay read/write,
-streaming chunk transfer, and NIXL credit deadlock avoidance.
-
-Extracted from worker/data_plane.py and worker/runtime.py.
-"""
+"""Relay IO utilities for inter-stage data transfer."""
 from __future__ import annotations
 
 import base64
@@ -55,13 +49,8 @@ def _torch_dtype(dtype_str: str) -> torch.dtype:
     return dtype
 
 
-# ---------------------------------------------------------------------------
-# Tensor extraction / restoration (recursive, nested dicts/lists)
-# ---------------------------------------------------------------------------
-
-
 def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tensor]]:
-    """Recursively extract tensors from nested structure, replacing with placeholders."""
+    """Replace tensors in nested data with placeholders."""
     tensors = {}
 
     if isinstance(obj, torch.Tensor):
@@ -97,7 +86,7 @@ def extract_tensors(obj: Any, path: str = "") -> tuple[Any, dict[str, torch.Tens
 
 
 def restore_tensors(obj: Any, tensor_dict: dict[str, torch.Tensor]) -> Any:
-    """Recursively restore tensors from placeholders."""
+    """Restore tensor placeholders in nested data."""
     if isinstance(obj, dict):
         if "_tensor_placeholder" in obj:
             path = obj["_tensor_placeholder"]
@@ -114,17 +103,12 @@ def restore_tensors(obj: Any, tensor_dict: dict[str, torch.Tensor]) -> Any:
         return obj
 
 
-# ---------------------------------------------------------------------------
-# Payload read/write (full StagePayload via relay)
-# ---------------------------------------------------------------------------
-
-
 async def write_payload(
     relay: Relay,
     request_id: str,
     payload: StagePayload,
 ) -> tuple[dict[str, Any], Any]:
-    """Write a StagePayload to relay. Returns (control_plane_metadata, relay_op)."""
+    """Write a StagePayload to relay."""
     device = _relay_device(relay)
     transport_device = torch.device(device)
 
@@ -180,7 +164,7 @@ async def read_payload(
     request_id: str,
     metadata: dict[str, Any],
 ) -> StagePayload:
-    """Read a StagePayload from relay using control_plane metadata."""
+    """Read a StagePayload from relay."""
     device = _relay_device(relay)
 
     payload_bytes = base64.b64decode(metadata["payload_pickle"])
@@ -221,17 +205,12 @@ async def read_payload(
     return payload
 
 
-# ---------------------------------------------------------------------------
-# Blob read/write (raw tensor via relay, for streaming chunks)
-# ---------------------------------------------------------------------------
-
-
 async def write_blob(
     relay: Relay,
     key: str,
     tensor: torch.Tensor,
 ) -> tuple[dict[str, Any], Any]:
-    """Write a raw tensor to relay. Returns (metadata, relay_op)."""
+    """Write a raw tensor to relay."""
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(
             f"write_blob requires torch.Tensor, got {type(tensor).__name__}"
@@ -324,11 +303,6 @@ async def read_blob(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Stream chunk send
-# ---------------------------------------------------------------------------
-
-
 async def send_stream_chunk(
     relay: Relay,
     control_plane: Any,
@@ -342,13 +316,7 @@ async def send_stream_chunk(
     metadata: dict | None = None,
     transport_kind: str | None = None,
 ) -> None:
-    """Send a streaming chunk to a downstream stage over the given relay.
-
-    The caller selects ``relay`` via the transport router, so this function is
-    transport-agnostic: for a CUDA-IPC relay the bulk rides an IPC handle (and
-    the handle travels in the control-plane metadata, no extra round-trip); for
-    shm it rides host shared memory.
-    """
+    """Send a relay-backed stream tensor chunk."""
     if not isinstance(data, torch.Tensor):
         raise TypeError(
             f"send_stream_chunk requires torch.Tensor, got {type(data).__name__}"
@@ -381,9 +349,7 @@ async def send_stream_chunk(
                 }
             relay_metadata["chunk_metadata_tensors"] = metadata_refs
 
-    # Send control message FIRST — receiver starts reading immediately.
-    # NIXL credit deadlock avoidance: if we wait_for_completion before notifying,
-    # the receiver never starts reading, never triggers RDMA notification, deadlock.
+    # Notify before waiting; relay credits are released by receiver progress.
     msg = DataReadyMessage(
         request_id=request_id,
         from_stage=from_stage,

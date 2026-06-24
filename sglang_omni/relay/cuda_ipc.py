@@ -1,31 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA IPC relay: intra-node, GPU-direct tensor transfer over NVLink.
-
-This backend moves CUDA buffers between same-host processes without a host
-round-trip. It deliberately follows the same pool/slot pattern used by the NIXL
-and Mooncake relays, and by TP custom allreduce implementations: allocate a
-bounded GPU pool once, export that pool once, then send slot metadata for each
-transfer. Exporting every application tensor would create unbounded CUDA IPC
-references and stalls under streaming load.
-
-The sender copies into one pool slot, records an interprocess CUDA event, and
-sends the pool storage handle + slot metadata on the control plane. The receiver opens
-the pool once, waits on the sender event, copies from the slot to its own
-destination tensor, then acknowledges the slot through a tiny mmap-backed ack
-buffer so the sender can safely reuse it. All waits are event/slot-scoped, never
-device-wide synchronizations.
-
-It is the same-node GPU cell of the transport ladder (see ``TransportRouter``):
-
-    same process            -> local object reference
-    same node, GPU buffer   -> cuda_ipc   (this backend)
-    same node, CPU buffer   -> shm
-    different node          -> nixl / mooncake (RDMA)
-
-The pool IPC handle rides the control-plane ``DataReadyMessage`` (like NIXL's
-agent metadata), so there is no extra fetch round-trip. The handle is stable per
-relay instance and receiver-side mappings are cached by pool id.
-"""
+"""CUDA IPC relay backed by a bounded sender-side GPU slot pool."""
 from __future__ import annotations
 
 import asyncio
@@ -47,7 +21,6 @@ from .base import CreditAllocator, Relay, RelayOperation, register_relay
 
 logger = logging.getLogger(__name__)
 
-# Pairs of GPUs for which peer access has already been ensured this process.
 _PEER_ENABLED: set[tuple[int, int]] = set()
 _PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 
@@ -59,13 +32,7 @@ def _parse_device_id(device: str) -> int:
 
 
 def _ensure_peer_access(src_index: int, dst_index: int) -> None:
-    """Best-effort enable of P2P access so the copy stays on the NVLink fabric.
-
-    torch enables peer access lazily on first cross-device copy; doing it
-    explicitly lets us warn loudly when two GPUs cannot reach each other over
-    the fabric (the copy would silently stage through host memory, defeating the
-    point of this relay).
-    """
+    """Enable P2P access when available and warn when it is not."""
     if src_index == dst_index:
         return
     key = (dst_index, src_index)
@@ -168,11 +135,7 @@ class _AckMap:
 
 
 class CudaIpcPutOperation(RelayOperation):
-    """Sender-side handle.
-
-    Completion means the receiver has finished copying from the sender pool
-    slot and the slot can be safely reused.
-    """
+    """Sender-side handle; completion means the slot can be reused."""
 
     def __init__(
         self,
@@ -239,7 +202,6 @@ class CudaIpcGetOperation(RelayOperation):
         size: int,
     ) -> None:
         self._event = event
-        # Keep the IPC-mapped pool alive until the copy has completed.
         self._pool_tensor: torch.Tensor | None = pool_tensor
         self._ack_map = ack_map
         self._ack_index = ack_index
@@ -540,10 +502,7 @@ class CudaIpcRelay(Relay):
         size = int(metadata["transfer_info"]["size"])
         offset = int(metadata["transfer_info"]["offset"])
         ack_index = int(ipc_meta["ack_index"])
-        # The event was recorded by the sender, but CUDA stream waits need the
-        # imported IPC event to be associated with the waiting device. Opening
-        # it on the source device and then waiting from a destination-device
-        # stream can hang for cross-GPU transfers.
+        # Import on the waiting device; source-device imports can hang cross-GPU.
         event_start = _comm_now_ns()
         ready_event = torch.cuda.Event.from_ipc_handle(
             dst_device, ipc_meta["ready_event"]

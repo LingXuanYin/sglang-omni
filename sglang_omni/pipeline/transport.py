@@ -1,26 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Centralized transport selection for inter-stage data movement.
-
-Every decision about *how* two stages exchange a payload lives here, so the
-logic is not duplicated across the send and receive paths. The choice is derived
-from static placement (which stage runs where), following one ladder:
-
-    same process              -> LOCAL     (python object reference, zero copy)
-    same node, both on GPU    -> CUDA_IPC  (NVLink / cudaMemcpyPeer)
-    same node, otherwise      -> SHM       (host shared memory)
-    different node            -> (future) nixl / mooncake (RDMA)
-
-Full-payload sends use placement alone: the sender and receiver independently
-compute the same transport for an edge from the shared stage placement.
-Streaming chunks additionally account for the actual payload device. A GPU-stage
-edge can still emit a CPU-resident stream tensor, and routing that through
-CUDA-IPC would add a CPU->GPU copy and IPC protocol overhead after the model has
-already synchronized to host. Those stream messages carry the transport kind the
-sender selected.
-
-This is also the single seam for cross-node unification: when multi-node lands,
-the only change is to return a nixl/mooncake relay for cross-node edges here.
-"""
+"""Centralized transport selection for inter-stage data movement."""
 from __future__ import annotations
 
 import logging
@@ -39,7 +18,6 @@ class TransportKind(str, Enum):
     LOCAL = "local"
     CUDA_IPC = "cuda_ipc"
     SHM = "shm"
-    # Future cross-node kinds: NIXL / MOONCAKE.
 
 
 class TransportRouter:
@@ -62,8 +40,6 @@ class TransportRouter:
         self._gpu_stages = set(gpu_stage_names or ())
         self.local_dispatcher = local_dispatcher
         self._relay_config = dict(relay_config or {})
-        # An explicitly supplied relay (tests / future cross-node override) is
-        # used for every relay kind, bypassing locality-based construction.
         self._injected = injected_relay
         self._relays: dict[TransportKind, Relay] = {}
 
@@ -83,12 +59,7 @@ class TransportRouter:
         return TransportKind.SHM
 
     def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
-        """Transport for a stream chunk sent to ``target``.
-
-        Placement picks the fast GPU path for GPU-stage edges, but stream chunks
-        may already be CPU tensors. Keep those on the host SHM path instead of
-        bouncing them back to CUDA just to use CUDA-IPC.
-        """
+        """Transport for a tensor stream chunk sent to ``target``."""
         if not isinstance(data, torch.Tensor):
             raise TypeError(
                 "relay-backed stream chunks must be torch.Tensor, got "
@@ -100,11 +71,7 @@ class TransportRouter:
         return kind
 
     def inbound(self, from_stage: str) -> TransportKind:
-        """Transport for relay data this stage receives from ``from_stage``.
-
-        Same-process traffic never reaches the relay (it arrives via the local
-        dispatcher), so only the relay-backed kinds are returned here.
-        """
+        """Transport for relay data this stage receives from ``from_stage``."""
         if self._self_is_gpu and from_stage in self._gpu_stages:
             return TransportKind.CUDA_IPC
         return TransportKind.SHM

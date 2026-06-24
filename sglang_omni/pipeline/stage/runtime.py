@@ -108,8 +108,6 @@ class Stage:
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
 
-        # --- Transport router: the single place that decides how each edge
-        # moves data (local object / cuda_ipc / shm), derived from placement. ---
         self._router = TransportRouter(
             stage_name=name,
             gpu_id=self.gpu_id,
@@ -120,13 +118,11 @@ class Stage:
             injected_relay=relay,
         )
 
-        # --- State ---
         self._running = False
         self._aborted: set[str] = set()
         self._active_requests: set[str] = set()
         self._stream_queue: StreamQueue | None = None
         self._stream_chunk_counters: dict[tuple[str, str], int] = {}
-        # Per-request: did we already emit the first stream-chunk event?
         self._first_stream_chunk_seen: set[str] = set()
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
@@ -967,10 +963,7 @@ class Stage:
 
         transport_kind = self._router.outbound(target)
         if transport_kind is TransportKind.LOCAL:
-            # Same-process fan-out can be unsafe to hand off by object reference
-            # when the target would share mutable payload containers. Use SHM as
-            # the relay-backed fallback instead of asking for a non-existent
-            # LOCAL relay.
+            # LOCAL has no relay; use SHM when object dispatch is unsafe.
             transport_kind = TransportKind.SHM
         relay = self._router.relay(transport_kind)
         metadata, op = await relay_io.write_payload(
@@ -1010,9 +1003,6 @@ class Stage:
                 "projected local-object dispatch requires projectors to return "
                 f"StagePayload, got {type(projected_payload).__name__}"
             )
-        # A fan-out edge may use process-local dispatch only when projection
-        # gives the target its own mutable payload/data containers. Tensor leaves
-        # inside those containers may still be shared intentionally.
         if projected_payload.data is original_payload.data:
             return False
         return not Stage._shares_mutable_container(
