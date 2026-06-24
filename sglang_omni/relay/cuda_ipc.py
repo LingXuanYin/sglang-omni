@@ -9,7 +9,7 @@ transfer. Exporting every application tensor would create unbounded CUDA IPC
 references and stalls under streaming load.
 
 The sender copies into one pool slot, records an interprocess CUDA event, and
-sends the pool handle + slot metadata on the control plane. The receiver opens
+sends the pool storage handle + slot metadata on the control plane. The receiver opens
 the pool once, waits on the sender event, copies from the slot to its own
 destination tensor, then acknowledges the slot through a tiny mmap-backed ack
 buffer so the sender can safely reuse it. All waits are event/slot-scoped, never
@@ -29,15 +29,12 @@ relay instance and receiver-side mappings are cached by pool id.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import mmap
 import os
-import pickle
 import tempfile
 import uuid
-from multiprocessing.reduction import ForkingPickler
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
@@ -52,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Pairs of GPUs for which peer access has already been ensured this process.
 _PEER_ENABLED: set[tuple[int, int]] = set()
+_PEER_VISIBILITY_WARNED: set[tuple[int, int, int]] = set()
 
 
 def _parse_device_id(device: str) -> int:
@@ -81,12 +79,6 @@ def _ensure_peer_access(src_index: int, dst_index: int) -> None:
             src_index,
         )
     _PEER_ENABLED.add(key)
-
-
-def _dump_cuda_tensor_handle(tensor: torch.Tensor) -> bytes:
-    buf = io.BytesIO()
-    ForkingPickler(buf, pickle.HIGHEST_PROTOCOL).dump(tensor)
-    return buf.getvalue()
 
 
 def _dump_cuda_storage_handle(tensor: torch.Tensor) -> dict[str, Any]:
@@ -192,10 +184,10 @@ class CudaIpcPutOperation(RelayOperation):
         ack_index: int,
         request_id: str | None,
         size: int,
-        release_cb: Any,
+        release_cb: Callable[[], None],
     ) -> None:
         self._metadata = metadata
-        self._ready_event = ready_event
+        self._ready_event: torch.cuda.Event | None = ready_event
         self._source_tensor: torch.Tensor | None = source_tensor
         self._ack_map = ack_map
         self._ack_index = ack_index
@@ -205,7 +197,7 @@ class CudaIpcPutOperation(RelayOperation):
         self._completed = False
 
     @property
-    def metadata(self) -> Any:
+    def metadata(self) -> dict[str, Any]:
         return self._metadata
 
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
@@ -223,7 +215,7 @@ class CudaIpcPutOperation(RelayOperation):
         self._completed = True
         self._release_cb()
         self._source_tensor = None
-        self._ready_event = None  # type: ignore[assignment]
+        self._ready_event = None
         _comm_trace(
             "cuda_ipc_put_wait_ack",
             request_id=self._request_id,
@@ -294,6 +286,10 @@ class CudaIpcRelay(Relay):
         credits: int = 2,
         **kwargs: Any,
     ) -> None:
+        if kwargs:
+            raise TypeError(
+                f"unexpected cuda_ipc relay options: {', '.join(sorted(kwargs))}"
+            )
         self.engine_id = engine_id
         if device == "cpu":
             raise ValueError(
@@ -311,7 +307,6 @@ class CudaIpcRelay(Relay):
 
         self._pool_tensor: torch.Tensor | None = None
         self._pool_id: str | None = None
-        self._pool_handle: bytes | None = None
         self._pool_storage_handle: dict[str, Any] | None = None
         self._allocator: CreditAllocator | None = None
         self._ack_map: _AckMap | None = None
@@ -342,7 +337,6 @@ class CudaIpcRelay(Relay):
                 total_pool_bytes, dtype=torch.uint8, device=device
             )
         self._pool_id = f"{self.engine_id}:{os.getpid()}:{uuid.uuid4().hex}"
-        self._pool_handle = _dump_cuda_tensor_handle(self._pool_tensor)
         self._pool_storage_handle = _dump_cuda_storage_handle(self._pool_tensor)
         self._allocator = CreditAllocator(
             credits=self.credits,
@@ -363,6 +357,27 @@ class CudaIpcRelay(Relay):
             elapsed_ms=round(_comm_elapsed_ms(start), 6),
         )
 
+    def _local_pool_state(
+        self,
+    ) -> tuple[torch.Tensor, str, dict[str, Any], CreditAllocator, _AckMap]:
+        self._ensure_local_pool()
+        pool_tensor = self._pool_tensor
+        pool_id = self._pool_id
+        pool_storage_handle = self._pool_storage_handle
+        allocator = self._allocator
+        ack_map = self._ack_map
+        if pool_tensor is None:
+            raise RuntimeError("cuda_ipc local pool tensor was not initialized")
+        if pool_id is None:
+            raise RuntimeError("cuda_ipc local pool id was not initialized")
+        if pool_storage_handle is None:
+            raise RuntimeError("cuda_ipc local pool storage handle was not initialized")
+        if allocator is None:
+            raise RuntimeError("cuda_ipc local credit allocator was not initialized")
+        if ack_map is None:
+            raise RuntimeError("cuda_ipc local ack map was not initialized")
+        return pool_tensor, pool_id, pool_storage_handle, allocator, ack_map
+
     def _get_remote_pool(
         self,
         metadata: dict[str, Any],
@@ -373,11 +388,13 @@ class CudaIpcRelay(Relay):
         pool_id = ipc_meta["pool_id"]
         pool = self._remote_pools.get(pool_id)
         if pool is None:
-            storage_meta = ipc_meta.get("pool_storage")
-            if isinstance(storage_meta, dict):
-                pool = _load_cuda_storage_handle(storage_meta, device=device)
-            else:
-                pool = pickle.loads(ipc_meta["pool_handle"])
+            storage_meta = ipc_meta["pool_storage"]
+            if not isinstance(storage_meta, dict):
+                raise TypeError(
+                    "cuda_ipc pool_storage metadata must be a dict, got "
+                    f"{type(storage_meta).__name__}"
+                )
+            pool = _load_cuda_storage_handle(storage_meta, device=device)
             self._remote_pools[pool_id] = pool
         return pool
 
@@ -401,13 +418,13 @@ class CudaIpcRelay(Relay):
                 "cuda_ipc relay can only transfer CUDA tensors; "
                 f"got tensor on {tensor.device}"
             )
-        self._ensure_local_pool()
-        assert self._pool_tensor is not None
-        assert self._pool_id is not None
-        assert self._pool_handle is not None
-        assert self._pool_storage_handle is not None
-        assert self._allocator is not None
-        assert self._ack_map is not None
+        (
+            pool_tensor,
+            pool_id,
+            pool_storage_handle,
+            allocator,
+            ack_map,
+        ) = self._local_pool_state()
 
         flat = tensor.contiguous().view(torch.uint8).reshape(-1)
         size = int(flat.numel())
@@ -417,14 +434,14 @@ class CudaIpcRelay(Relay):
             )
 
         acquire_start = _comm_now_ns()
-        offset = await self._allocator.acquire_async()
+        offset = await allocator.acquire_async()
         acquire_ms = _comm_elapsed_ms(acquire_start)
         slot_index = int(offset // self.slot_size)
-        self._ack_map.clear(slot_index)
+        ack_map.clear(slot_index)
 
         try:
             copy_start = _comm_now_ns()
-            pool_slice = self._pool_tensor[offset : offset + size]
+            pool_slice = pool_tensor[offset : offset + size]
             device = torch.device(self.device)
             stream = torch.cuda.current_stream(device)
             ready_event = torch.cuda.Event(interprocess=True)
@@ -436,7 +453,7 @@ class CudaIpcRelay(Relay):
             ready_handle = ready_event.ipc_handle()
             handle_ms = _comm_elapsed_ms(handle_start)
         except Exception:
-            self._allocator.release(offset)
+            allocator.release(offset)
             raise
         _comm_trace(
             "cuda_ipc_put_async",
@@ -459,12 +476,11 @@ class CudaIpcRelay(Relay):
                 "slot_size": self.slot_size,
             },
             "cuda_ipc": {
-                "pool_id": self._pool_id,
-                "pool_handle": self._pool_handle,
-                "pool_storage": self._pool_storage_handle,
+                "pool_id": pool_id,
+                "pool_storage": pool_storage_handle,
                 "src_device_id": self.device_id,
                 "ready_event": ready_handle,
-                "ack_path": self._ack_map.path,
+                "ack_path": ack_map.path,
                 "ack_index": slot_index,
                 "credits": self.credits,
             },
@@ -473,16 +489,16 @@ class CudaIpcRelay(Relay):
             metadata,
             ready_event=ready_event,
             source_tensor=flat,
-            ack_map=self._ack_map,
+            ack_map=ack_map,
             ack_index=slot_index,
             request_id=request_id,
             size=size,
-            release_cb=lambda: self._allocator.release(offset),
+            release_cb=lambda: allocator.release(offset),
         )
 
     async def get_async(
         self,
-        metadata: Any,
+        metadata: dict[str, Any],
         dest_tensor: torch.Tensor,
         request_id: str | None = None,
     ) -> CudaIpcGetOperation:
@@ -504,8 +520,21 @@ class CudaIpcRelay(Relay):
         src_index = int(ipc_meta["src_device_id"])
         dst_index = int(dst_device.index or 0)
         peer_start = _comm_now_ns()
-        if 0 <= src_index < torch.cuda.device_count():
+        device_count = torch.cuda.device_count()
+        if 0 <= src_index < device_count:
             _ensure_peer_access(src_index, dst_index)
+        else:
+            warn_key = (dst_index, src_index, device_count)
+            if warn_key not in _PEER_VISIBILITY_WARNED:
+                _PEER_VISIBILITY_WARNED.add(warn_key)
+                logger.warning(
+                    "cuda_ipc source device %d is outside this receiver's visible "
+                    "CUDA device range [0, %d); peer-access validation skipped. "
+                    "This is expected only when sender and receiver use different "
+                    "CUDA_VISIBLE_DEVICES namespaces.",
+                    src_index,
+                    device_count,
+                )
         peer_ms = _comm_elapsed_ms(peer_start)
 
         size = int(metadata["transfer_info"]["size"])
@@ -524,7 +553,12 @@ class CudaIpcRelay(Relay):
         copy_start = _comm_now_ns()
         src = pool_tensor.view(torch.uint8).reshape(-1)[offset : offset + size]
         dst = dest_tensor.view(torch.uint8).reshape(-1)
-        copy_len = min(dst.numel(), size)
+        if dst.numel() < size:
+            raise ValueError(
+                f"cuda_ipc destination buffer has {dst.numel()} bytes, "
+                f"but transfer requires {size} bytes"
+            )
+        copy_len = size
 
         stream = torch.cuda.current_stream(dst_device)
         with torch.cuda.device(dst_device), torch.cuda.stream(stream):
@@ -570,6 +604,5 @@ class CudaIpcRelay(Relay):
             self._ack_map.close()
             self._ack_map = None
         self._pool_tensor = None
-        self._pool_handle = None
         self._pool_storage_handle = None
         self._allocator = None

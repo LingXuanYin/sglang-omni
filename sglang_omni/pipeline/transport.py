@@ -28,6 +28,8 @@ from contextlib import suppress
 from enum import Enum
 from typing import Any
 
+import torch
+
 from sglang_omni.relay.base import Relay, create_relay
 
 logger = logging.getLogger(__name__)
@@ -80,17 +82,21 @@ class TransportRouter:
             return TransportKind.CUDA_IPC
         return TransportKind.SHM
 
-    def outbound_stream(self, target: str, data: Any) -> TransportKind:
+    def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
         """Transport for a stream chunk sent to ``target``.
 
         Placement picks the fast GPU path for GPU-stage edges, but stream chunks
         may already be CPU tensors. Keep those on the host SHM path instead of
         bouncing them back to CUDA just to use CUDA-IPC.
         """
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(
+                "relay-backed stream chunks must be torch.Tensor, got "
+                f"{type(data).__name__}"
+            )
         kind = self.outbound(target)
-        if kind is TransportKind.CUDA_IPC and hasattr(data, "is_cuda"):
-            if not bool(data.is_cuda):
-                return TransportKind.SHM
+        if kind is TransportKind.CUDA_IPC and not data.is_cuda:
+            return TransportKind.SHM
         return kind
 
     def inbound(self, from_stage: str) -> TransportKind:
@@ -116,7 +122,9 @@ class TransportRouter:
         kind = self.outbound(target)
         return kind, self.relay(kind)
 
-    def relay_for_stream(self, target: str, data: Any) -> tuple[TransportKind, Relay]:
+    def relay_for_stream(
+        self, target: str, data: torch.Tensor
+    ) -> tuple[TransportKind, Relay]:
         kind = self.outbound_stream(target, data)
         return kind, self.relay(kind)
 

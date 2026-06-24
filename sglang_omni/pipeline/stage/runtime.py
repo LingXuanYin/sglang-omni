@@ -17,6 +17,8 @@ import threading
 from contextlib import suppress
 from typing import Any, Callable, Literal
 
+import torch
+
 from sglang_omni.pipeline import relay_io
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
@@ -471,49 +473,73 @@ class Stage:
     async def _read_chunk_metadata(
         self, relay: Relay, shm_metadata: dict, blob_key: str
     ) -> dict | None:
+        if not isinstance(shm_metadata, dict):
+            raise TypeError(
+                "stream chunk relay metadata must be a dict, got "
+                f"{type(shm_metadata).__name__}"
+            )
         metadata = {}
-        chunk_meta = (
-            shm_metadata.get("chunk_metadata")
-            if isinstance(shm_metadata, dict)
-            else None
-        )
-        if isinstance(chunk_meta, dict):
+        chunk_meta = shm_metadata.get("chunk_metadata")
+        if chunk_meta is None:
+            pass
+        elif isinstance(chunk_meta, dict):
             metadata.update(chunk_meta)
-        tensor_blobs = (
-            shm_metadata.get("chunk_metadata_tensors", {})
-            if isinstance(shm_metadata, dict)
-            else {}
-        )
-        if isinstance(tensor_blobs, dict):
-            tensor_dict = {}
-            for path, info in tensor_blobs.items():
-                if not isinstance(info, dict):
-                    continue
-                meta_blob_key = info.get("blob_key")
-                meta_metadata = info.get("relay_metadata")
-                if isinstance(meta_blob_key, str) and isinstance(meta_metadata, dict):
-                    tensor_dict[path] = await relay_io.read_blob(
-                        relay, meta_blob_key, meta_metadata
-                    )
-            if tensor_dict:
-                metadata = relay_io.restore_tensors(metadata, tensor_dict)
+        else:
+            raise TypeError(
+                "stream chunk_metadata must be a dict when present, got "
+                f"{type(chunk_meta).__name__}"
+            )
+
+        tensor_blobs = shm_metadata.get("chunk_metadata_tensors", {})
+        if not isinstance(tensor_blobs, dict):
+            raise TypeError(
+                "stream chunk_metadata_tensors must be a dict, got "
+                f"{type(tensor_blobs).__name__}"
+            )
+        tensor_dict = {}
+        for path, info in tensor_blobs.items():
+            if not isinstance(info, dict):
+                raise TypeError(
+                    "stream chunk metadata tensor entry must be a dict, got "
+                    f"{type(info).__name__} at {path!r}"
+                )
+            meta_blob_key = info["blob_key"]
+            meta_metadata = info["relay_metadata"]
+            if not isinstance(meta_blob_key, str):
+                raise TypeError(
+                    f"metadata tensor blob_key for {path!r} must be str, got "
+                    f"{type(meta_blob_key).__name__}"
+                )
+            if not isinstance(meta_metadata, dict):
+                raise TypeError(
+                    f"metadata tensor relay_metadata for {path!r} must be dict, "
+                    f"got {type(meta_metadata).__name__}"
+                )
+            tensor_dict[path] = await relay_io.read_blob(
+                relay, meta_blob_key, meta_metadata
+            )
+        if tensor_dict:
+            metadata = relay_io.restore_tensors(metadata, tensor_dict)
         return metadata or None
 
     def _relay_for_stream_message(self, msg: DataReadyMessage) -> Relay:
-        if isinstance(msg.shm_metadata, dict):
-            transport = msg.shm_metadata.get("_transport")
-            if isinstance(transport, str):
-                try:
-                    return self._router.relay(TransportKind(transport))
-                except ValueError:
-                    logger.warning(
-                        "Stage %s: unknown stream transport %r from %s; "
-                        "falling back to placement inference",
-                        self.name,
-                        transport,
-                        msg.from_stage,
-                    )
-        return self._router.inbound_relay(msg.from_stage)
+        if not isinstance(msg.shm_metadata, dict):
+            raise TypeError(
+                "stream chunk relay metadata must be a dict, got "
+                f"{type(msg.shm_metadata).__name__}"
+            )
+        if "_transport" not in msg.shm_metadata:
+            raise ValueError("stream chunk relay metadata is missing '_transport'")
+        transport = msg.shm_metadata["_transport"]
+        if not isinstance(transport, str):
+            raise ValueError(
+                "stream chunk relay metadata is missing string '_transport'"
+            )
+        try:
+            transport_kind = TransportKind(transport)
+        except ValueError as exc:
+            raise ValueError(f"unknown stream transport {transport!r}") from exc
+        return self._router.relay(transport_kind)
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
@@ -1072,7 +1098,10 @@ class Stage:
             return
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for stream target "
+                f"{target!r}"
+            )
         key = (request_id, target)
         chunk_id = self._stream_chunk_counters.get(key, 0)
         self._stream_chunk_counters[key] = chunk_id + 1
@@ -1115,6 +1144,11 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(
+                "relay-backed stream chunks must be torch.Tensor, got "
+                f"{type(data).__name__}"
+            )
         transport_kind, relay = self._router.relay_for_stream(target, data)
         _emit_event(
             request_id=request_id,
@@ -1152,7 +1186,10 @@ class Stage:
             return
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for stream target "
+                f"{target!r}"
+            )
         if target in self._same_process_targets:
             if self._local_dispatcher is None:
                 raise RuntimeError(

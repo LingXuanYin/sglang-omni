@@ -29,6 +29,32 @@ def _pad_offset(offset: int, alignment: int) -> int:
     return (-offset) % alignment
 
 
+def _relay_device(relay: Relay) -> str:
+    try:
+        device = relay.device
+    except AttributeError as exc:
+        raise TypeError(
+            f"{type(relay).__name__} must expose a string 'device' attribute"
+        ) from exc
+    if not isinstance(device, str):
+        raise TypeError(
+            f"{type(relay).__name__}.device must be a string, got "
+            f"{type(device).__name__}"
+        )
+    return device
+
+
+def _torch_dtype(dtype_str: str) -> torch.dtype:
+    prefix = "torch."
+    if not isinstance(dtype_str, str) or not dtype_str.startswith(prefix):
+        raise ValueError(f"invalid tensor dtype metadata: {dtype_str!r}")
+    dtype_name = dtype_str[len(prefix) :]
+    dtype = vars(torch).get(dtype_name)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"unsupported tensor dtype metadata: {dtype_str!r}")
+    return dtype
+
+
 # ---------------------------------------------------------------------------
 # Tensor extraction / restoration (recursive, nested dicts/lists)
 # ---------------------------------------------------------------------------
@@ -75,7 +101,9 @@ def restore_tensors(obj: Any, tensor_dict: dict[str, torch.Tensor]) -> Any:
     if isinstance(obj, dict):
         if "_tensor_placeholder" in obj:
             path = obj["_tensor_placeholder"]
-            return tensor_dict.get(path)
+            if path not in tensor_dict:
+                raise KeyError(f"missing tensor payload for placeholder {path!r}")
+            return tensor_dict[path]
         else:
             return {
                 key: restore_tensors(value, tensor_dict) for key, value in obj.items()
@@ -97,7 +125,7 @@ async def write_payload(
     payload: StagePayload,
 ) -> tuple[dict[str, Any], Any]:
     """Write a StagePayload to relay. Returns (control_plane_metadata, relay_op)."""
-    device = getattr(relay, "device", "cpu")
+    device = _relay_device(relay)
     transport_device = torch.device(device)
 
     modified_data, tensor_dict = extract_tensors(payload.data)
@@ -153,13 +181,15 @@ async def read_payload(
     metadata: dict[str, Any],
 ) -> StagePayload:
     """Read a StagePayload from relay using control_plane metadata."""
-    device = getattr(relay, "device", "cpu")
+    device = _relay_device(relay)
 
     payload_bytes = base64.b64decode(metadata["payload_pickle"])
     payload_no_tensors = pickle.loads(payload_bytes)
 
     relay_info = metadata["relay_info"]
-    tensor_info = metadata.get("tensor_info", [])
+    tensor_info = metadata["tensor_info"]
+    if not isinstance(tensor_info, list):
+        raise TypeError(f"tensor_info must be a list, got {type(tensor_info).__name__}")
     tensor_dict = {}
 
     data_size = relay_info["transfer_info"]["size"]
@@ -177,7 +207,7 @@ async def read_payload(
             offset = info["offset"]
             size = info["size"]
             tensor_bytes = recv_tensor[offset : offset + size]
-            dtype = getattr(torch, dtype_str.replace("torch.", ""))
+            dtype = _torch_dtype(dtype_str)
             tensor = tensor_bytes.view(dtype).reshape(shape)
             tensor_dict[path] = tensor
 
@@ -202,10 +232,14 @@ async def write_blob(
     tensor: torch.Tensor,
 ) -> tuple[dict[str, Any], Any]:
     """Write a raw tensor to relay. Returns (metadata, relay_op)."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(
+            f"write_blob requires torch.Tensor, got {type(tensor).__name__}"
+        )
     start = _comm_now_ns()
     flat = tensor.contiguous().view(torch.uint8).reshape(-1)
     contiguous_ms = _comm_elapsed_ms(start)
-    transport_device = torch.device(getattr(relay, "device", "cpu"))
+    transport_device = torch.device(_relay_device(relay))
     move_start = _comm_now_ns()
     source_device = str(flat.device)
     if flat.device != transport_device:
@@ -227,9 +261,9 @@ async def write_blob(
         key=key,
         source_device=source_device,
         transport_device=str(transport_device),
-        tensor_device=str(getattr(tensor, "device", "unknown")),
-        tensor_shape=list(getattr(tensor, "shape", ())),
-        tensor_dtype=str(getattr(tensor, "dtype", "")),
+        tensor_device=str(tensor.device),
+        tensor_shape=list(tensor.shape),
+        tensor_dtype=str(tensor.dtype),
         bytes=int(flat.numel()),
         padding=int(padding),
         contiguous_ms=round(contiguous_ms, 6),
@@ -253,11 +287,11 @@ async def read_blob(
 ) -> torch.Tensor:
     """Read a raw tensor from relay."""
     start = _comm_now_ns()
-    device = getattr(relay, "device", "cpu")
+    device = _relay_device(relay)
     relay_info = metadata["relay_info"]
     shape = metadata["tensor_shape"]
     dtype_str = metadata["tensor_dtype"]
-    offset = int(metadata.get("tensor_offset", 0))
+    offset = int(metadata["tensor_offset"])
 
     data_size = relay_info["transfer_info"]["size"]
     alloc_start = _comm_now_ns()
@@ -272,7 +306,7 @@ async def read_blob(
     await op.wait_for_completion()
     wait_ms = _comm_elapsed_ms(wait_start)
 
-    dtype = getattr(torch, dtype_str.replace("torch.", ""))
+    dtype = _torch_dtype(dtype_str)
     result = recv_buf[offset:].view(dtype).reshape(shape)
     _comm_trace(
         "relay_read_blob",
@@ -300,7 +334,7 @@ async def send_stream_chunk(
     control_plane: Any,
     *,
     request_id: str,
-    data: Any,
+    data: torch.Tensor,
     target_stage: str,
     target_endpoint: str,
     from_stage: str,
@@ -315,6 +349,10 @@ async def send_stream_chunk(
     the handle travels in the control-plane metadata, no extra round-trip); for
     shm it rides host shared memory.
     """
+    if not isinstance(data, torch.Tensor):
+        raise TypeError(
+            f"send_stream_chunk requires torch.Tensor, got {type(data).__name__}"
+        )
     start = _comm_now_ns()
     blob_key = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
 
@@ -368,8 +406,8 @@ async def send_stream_chunk(
         from_stage=from_stage,
         target_stage=target_stage,
         chunk_id=chunk_id,
-        data_device=str(getattr(data, "device", "unknown")),
-        data_shape=list(getattr(data, "shape", ())),
+        data_device=str(data.device),
+        data_shape=list(data.shape),
         metadata_tensor_count=len(relay_metadata.get("chunk_metadata_tensors", {})),
         write_blob_ms=round(write_ms, 6),
         control_send_ms=round(send_ms, 6),
