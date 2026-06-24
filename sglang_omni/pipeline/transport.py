@@ -3,18 +3,20 @@
 
 Every decision about *how* two stages exchange a payload lives here, so the
 logic is not duplicated across the send and receive paths. The choice is derived
-purely from static placement (which stage runs where), following one ladder:
+from static placement (which stage runs where), following one ladder:
 
     same process              -> LOCAL     (python object reference, zero copy)
     same node, both on GPU    -> CUDA_IPC  (NVLink / cudaMemcpyPeer)
     same node, otherwise      -> SHM       (host shared memory)
     different node            -> (future) nixl / mooncake (RDMA)
 
-Because the decision is a function of placement alone, the sender and the
-receiver independently compute the *same* transport for an edge — the sender
-from its target, the receiver from ``msg.from_stage`` — so no per-message
-transport tag is needed. ``gpu_stage_names`` is the set of GPU-resident stages,
-which both sides share.
+Full-payload sends use placement alone: the sender and receiver independently
+compute the same transport for an edge from the shared stage placement.
+Streaming chunks additionally account for the actual payload device. A GPU-stage
+edge can still emit a CPU-resident stream tensor, and routing that through
+CUDA-IPC would add a CPU->GPU copy and IPC protocol overhead after the model has
+already synchronized to host. Those stream messages carry the transport kind the
+sender selected.
 
 This is also the single seam for cross-node unification: when multi-node lands,
 the only change is to return a nixl/mooncake relay for cross-node edges here.
@@ -78,6 +80,19 @@ class TransportRouter:
             return TransportKind.CUDA_IPC
         return TransportKind.SHM
 
+    def outbound_stream(self, target: str, data: Any) -> TransportKind:
+        """Transport for a stream chunk sent to ``target``.
+
+        Placement picks the fast GPU path for GPU-stage edges, but stream chunks
+        may already be CPU tensors. Keep those on the host SHM path instead of
+        bouncing them back to CUDA just to use CUDA-IPC.
+        """
+        kind = self.outbound(target)
+        if kind is TransportKind.CUDA_IPC and hasattr(data, "is_cuda"):
+            if not bool(data.is_cuda):
+                return TransportKind.SHM
+        return kind
+
     def inbound(self, from_stage: str) -> TransportKind:
         """Transport for relay data this stage receives from ``from_stage``.
 
@@ -101,6 +116,10 @@ class TransportRouter:
         kind = self.outbound(target)
         return kind, self.relay(kind)
 
+    def relay_for_stream(self, target: str, data: Any) -> tuple[TransportKind, Relay]:
+        kind = self.outbound_stream(target, data)
+        return kind, self.relay(kind)
+
     def inbound_relay(self, from_stage: str) -> Relay:
         return self.relay(self.inbound(from_stage))
 
@@ -114,7 +133,11 @@ class TransportRouter:
                     f"{self.stage_name!r}"
                 )
             return create_relay(
-                "cuda_ipc", engine_id=engine_id, device=f"cuda:{self.gpu_id}"
+                "cuda_ipc",
+                engine_id=engine_id,
+                device=f"cuda:{self.gpu_id}",
+                slot_size_mb=cfg.get("slot_size_mb", 512),
+                credits=cfg.get("credits", 2),
             )
         if kind is TransportKind.SHM:
             return create_relay(

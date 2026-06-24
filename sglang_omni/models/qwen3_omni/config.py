@@ -76,7 +76,9 @@ def _audio_encoder_stage(*, gpu: int, process: str) -> StageConfig:
     )
 
 
-def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConfig:
+def _aggregate_stage(
+    *, process: str, gpu: int, speech_enabled: bool = False
+) -> StageConfig:
     # Route the merged payload to talker_ar so partial-start can fire — the
     # policy hook needs the new_request before `stream_done` arrives.
     if speech_enabled:
@@ -84,6 +86,7 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
             name="mm_aggregate",
             process=process,
             factory=f"{_PKG}.stages.create_aggregate_executor",
+            gpu=gpu,
             wait_for=["preprocessing", "image_encoder", "audio_encoder"],
             wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
             merge_fn=f"{_PKG}.merge.merge_for_thinker",
@@ -99,6 +102,7 @@ def _aggregate_stage(*, process: str, speech_enabled: bool = False) -> StageConf
         name="mm_aggregate",
         process=process,
         factory=f"{_PKG}.stages.create_aggregate_executor",
+        gpu=gpu,
         wait_for=["preprocessing", "image_encoder", "audio_encoder"],
         wait_for_fn=f"{_PKG}.request_builders.resolve_mm_aggregate_wait_sources",
         merge_fn=f"{_PKG}.merge.merge_for_thinker",
@@ -197,7 +201,7 @@ def _text_stages() -> list[StageConfig]:
         _preprocessing_stage(process="pipeline"),
         _image_encoder_stage(gpu=0, process="pipeline"),
         _audio_encoder_stage(gpu=0, process="pipeline"),
-        _aggregate_stage(process="pipeline", speech_enabled=False),
+        _aggregate_stage(process="pipeline", gpu=0, speech_enabled=False),
         _thinker_stage(gpu=0, speech_enabled=False, process="pipeline"),
         _decode_stage(process="pipeline"),
     ]
@@ -222,6 +226,7 @@ def _speech_stages(
         ),
         _aggregate_stage(
             process=process_by_stage["mm_aggregate"],
+            gpu=thinker_gpu,
             speech_enabled=True,
         ),
         _thinker_stage(

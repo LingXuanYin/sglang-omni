@@ -14,6 +14,9 @@ from typing import Any
 
 import torch
 
+from sglang_omni.profiler.comm_trace import elapsed_ms as _comm_elapsed_ms
+from sglang_omni.profiler.comm_trace import emit as _comm_trace
+from sglang_omni.profiler.comm_trace import now_ns as _comm_now_ns
 from sglang_omni.proto import DataReadyMessage, StagePayload
 from sglang_omni.relay.base import Relay
 
@@ -199,10 +202,15 @@ async def write_blob(
     tensor: torch.Tensor,
 ) -> tuple[dict[str, Any], Any]:
     """Write a raw tensor to relay. Returns (metadata, relay_op)."""
+    start = _comm_now_ns()
     flat = tensor.contiguous().view(torch.uint8).reshape(-1)
+    contiguous_ms = _comm_elapsed_ms(start)
     transport_device = torch.device(getattr(relay, "device", "cpu"))
+    move_start = _comm_now_ns()
+    source_device = str(flat.device)
     if flat.device != transport_device:
         flat = flat.to(device=transport_device)
+    move_ms = _comm_elapsed_ms(move_start)
     padding = _pad_offset(0, _dtype_alignment(tensor.dtype))
     if padding:
         flat = torch.cat(
@@ -211,7 +219,24 @@ async def write_blob(
                 flat,
             ]
         )
+    put_start = _comm_now_ns()
     op = await relay.put_async(flat, request_id=key)
+    put_ms = _comm_elapsed_ms(put_start)
+    _comm_trace(
+        "relay_write_blob",
+        key=key,
+        source_device=source_device,
+        transport_device=str(transport_device),
+        tensor_device=str(getattr(tensor, "device", "unknown")),
+        tensor_shape=list(getattr(tensor, "shape", ())),
+        tensor_dtype=str(getattr(tensor, "dtype", "")),
+        bytes=int(flat.numel()),
+        padding=int(padding),
+        contiguous_ms=round(contiguous_ms, 6),
+        device_move_ms=round(move_ms, 6),
+        put_async_ms=round(put_ms, 6),
+        elapsed_ms=round(_comm_elapsed_ms(start), 6),
+    )
     metadata = {
         "relay_info": op.metadata,
         "tensor_shape": list(tensor.shape),
@@ -227,6 +252,7 @@ async def read_blob(
     metadata: dict[str, Any],
 ) -> torch.Tensor:
     """Read a raw tensor from relay."""
+    start = _comm_now_ns()
     device = getattr(relay, "device", "cpu")
     relay_info = metadata["relay_info"]
     shape = metadata["tensor_shape"]
@@ -234,14 +260,34 @@ async def read_blob(
     offset = int(metadata.get("tensor_offset", 0))
 
     data_size = relay_info["transfer_info"]["size"]
+    alloc_start = _comm_now_ns()
     recv_buf = torch.zeros(data_size, dtype=torch.uint8, device=device)
+    alloc_ms = _comm_elapsed_ms(alloc_start)
+    get_start = _comm_now_ns()
     op = await relay.get_async(
         metadata=relay_info, dest_tensor=recv_buf, request_id=key
     )
+    get_ms = _comm_elapsed_ms(get_start)
+    wait_start = _comm_now_ns()
     await op.wait_for_completion()
+    wait_ms = _comm_elapsed_ms(wait_start)
 
     dtype = getattr(torch, dtype_str.replace("torch.", ""))
-    return recv_buf[offset:].view(dtype).reshape(shape)
+    result = recv_buf[offset:].view(dtype).reshape(shape)
+    _comm_trace(
+        "relay_read_blob",
+        key=key,
+        device=str(device),
+        tensor_shape=list(shape),
+        tensor_dtype=dtype_str,
+        bytes=int(data_size),
+        offset=offset,
+        alloc_ms=round(alloc_ms, 6),
+        get_async_ms=round(get_ms, 6),
+        wait_completion_ms=round(wait_ms, 6),
+        elapsed_ms=round(_comm_elapsed_ms(start), 6),
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +306,7 @@ async def send_stream_chunk(
     from_stage: str,
     chunk_id: int,
     metadata: dict | None = None,
+    transport_kind: str | None = None,
 ) -> None:
     """Send a streaming chunk to a downstream stage over the given relay.
 
@@ -268,10 +315,15 @@ async def send_stream_chunk(
     the handle travels in the control-plane metadata, no extra round-trip); for
     shm it rides host shared memory.
     """
+    start = _comm_now_ns()
     blob_key = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
 
     pending_ops = []
+    write_start = _comm_now_ns()
     relay_metadata, op = await write_blob(relay, blob_key, data)
+    write_ms = _comm_elapsed_ms(write_start)
+    if transport_kind is not None:
+        relay_metadata["_transport"] = transport_kind
     pending_ops.append(op)
 
     if metadata:
@@ -301,10 +353,29 @@ async def send_stream_chunk(
         shm_metadata=relay_metadata,
         chunk_id=chunk_id,
     )
+    send_start = _comm_now_ns()
     await control_plane.send_to_stage(target_stage, target_endpoint, msg)
+    send_ms = _comm_elapsed_ms(send_start)
 
+    wait_start = _comm_now_ns()
     for pending_op in pending_ops:
         await pending_op.wait_for_completion()
+    wait_ms = _comm_elapsed_ms(wait_start)
+    _comm_trace(
+        "relay_send_stream_chunk",
+        request_id=request_id,
+        blob_key=blob_key,
+        from_stage=from_stage,
+        target_stage=target_stage,
+        chunk_id=chunk_id,
+        data_device=str(getattr(data, "device", "unknown")),
+        data_shape=list(getattr(data, "shape", ())),
+        metadata_tensor_count=len(relay_metadata.get("chunk_metadata_tensors", {})),
+        write_blob_ms=round(write_ms, 6),
+        control_send_ms=round(send_ms, 6),
+        sender_wait_completion_ms=round(wait_ms, 6),
+        elapsed_ms=round(_comm_elapsed_ms(start), 6),
+    )
 
 
 async def send_stream_signal(

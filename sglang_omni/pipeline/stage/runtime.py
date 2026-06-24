@@ -21,7 +21,7 @@ from sglang_omni.pipeline import relay_io
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
-from sglang_omni.pipeline.transport import TransportRouter
+from sglang_omni.pipeline.transport import TransportKind, TransportRouter
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
@@ -385,7 +385,7 @@ class Stage:
             return
         self._active_requests.add(request_id)
 
-        relay = self._router.inbound_relay(msg.from_stage)
+        relay = self._relay_for_stream_message(msg)
         blob_key = f"{request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         try:
             data = await relay_io.read_blob(relay, blob_key, msg.shm_metadata)
@@ -499,6 +499,22 @@ class Stage:
                 metadata = relay_io.restore_tensors(metadata, tensor_dict)
         return metadata or None
 
+    def _relay_for_stream_message(self, msg: DataReadyMessage) -> Relay:
+        if isinstance(msg.shm_metadata, dict):
+            transport = msg.shm_metadata.get("_transport")
+            if isinstance(transport, str):
+                try:
+                    return self._router.relay(TransportKind(transport))
+                except ValueError:
+                    logger.warning(
+                        "Stage %s: unknown stream transport %r from %s; "
+                        "falling back to placement inference",
+                        self.name,
+                        transport,
+                        msg.from_stage,
+                    )
+        return self._router.inbound_relay(msg.from_stage)
+
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
         relay = self._router.inbound_relay(msg.from_stage)
@@ -516,7 +532,7 @@ class Stage:
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
         if msg.chunk_id is None:
             return
-        relay = self._router.inbound_relay(msg.from_stage)
+        relay = self._relay_for_stream_message(msg)
         blob_key = (
             f"{msg.request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
         )
@@ -923,7 +939,14 @@ class Stage:
             )
             return
 
-        _, relay = self._router.relay_for(target)
+        transport_kind = self._router.outbound(target)
+        if transport_kind is TransportKind.LOCAL:
+            # Same-process fan-out can be unsafe to hand off by object reference
+            # when the target would share mutable payload containers. Use SHM as
+            # the relay-backed fallback instead of asking for a non-existent
+            # LOCAL relay.
+            transport_kind = TransportKind.SHM
+        relay = self._router.relay(transport_kind)
         metadata, op = await relay_io.write_payload(
             relay, request_id, projected_payload
         )
@@ -937,7 +960,7 @@ class Stage:
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
-            metadata={"to_stage": target},
+            metadata={"to_stage": target, "transport": transport_kind.value},
         )
         await self.control_plane.send_to_stage(target, endpoint, msg)
         await op.wait_for_completion()
@@ -1064,17 +1087,18 @@ class Stage:
                 event_name="stage_first_stream_chunk_sent",
                 metadata={"to_stage": target, "modality": chunk_modality},
             )
-        _emit_event(
-            request_id=request_id,
-            stage=self.name,
-            event_name="stage_stream_chunk_sent",
-            metadata={
-                "to_stage": target,
-                "chunk_id": chunk_id,
-                "modality": chunk_modality,
-            },
-        )
         if target in self._same_process_targets:
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_stream_chunk_sent",
+                metadata={
+                    "to_stage": target,
+                    "chunk_id": chunk_id,
+                    "modality": chunk_modality,
+                    "transport": "local_object",
+                },
+            )
             if self._local_dispatcher is None:
                 raise RuntimeError(
                     f"Stage {self.name}: same-process stream target {target!r} "
@@ -1091,7 +1115,18 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
-        _, relay = self._router.relay_for(target)
+        transport_kind, relay = self._router.relay_for_stream(target, data)
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_stream_chunk_sent",
+            metadata={
+                "to_stage": target,
+                "chunk_id": chunk_id,
+                "modality": chunk_modality,
+                "transport": transport_kind.value,
+            },
+        )
         await relay_io.send_stream_chunk(
             relay,
             self.control_plane,
@@ -1102,6 +1137,7 @@ class Stage:
             from_stage=self.name,
             chunk_id=chunk_id,
             metadata=metadata,
+            transport_kind=transport_kind.value,
         )
 
     async def _send_stream_signal_to_target(
