@@ -413,15 +413,6 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             )
         return audio_parts
 
-    def _has_ready_request(self) -> bool:
-        for request_id, chunks in self._code_chunks.items():
-            if self._is_aborted(request_id):
-                continue
-            ready = len(chunks) - self._emitted.get(request_id, 0)
-            if ready >= self._stream_chunk_size:
-                return True
-        return False
-
     def _ready_request_count(self) -> int:
         count = 0
         for request_id, chunks in self._code_chunks.items():
@@ -433,11 +424,12 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         return count
 
     def _collect_more_stream_chunks(self) -> None:
-        if self._decode_max_batch_size <= 1 or not self._has_ready_request():
+        ready_count = self._ready_request_count()
+        if self._decode_max_batch_size <= 1 or ready_count == 0:
             return
 
         deadline = time.monotonic() + self._decode_max_batch_wait_s
-        while self._ready_request_count() < self._decode_max_batch_size:
+        while ready_count < self._decode_max_batch_size:
             try:
                 msg = self.inbox.get_nowait()
             except _queue_mod.Empty:
@@ -455,6 +447,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                 self._pending_messages.append(msg)
                 break
             self._append_stream_chunk(msg.request_id, msg.data)
+            ready_count = self._ready_request_count()
 
     def _collect_more_stream_done(self) -> list[str]:
         if self._decode_max_batch_size <= 1:
