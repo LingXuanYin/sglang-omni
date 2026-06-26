@@ -110,9 +110,7 @@ if has_triton_predictor_kernels():
         vocab_offsets = tl.arange(0, block_v)
         vocab_mask = vocab_offsets < vocab_size
         row_logits = tl.load(
-            logits
-            + row * logits_stride_b
-            + vocab_offsets * logits_stride_v,
+            logits + row * logits_stride_b + vocab_offsets * logits_stride_v,
             mask=vocab_mask,
             other=-float("inf"),
         )
@@ -173,9 +171,7 @@ def stage_initial_predictor_input_(
     if layer0_code.ndim != 1:
         raise ValueError(f"layer0_code must be 1D, got {tuple(layer0_code.shape)}")
     if talker_hidden.ndim != 2:
-        raise ValueError(
-            f"talker_hidden must be 2D, got {tuple(talker_hidden.shape)}"
-        )
+        raise ValueError(f"talker_hidden must be 2D, got {tuple(talker_hidden.shape)}")
     if predictor_input.ndim != 3:
         raise ValueError(
             f"predictor_input must be 3D, got {tuple(predictor_input.shape)}"

@@ -9,7 +9,6 @@ from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
     stage_initial_predictor_input_,
 )
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Qwen3-Omni predictor kernels require CUDA"
 )

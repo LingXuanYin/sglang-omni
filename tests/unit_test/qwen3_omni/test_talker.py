@@ -1825,7 +1825,9 @@ def _talker_seed_req(
     req = SimpleNamespace(
         sampling_params=sp, output_ids=[], _codec_suppress_tokens=None, rid=rid
     )
-    return SimpleNamespace(data=SimpleNamespace(req=req, suppress_tokens=suppress_tokens))
+    return SimpleNamespace(
+        data=SimpleNamespace(req=req, suppress_tokens=suppress_tokens)
+    )
 
 
 def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
@@ -1894,8 +1896,12 @@ def test_talker_emit_code_feedback_batches_clone_lifetime() -> None:
     second = outbox.get_nowait()
     assert torch.equal(first.data, torch.tensor([1, 2]))
     assert torch.equal(second.data, torch.tensor([3, 4]))
-    assert torch.equal(requests[0].data.pending_feedback_queue[0], torch.tensor([1.0, 2.0]))
-    assert torch.equal(requests[1].data.pending_feedback_queue[0], torch.tensor([3.0, 4.0]))
+    assert torch.equal(
+        requests[0].data.pending_feedback_queue[0], torch.tensor([1.0, 2.0])
+    )
+    assert torch.equal(
+        requests[1].data.pending_feedback_queue[0], torch.tensor([3.0, 4.0])
+    )
     assert first.metadata == {"stream": True}
     assert first.target == "code2wav"
 

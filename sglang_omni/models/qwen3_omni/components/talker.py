@@ -14,14 +14,14 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.utils import add_prefix
 from torch import nn
 
+from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
+    sample_code_and_stage_,
+    stage_initial_predictor_input_,
+)
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
     Qwen3OmniMoeThinkerTextAttention,
     Qwen3OmniMoeThinkerTextDecoderLayer,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
-)
-from sglang_omni.models.qwen3_omni.components.predictor_kernels import (
-    sample_code_and_stage_,
-    stage_initial_predictor_input_,
 )
 from sglang_omni.models.qwen3_omni.hf_config import (
     Qwen3OmniMoeTalkerConfig,

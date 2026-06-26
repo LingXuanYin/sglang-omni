@@ -409,7 +409,9 @@ class QwenTalkerModelRunner(ModelRunner):
                 feedback_buffer[rows_t] = embeds_stacked
                 feedback_mask[rows_t] = True
         _emit_event(
-            request_id=getattr(getattr(requests[0].data, "req", None), "rid", "unknown"),
+            request_id=getattr(
+                getattr(requests[0].data, "req", None), "rid", "unknown"
+            ),
             stage=None,
             event_name="talker_feedback_buffer_write",
             metadata={

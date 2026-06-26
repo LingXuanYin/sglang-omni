@@ -136,7 +136,9 @@ def test_colocated_config_places_talker_code2wav_local_edge_in_one_process() -> 
 
     assert talker.next == "code2wav"
     assert "code2wav" in talker.stream_to
-    assert topology.stage_to_process["talker_ar"] == topology.stage_to_process["code2wav"]
+    assert (
+        topology.stage_to_process["talker_ar"] == topology.stage_to_process["code2wav"]
+    )
 
 
 def test_colocated_talker_code2wav_fusion_can_be_disabled(monkeypatch) -> None:
