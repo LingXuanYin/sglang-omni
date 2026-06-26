@@ -156,6 +156,81 @@ def test_qwen_code2wav_batches_same_length_final_partials() -> None:
     assert model.calls == [(2, 2, 2), (1, 2, 1)]
 
 
+def test_qwen_code2wav_streaming_first_window_can_emit_early() -> None:
+    model = FakeCode2WavModel(total_upsample=2)
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        first_stream_chunk_size=2,
+        left_context_size=0,
+        sample_rate=24000,
+        max_batch_wait_ms=0,
+    )
+    _seed_payloads(scheduler, ["req-1"])
+
+    scheduler._on_chunk("req-1", _chunk(0, 1, 10, stream=True))
+    assert model.calls == []
+    scheduler._on_chunk("req-1", _chunk(1, 2, 20, stream=True))
+    assert model.calls == [(1, 2, 2)]
+
+    stream_messages = []
+    while not scheduler.outbox.empty():
+        stream_messages.append(scheduler.outbox.get_nowait())
+    assert any(message.type == "stream" for message in stream_messages)
+
+    for idx in range(2, 5):
+        scheduler._on_chunk("req-1", _chunk(idx, idx + 1, idx + 10, stream=True))
+    assert model.calls == [(1, 2, 2)]
+    scheduler._on_chunk("req-1", _chunk(5, 6, 15, stream=True))
+    assert model.calls == [(1, 2, 2), (1, 2, 4)]
+
+
+def test_qwen_code2wav_non_streaming_keeps_full_window_for_first_decode() -> None:
+    model = FakeCode2WavModel(total_upsample=2)
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        first_stream_chunk_size=2,
+        left_context_size=0,
+        sample_rate=24000,
+        max_batch_wait_ms=0,
+    )
+    _seed_payloads(scheduler, ["req-1"])
+
+    for idx in range(2):
+        scheduler._on_chunk("req-1", _chunk(idx, idx + 1, idx + 10, stream=False))
+    assert model.calls == []
+
+    for idx in range(2, 4):
+        scheduler._on_chunk("req-1", _chunk(idx, idx + 1, idx + 10, stream=False))
+    assert model.calls == [(1, 2, 4)]
+
+
+def test_qwen_code2wav_first_window_env_can_disable(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_QWEN3_CODE2WAV_FIRST_CHUNK_SIZE", "0")
+    model = FakeCode2WavModel(total_upsample=2)
+    scheduler = Code2WavScheduler(
+        model,
+        device="cpu",
+        stream_chunk_size=4,
+        first_stream_chunk_size=2,
+        left_context_size=0,
+        sample_rate=24000,
+        max_batch_wait_ms=0,
+    )
+    _seed_payloads(scheduler, ["req-1"])
+
+    for idx in range(2):
+        scheduler._on_chunk("req-1", _chunk(idx, idx + 1, idx + 10, stream=True))
+    assert model.calls == []
+
+    for idx in range(2, 4):
+        scheduler._on_chunk("req-1", _chunk(idx, idx + 1, idx + 10, stream=True))
+    assert model.calls == [(1, 2, 4)]
+
+
 def test_qwen_code2wav_skips_eos_chunks_before_batching() -> None:
     model = FakeCode2WavModel(total_upsample=2)
     scheduler = Code2WavScheduler(

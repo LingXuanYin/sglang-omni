@@ -115,10 +115,15 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         max_batch_size: int = 16,
         max_batch_wait_ms: int = 1,
         enable_batched_decode: bool = True,
+        first_stream_chunk_size: int | None = None,
     ):
         self._model = model
         self._device = torch.device(device)
         self._stream_chunk_size = max(int(stream_chunk_size), 1)
+        self._first_stream_chunk_size = self._resolve_first_stream_chunk_size(
+            self._stream_chunk_size,
+            first_stream_chunk_size,
+        )
         self._left_context_size = max(int(left_context_size), 0)
         self._sample_rate = sample_rate
         self._codec_eos_token_id = codec_eos_token_id
@@ -138,6 +143,24 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._stream_enabled: dict[str, bool] = {}
         super().__init__(compute_fn=None)
         self._payloads = self._stream_payloads
+
+    @staticmethod
+    def _resolve_first_stream_chunk_size(
+        stream_chunk_size: int,
+        configured: int | None,
+    ) -> int:
+        env_value = os.getenv("SGLANG_OMNI_QWEN3_CODE2WAV_FIRST_CHUNK_SIZE")
+        if env_value is not None:
+            value = int(env_value)
+            if value <= 0:
+                return stream_chunk_size
+        elif configured is None:
+            value = min(stream_chunk_size, 8)
+        else:
+            value = int(configured)
+            if value <= 0:
+                return stream_chunk_size
+        return min(max(value, 1), stream_chunk_size)
 
     def is_streaming_payload(self, payload: StagePayload) -> bool:
         del payload
@@ -395,7 +418,8 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             ready = end - start
             if ready <= 0:
                 continue
-            if ready < self._stream_chunk_size and request_id not in force_request_ids:
+            threshold = self._decode_ready_threshold(request_id)
+            if ready < threshold and request_id not in force_request_ids:
                 continue
             context = min(self._left_context_size, start)
             window = self._code_window(request_id, start - context, end)
@@ -512,9 +536,17 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             ready = self._code_chunk_count(request_id) - self._emitted.get(
                 request_id, 0
             )
-            if ready >= self._stream_chunk_size:
+            if ready >= self._decode_ready_threshold(request_id):
                 count += 1
         return count
+
+    def _decode_ready_threshold(self, request_id: str) -> int:
+        if (
+            self._stream_enabled.get(request_id, False)
+            and self._emitted.get(request_id, 0) == 0
+        ):
+            return self._first_stream_chunk_size
+        return self._stream_chunk_size
 
     def _collect_more_stream_chunks(self) -> None:
         ready_count = self._ready_request_count()
@@ -605,6 +637,7 @@ def create_code2wav_scheduler(
     max_batch_size: int = 16,
     max_batch_wait_ms: int = 1,
     enable_batched_decode: bool = True,
+    first_stream_chunk_size: int | None = None,
 ):
     """Factory: returns Code2WavScheduler."""
     if gpu_id is not None:
@@ -618,4 +651,5 @@ def create_code2wav_scheduler(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         enable_batched_decode=enable_batched_decode,
+        first_stream_chunk_size=first_stream_chunk_size,
     )
