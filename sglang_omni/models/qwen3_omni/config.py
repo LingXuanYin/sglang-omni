@@ -24,7 +24,7 @@ _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
 
 
 def _colocated_fused_stages() -> list[list[str]]:
-    if os.getenv("SGLANG_OMNI_QWEN3_FUSE_TALKER_CODE2WAV", "1") == "0":
+    if os.getenv("SGLANG_OMNI_QWEN3_FUSE_TALKER_CODE2WAV", "0") != "1":
         return []
     return [["talker_ar", "code2wav"]]
 
