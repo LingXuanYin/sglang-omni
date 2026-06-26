@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar
 
 from pydantic import Field
@@ -20,6 +21,12 @@ MIN_PARTIAL_START_CHUNKS = 3
 # FIXME (Ratish): Replace this with a bounded/pre-ready SGLang DeepGEMM compile
 # policy once that exists outside import-time environment globals.
 _DEEPGEMM_PRECOMPILE_ENV_DEFAULTS = {"SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0"}
+
+
+def _colocated_fused_stages() -> list[list[str]]:
+    if os.getenv("SGLANG_OMNI_QWEN3_FUSE_TALKER_CODE2WAV", "1") == "0":
+        return []
+    return [["talker_ar", "code2wav"]]
 
 
 def _preprocessing_stage(*, process: str) -> StageConfig:
@@ -345,6 +352,7 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
             enable_partial_start=False,
         )
     )
+    fused_stages: list[list[str]] = Field(default_factory=_colocated_fused_stages)
 
 
 EntryClass = Qwen3OmniSpeechPipelineConfig

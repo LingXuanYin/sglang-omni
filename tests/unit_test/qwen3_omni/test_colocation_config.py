@@ -82,6 +82,7 @@ def test_colocated_topology_is_opt_in_and_uses_one_gpu() -> None:
 
     assert Variants["speech-colocated"] is Qwen3OmniSpeechColocatedPipelineConfig
     assert _stage(config, "talker_ar").factory_args["enable_partial_start"] is False
+    assert config.fused_stages == [["talker_ar", "code2wav"]]
     for stage_name in (
         "image_encoder",
         "audio_encoder",
@@ -110,9 +111,10 @@ def test_colocated_config_passes_with_explicit_budgets_without_ar_mem_fraction()
         "mm_aggregate",
         "thinker",
         "decode",
-        "talker_ar",
-        "code2wav",
+        "fused_talker_ar_code2wav",
     ]
+    assert topology.stage_to_process["talker_ar"] == "fused_talker_ar_code2wav"
+    assert topology.stage_to_process["code2wav"] == "fused_talker_ar_code2wav"
 
 
 def test_colocated_config_marks_same_gpu_stream_targets() -> None:
@@ -123,6 +125,31 @@ def test_colocated_config_marks_same_gpu_stream_targets() -> None:
 
     assert plan.same_gpu_stream_targets["thinker"] == frozenset({"talker_ar"})
     assert plan.same_gpu_stream_targets["talker_ar"] == frozenset({"code2wav"})
+
+
+def test_colocated_config_places_talker_code2wav_local_edge_in_one_process() -> None:
+    config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
+    _set_colocated_runtime(config)
+    placement = build_stage_placement_plan(config)
+    topology = build_process_topology_plan(config, placement)
+    talker = _stage(config, "talker_ar")
+
+    assert talker.next == "code2wav"
+    assert "code2wav" in talker.stream_to
+    assert topology.stage_to_process["talker_ar"] == topology.stage_to_process["code2wav"]
+
+
+def test_colocated_talker_code2wav_fusion_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_QWEN3_FUSE_TALKER_CODE2WAV", "0")
+    config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
+    _set_colocated_runtime(config)
+
+    placement = build_stage_placement_plan(config)
+    topology = build_process_topology_plan(config, placement)
+
+    assert config.fused_stages == []
+    assert topology.stage_to_process["talker_ar"] == "talker_ar"
+    assert topology.stage_to_process["code2wav"] == "code2wav"
 
 
 def test_default_speech_marks_only_talker_to_code2wav_same_gpu_stream() -> None:

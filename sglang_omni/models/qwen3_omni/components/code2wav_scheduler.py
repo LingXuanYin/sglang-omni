@@ -8,6 +8,7 @@ runs vocoder incrementally, outputs final audio via outbox.
 from __future__ import annotations
 
 import logging
+import os
 import queue as _queue_mod
 import time
 from dataclasses import dataclass
@@ -33,6 +34,43 @@ class _DecodePlan:
     end: int
     trim: int
     codes: torch.Tensor
+
+
+@dataclass
+class _CodeTensorBuffer:
+    chunks: torch.Tensor | None = None
+    length: int = 0
+
+    def append(self, codes: torch.Tensor) -> None:
+        if self.chunks is None:
+            capacity = max(16, self.length + 1)
+            self.chunks = torch.empty(
+                (capacity, *codes.shape),
+                device=codes.device,
+                dtype=codes.dtype,
+            )
+        elif self.length >= int(self.chunks.shape[0]):
+            capacity = max(self.length + 1, int(self.chunks.shape[0]) * 2)
+            grown = torch.empty(
+                (capacity, *self.chunks.shape[1:]),
+                device=self.chunks.device,
+                dtype=self.chunks.dtype,
+            )
+            grown[: self.length].copy_(self.chunks[: self.length])
+            self.chunks = grown
+
+        if tuple(codes.shape) != tuple(self.chunks.shape[1:]):
+            raise RuntimeError(
+                "code2wav received inconsistent codec chunk shape: "
+                f"got {tuple(codes.shape)}, expected {tuple(self.chunks.shape[1:])}"
+            )
+        self.chunks[self.length].copy_(codes)
+        self.length += 1
+
+    def window(self, start: int, end: int) -> torch.Tensor:
+        if self.chunks is None:
+            raise RuntimeError("code2wav tensor buffer is empty")
+        return self.chunks[start:end]
 
 
 def load_code2wav_model(
@@ -88,9 +126,13 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         self._decode_max_batch_size = max(int(max_batch_size), 1)
         self._decode_max_batch_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
         self._enable_batched_decode = bool(enable_batched_decode)
+        self._enable_tensor_code_buffer = (
+            os.getenv("SGLANG_OMNI_QWEN3_CODE2WAV_TENSOR_BUFFER", "1") != "0"
+        )
 
         # Per-request state
         self._code_chunks: dict[str, list[torch.Tensor]] = {}
+        self._code_buffers: dict[str, _CodeTensorBuffer] = {}
         self._emitted: dict[str, int] = {}
         self._audio_chunks: dict[str, list[np.ndarray]] = {}
         self._stream_enabled: dict[str, bool] = {}
@@ -107,6 +149,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
 
     def clear_stream_state(self, request_id: str) -> None:
         self._code_chunks.pop(request_id, None)
+        self._code_buffers.pop(request_id, None)
         self._emitted.pop(request_id, None)
         self._audio_chunks.pop(request_id, None)
         self._stream_enabled.pop(request_id, None)
@@ -125,6 +168,8 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         if request_id in self._code_chunks:
             return
         self._code_chunks[request_id] = []
+        if self._enable_tensor_code_buffer:
+            self._code_buffers[request_id] = _CodeTensorBuffer()
         self._emitted[request_id] = 0
         self._audio_chunks[request_id] = []
 
@@ -227,7 +272,10 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                     "Code2Wav skip EOS req=%s codes=%s", request_id, codes.tolist()
                 )
             return
-        self._code_chunks[request_id].append(codes)
+        if self._enable_tensor_code_buffer:
+            self._code_buffers[request_id].append(codes)
+        else:
+            self._code_chunks[request_id].append(codes)
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
         messages: list[OutgoingMessage] = []
@@ -252,7 +300,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             logger.debug(
                 "Code2Wav finalize req=%s code_chunks=%s audio_parts=%s final_samples=%s",
                 request_id,
-                len(self._code_chunks[request_id]),
+                self._code_chunk_count(request_id),
                 len(audio_parts),
                 int(full_audio.shape[0]),
             )
@@ -266,7 +314,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                 "sample_rate": self._sample_rate,
             }
         else:
-            final_data = self._build_audio_payload(full_audio)
+            final_data = self._build_audio_payload(full_audio, request_id=request_id)
         messages.append(
             OutgoingMessage(
                 request_id=request_id,
@@ -314,7 +362,10 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                             request_id=plan.request_id,
                             type="stream",
                             target=None,
-                            data=self._build_audio_payload(audio),
+                            data=self._build_audio_payload(
+                                audio,
+                                request_id=plan.request_id,
+                            ),
                             metadata={"modality": "audio"},
                         )
                     )
@@ -330,21 +381,24 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         candidate_ids = (
             request_ids if request_ids is not None else list(self._code_chunks)
         )
+        start_ns = time.perf_counter_ns()
         for request_id in candidate_ids:
             if self._is_aborted(request_id):
                 continue
-            code_chunks = self._code_chunks.get(request_id)
-            if not code_chunks:
+            if request_id not in self._code_chunks:
+                continue
+            chunk_count = self._code_chunk_count(request_id)
+            if chunk_count <= 0:
                 continue
             start = self._emitted.get(request_id, 0)
-            end = len(code_chunks)
+            end = chunk_count
             ready = end - start
             if ready <= 0:
                 continue
             if ready < self._stream_chunk_size and request_id not in force_request_ids:
                 continue
             context = min(self._left_context_size, start)
-            window = torch.stack(code_chunks[start - context : end], dim=0)
+            window = self._code_window(request_id, start - context, end)
             codes = window.transpose(0, 1)
             plans.append(
                 _DecodePlan(
@@ -355,7 +409,32 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                     codes=codes,
                 )
             )
+        if plans:
+            _emit_event(
+                request_id=plans[0].request_id,
+                stage=None,
+                event_name="code2wav_plan_build",
+                metadata={
+                    "plans": len(plans),
+                    "duration_us": (time.perf_counter_ns() - start_ns) / 1000.0,
+                    "tensor_buffer": self._enable_tensor_code_buffer,
+                },
+            )
         return plans
+
+    def _code_chunk_count(self, request_id: str) -> int:
+        if self._enable_tensor_code_buffer:
+            buffer = self._code_buffers.get(request_id)
+            return 0 if buffer is None else buffer.length
+        return len(self._code_chunks.get(request_id, ()))
+
+    def _code_window(self, request_id: str, start: int, end: int) -> torch.Tensor:
+        if self._enable_tensor_code_buffer:
+            buffer = self._code_buffers.get(request_id)
+            if buffer is None:
+                raise RuntimeError(f"code2wav missing tensor buffer for {request_id!r}")
+            return buffer.window(start, end)
+        return torch.stack(self._code_chunks[request_id][start:end], dim=0)
 
     def _group_decode_plans(self, plans: list[_DecodePlan]) -> list[list[_DecodePlan]]:
         if not self._enable_batched_decode:
@@ -381,6 +460,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         if not plans:
             return []
 
+        start_ns = time.perf_counter_ns()
         codes = torch.stack([plan.codes for plan in plans], dim=0)
         with torch.no_grad():
             if self._device.type == "cuda":
@@ -401,7 +481,7 @@ class Code2WavScheduler(StreamingSimpleScheduler):
         if trim:
             wav = wav[:, trim:]
         audio_batch = wav.detach().to(device="cpu", dtype=torch.float32).numpy()
-        audio_parts = [audio_batch[i].copy() for i in range(batch_size)]
+        audio_parts = [audio_batch[i] for i in range(batch_size)]
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "Code2Wav decode batch window=%s batch=%s start_end=%s trim=%s samples=%s",
@@ -411,14 +491,27 @@ class Code2WavScheduler(StreamingSimpleScheduler):
                 trim,
                 [int(audio.shape[0]) for audio in audio_parts],
             )
+        _emit_event(
+            request_id=plans[0].request_id,
+            stage=None,
+            event_name="code2wav_decode_batch",
+            metadata={
+                "batch_size": batch_size,
+                "window_shape": tuple(codes.shape),
+                "trim": trim,
+                "duration_us": (time.perf_counter_ns() - start_ns) / 1000.0,
+            },
+        )
         return audio_parts
 
     def _ready_request_count(self) -> int:
         count = 0
-        for request_id, chunks in self._code_chunks.items():
+        for request_id in self._code_chunks:
             if self._is_aborted(request_id):
                 continue
-            ready = len(chunks) - self._emitted.get(request_id, 0)
+            ready = self._code_chunk_count(request_id) - self._emitted.get(
+                request_id, 0
+            )
             if ready >= self._stream_chunk_size:
                 count += 1
         return count
@@ -475,13 +568,30 @@ class Code2WavScheduler(StreamingSimpleScheduler):
             request_ids.append(msg.request_id)
         return request_ids
 
-    def _build_audio_payload(self, audio: np.ndarray) -> dict[str, Any]:
-        return audio_waveform_payload(
+    def _build_audio_payload(
+        self,
+        audio: np.ndarray,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        start_ns = time.perf_counter_ns()
+        payload = audio_waveform_payload(
             audio.astype(np.float32, copy=False),
             sample_rate=self._sample_rate,
             modality="audio",
             source_hint="Qwen3-Omni code2wav",
         )
+        if request_id is not None:
+            _emit_event(
+                request_id=request_id,
+                stage=None,
+                event_name="code2wav_audio_payload",
+                metadata={
+                    "samples": int(audio.shape[0]),
+                    "duration_us": (time.perf_counter_ns() - start_ns) / 1000.0,
+                },
+            )
+        return payload
 
 
 def create_code2wav_scheduler(

@@ -113,8 +113,7 @@ def test_qwen3_omni_h20_colocated_example_config_loads_and_plans() -> None:
         "mm_aggregate",
         "thinker",
         "decode",
-        "talker_ar",
-        "code2wav",
+        "fused_talker_ar_code2wav",
     ]
     assert (
         _stage(config, "thinker").runtime.sglang_server_args.mem_fraction_static is None
