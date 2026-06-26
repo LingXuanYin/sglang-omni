@@ -14,6 +14,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+import pytest
+
 from sglang_omni.scheduling.messages import IncomingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
@@ -201,57 +203,16 @@ def test_max_concurrency_reports_errors_from_returned_coroutines() -> None:
     assert isinstance(outputs[0].data, RuntimeError)
 
 
-def test_max_concurrency_runs_batch_fn_in_parallel() -> None:
-    """Batched stages should be able to run multiple batches concurrently."""
-    started_batches: list[tuple[str, ...]] = []
-    lock = threading.Lock()
-    both_batches_started = threading.Event()
-    release = threading.Event()
-
-    def compute(payload: str) -> str:
-        return payload.upper()
-
-    def compute_batch(payloads: list[str]) -> list[str]:
-        with lock:
-            started_batches.append(tuple(payloads))
-            if len(started_batches) == 2:
-                both_batches_started.set()
-        assert release.wait(timeout=2.0)
-        return [payload.upper() for payload in payloads]
-
-    def wait_for_both_batches_started() -> None:
-        try:
-            assert both_batches_started.wait(timeout=2.0)
-        finally:
-            release.set()
-
-    outputs = run_scheduler(
+def test_max_concurrency_with_batch_fn_is_rejected() -> None:
+    """``max_concurrency > 1`` and ``batch_compute_fn`` are mutually exclusive
+    construction options."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
         SimpleScheduler(
-            compute,
-            batch_compute_fn=compute_batch,
+            lambda payload: payload,
+            batch_compute_fn=lambda payloads: payloads,
             max_batch_size=2,
-            max_batch_wait_ms=10,
-            max_concurrency=2,
-        ),
-        [
-            IncomingMessage("req-1", "new_request", "a"),
-            IncomingMessage("req-2", "new_request", "b"),
-            IncomingMessage("req-3", "new_request", "c"),
-            IncomingMessage("req-4", "new_request", "d"),
-        ],
-        output_count=4,
-        before_collect=wait_for_both_batches_started,
-    )
-
-    assert {out.request_id for out in outputs} == {
-        "req-1",
-        "req-2",
-        "req-3",
-        "req-4",
-    }
-    assert {out.data for out in outputs} == {"A", "B", "C", "D"}
-    assert len(started_batches) == 2
-    assert all(len(batch) == 2 for batch in started_batches)
+            max_concurrency=4,
+        )
 
 
 def test_default_max_concurrency_is_one_for_backcompat() -> None:
