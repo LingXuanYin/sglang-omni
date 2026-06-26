@@ -407,10 +407,10 @@ tts_wer:
   group: wer
   extra_env: {}
   context_vars:
-    - MAX_SAMPLES
     - CONCURRENCY
-  test_file_sha256: c0db8074a88d6f7d46d9ed556193ce16d16de0e730aa350f460d8d1988ae5b7c
-  last_discovered_at: 2026-06-14T23:57:14Z
+  test_file_sha256: d19753d8a0a445a8f492f589a236ad6b4f68a8229624d454595d54af54772455
+  last_discovered_at: 2026-06-26T23:06:14Z
+  expected_samples: 50
   sample_counts:
     total:
       json_file: "vc_nonstream0/wer_results.json"
@@ -439,16 +439,44 @@ tts_wer:
         scale: 1
         digits: 0
       status: OK
+tts_similarity:
+  test: tests/test_model/test_qwen3_omni_tts_ci.py
+  title: "TTS Similarity"
+  group: similarity
+  extra_env: {}
+  context_vars:
+    - CONCURRENCY
+  test_file_sha256: d19753d8a0a445a8f492f589a236ad6b4f68a8229624d454595d54af54772455
+  last_discovered_at: 2026-06-26T23:06:14Z
+  expected_samples: 20
+  sample_counts:
+    total:
+      json_file: "vc_nonstream0/voice_copy_margin_results.json"
+      json_path: "summary.total_samples"
+    ok:
+      json_file: "vc_nonstream0/voice_copy_margin_results.json"
+      json_path: "summary.evaluated"
+  metrics:
+    similarity_margin:
+      source: "VC_SIMILARITY_MARGIN_MIN"
+      json_file: "vc_nonstream0/voice_copy_margin_results.json"
+      json_path: "summary.speaker_similarity_margin_mean"
+      worst: min
+      display:
+        label: "Speaker sim margin"
+        scale: 1
+        digits: 4
+      status: OK
 tts_utmos:
   test: tests/test_model/test_qwen3_omni_tts_ci.py
   title: "TTS Utmos"
   group: utmos
   extra_env: {}
   context_vars:
-    - MAX_SAMPLES
     - CONCURRENCY
-  test_file_sha256: c0db8074a88d6f7d46d9ed556193ce16d16de0e730aa350f460d8d1988ae5b7c
-  last_discovered_at: 2026-06-14T23:57:14Z
+  test_file_sha256: d19753d8a0a445a8f492f589a236ad6b4f68a8229624d454595d54af54772455
+  last_discovered_at: 2026-06-26T23:06:14Z
+  expected_samples: 50
   sample_counts:
     total:
       json_file: "vc_nonstream0/utmos_results.json"
@@ -473,10 +501,10 @@ tts_speed:
   group: speed
   extra_env: {}
   context_vars:
-    - MAX_SAMPLES
     - CONCURRENCY
-  test_file_sha256: c0db8074a88d6f7d46d9ed556193ce16d16de0e730aa350f460d8d1988ae5b7c
-  last_discovered_at: 2026-06-14T23:57:14Z
+  test_file_sha256: d19753d8a0a445a8f492f589a236ad6b4f68a8229624d454595d54af54772455
+  last_discovered_at: 2026-06-26T23:06:14Z
+  expected_samples: 50
   sample_counts:
     total:
       json_file: "vc_nonstream0/speed_results.json"
