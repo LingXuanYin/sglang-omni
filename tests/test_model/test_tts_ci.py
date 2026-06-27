@@ -310,8 +310,7 @@ def _build_voice_copy_margin_results(
             "id": sample_id,
             "copy_similarity": copy_rows[sample_id],
             "no_copy_similarity": no_copy_rows[sample_id],
-            "speaker_similarity_margin": copy_rows[sample_id]
-            - no_copy_rows[sample_id],
+            "speaker_similarity_margin": copy_rows[sample_id] - no_copy_rows[sample_id],
         }
         for sample_id in shared_ids
     ]

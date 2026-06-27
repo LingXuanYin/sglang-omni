@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 
-
 VOICE_COPY_MARGIN_RESULTS_FILENAME = "voice_copy_margin_results.json"
 
 
-def _index_similarity_rows(results: dict, label: str) -> tuple[dict[str, dict], list[str]]:
+def _index_similarity_rows(
+    results: dict, label: str
+) -> tuple[dict[str, dict], list[str]]:
     rows = results.get("per_sample")
     if not isinstance(rows, list):
         raise ValueError(f"{label} similarity results must contain a per_sample list")
