@@ -116,7 +116,7 @@ tts_higgs_nonstream_wer:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
@@ -152,7 +152,7 @@ tts_higgs_nonstream_similarity:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
@@ -188,7 +188,7 @@ tts_higgs_nonstream_utmos:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
@@ -224,7 +224,7 @@ tts_higgs_nonstream_speed:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
@@ -464,7 +464,7 @@ tts_higgs_stream_wer:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
@@ -500,7 +500,7 @@ tts_higgs_stream_speed:
   calibration_preset: "higgs"
   gpus: 2
   hf_model_ids:
-    - "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+    - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
   test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
   last_discovered_at: 2026-06-25T18:10:05Z
