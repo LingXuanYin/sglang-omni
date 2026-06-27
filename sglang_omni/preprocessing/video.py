@@ -54,7 +54,7 @@ def clear_video_decode_cache() -> None:
 
 
 def _video_decode_cache_enabled() -> bool:
-    return os.getenv("SGLANG_OMNI_VIDEO_DECODE_CACHE", "1") != "0"
+    return os.getenv("SGLANG_OMNI_VIDEO_DECODE_CACHE", "0") == "1"
 
 
 def _video_decode_cache_max_bytes() -> int:

@@ -124,6 +124,57 @@ def test_load_video_path_reuses_local_decode_cache(
     video_utils.clear_video_decode_cache()
 
 
+def test_load_video_path_cache_is_opt_in_by_default(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    video_utils.clear_video_decode_cache()
+    path = tmp_path / "sample.mp4"
+    path.write_bytes(b"stable local video")
+    frames = torch.zeros(2, 3, 4, 4)
+    calls = 0
+
+    def decord_reader(ele):
+        nonlocal calls
+        calls += 1
+        return frames.clone(), {"video_backend": "decord"}, 2.0
+
+    monkeypatch.delenv("SGLANG_OMNI_VIDEO_DECODE_CACHE", raising=False)
+    monkeypatch.setattr(
+        video_utils.tempfile,
+        "gettempdir",
+        lambda: str(tmp_path / "different-temp-root"),
+    )
+    monkeypatch.setattr(
+        video_utils.qwen_vision,
+        "get_video_reader_backend",
+        lambda: "decord",
+    )
+    monkeypatch.setitem(
+        video_utils.qwen_vision.VIDEO_READER_BACKENDS,
+        "decord",
+        decord_reader,
+    )
+    monkeypatch.setattr(
+        video_utils.qwen_vision,
+        "smart_resize",
+        lambda height, width, **kwargs: (height, width),
+    )
+    monkeypatch.setattr(
+        video_utils.tv_f,
+        "resize",
+        lambda video, size, interpolation, antialias: video,
+    )
+
+    first, first_fps = video_utils.load_video_path(path, fps=2)
+    second, second_fps = video_utils.load_video_path(path, fps=2)
+
+    assert calls == 2
+    assert first is not second
+    assert first_fps == second_fps == 2.0
+    video_utils.clear_video_decode_cache()
+
+
 def test_load_video_path_does_not_cache_temp_files(
     monkeypatch,
     tmp_path,
