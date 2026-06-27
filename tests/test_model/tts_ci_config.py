@@ -27,7 +27,7 @@ class TtsCiThresholdPreset:
     stream_speed: dict[int, dict[str, float]]
     wer_corpus: float
     stream_wer_corpus: float
-    similarity_mean_min: float
+    similarity_margin_min: float
     utmos_mean_min: float
 
 
@@ -49,7 +49,7 @@ HIGGS_VC_WER_MAX_CORPUS = 0.0121
 HIGGS_VC_WER_CORPUS_THRESHOLD = apply_wer_slack(HIGGS_VC_WER_MAX_CORPUS)
 HIGGS_VC_STREAM_WER_MAX_CORPUS = 0.0119
 HIGGS_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(HIGGS_VC_STREAM_WER_MAX_CORPUS)
-HIGGS_VC_SIMILARITY_MEAN_MIN = 66.28049980163574
+HIGGS_VC_SIMILARITY_MARGIN_MIN = 60.636281912326815
 HIGGS_VC_UTMOS_MEAN_REFERENCE = 4.1539
 HIGGS_VC_UTMOS_MEAN_MIN = apply_mos_slack(HIGGS_VC_UTMOS_MEAN_REFERENCE)
 
@@ -83,7 +83,7 @@ MOSS_VC_WER_MAX_CORPUS = 0.0256
 MOSS_VC_WER_CORPUS_THRESHOLD = apply_wer_slack(MOSS_VC_WER_MAX_CORPUS)
 MOSS_VC_STREAM_WER_MAX_CORPUS = 0.0254
 MOSS_VC_STREAM_WER_CORPUS_THRESHOLD = apply_wer_slack(MOSS_VC_STREAM_WER_MAX_CORPUS)
-MOSS_VC_SIMILARITY_MEAN_MIN = 62.2052205657959
+MOSS_VC_SIMILARITY_MARGIN_MIN = 54.81295958429575
 MOSS_VC_UTMOS_MEAN_REFERENCE = 3.9603
 MOSS_VC_UTMOS_MEAN_MIN = apply_mos_slack(MOSS_VC_UTMOS_MEAN_REFERENCE)
 
@@ -122,7 +122,7 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
             stream_speed=HIGGS_VC_STREAM_THRESHOLDS,
             wer_corpus=HIGGS_VC_WER_CORPUS_THRESHOLD,
             stream_wer_corpus=HIGGS_VC_STREAM_WER_CORPUS_THRESHOLD,
-            similarity_mean_min=HIGGS_VC_SIMILARITY_MEAN_MIN,
+            similarity_margin_min=HIGGS_VC_SIMILARITY_MARGIN_MIN,
             utmos_mean_min=HIGGS_VC_UTMOS_MEAN_MIN,
         ),
     ),
@@ -138,7 +138,7 @@ TTS_CI_PRESETS: dict[str, TtsCiPreset] = {
             stream_speed=MOSS_VC_STREAM_THRESHOLDS,
             wer_corpus=MOSS_VC_WER_CORPUS_THRESHOLD,
             stream_wer_corpus=MOSS_VC_STREAM_WER_CORPUS_THRESHOLD,
-            similarity_mean_min=MOSS_VC_SIMILARITY_MEAN_MIN,
+            similarity_margin_min=MOSS_VC_SIMILARITY_MARGIN_MIN,
             utmos_mean_min=MOSS_VC_UTMOS_MEAN_MIN,
         ),
     ),

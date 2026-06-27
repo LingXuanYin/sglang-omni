@@ -137,8 +137,8 @@ metric_sources:
             total: "test_voice_cloning_non_streami0/vc_nonstream_c16/wer_results.json::summary.total_samples"
             ok: "test_voice_cloning_non_streami0/vc_nonstream_c16/wer_results.json::summary.evaluated"
           similarity:
-            total: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json::summary.total_samples"
-            ok: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json::summary.evaluated"
+            total: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json::summary.total_samples"
+            ok: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json::summary.evaluated"
           utmos:
             total: "test_voice_cloning_non_streami0/vc_nonstream_c16/utmos_results.json::summary.total_samples"
             ok: "test_voice_cloning_non_streami0/vc_nonstream_c16/utmos_results.json::summary.evaluated"
@@ -148,7 +148,7 @@ metric_sources:
           latency_mean_s: "summary.latency_mean_s"
           rtf_mean: "summary.rtf_mean"
           corpus_wer: "test_voice_cloning_non_streami0/vc_nonstream_c16/wer_results.json::summary.wer_corpus"
-          similarity_mean: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json::summary.speaker_similarity_mean"
+          similarity_margin: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json::summary.speaker_similarity_margin_mean"
           utmos_mean: "test_voice_cloning_non_streami0/vc_nonstream_c16/utmos_results.json::summary.utmos_mean"
       stream:
         constant_filter: "^HIGGS_VC_STREAM_.*$|^MOSS_VC_STREAM_.*$"

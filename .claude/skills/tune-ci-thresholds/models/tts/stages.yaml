@@ -7,7 +7,7 @@ qwen3_asr_wer:
   context_vars:
     - SEEDTTS_ASR_CORRECTNESS_SAMPLES
   test_file_sha256: 680a4feb5aa48795ea007f511691c137ae6d08f326f9a0f9c68ef19a695ae9c5
-  last_discovered_at: 2026-06-27T02:04:11Z
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   sample_counts:
     total:
@@ -45,7 +45,7 @@ qwen3_asr_speed:
   context_vars:
     - SEEDTTS_ASR_CORRECTNESS_SAMPLES
   test_file_sha256: 680a4feb5aa48795ea007f511691c137ae6d08f326f9a0f9c68ef19a695ae9c5
-  last_discovered_at: 2026-06-27T02:04:11Z
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   sample_counts:
     total:
@@ -118,11 +118,11 @@ tts_higgs_nonstream_wer:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/wer_results.json"
@@ -154,26 +154,26 @@ tts_higgs_nonstream_similarity:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
       json_path: "summary.total_samples"
     ok:
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
       json_path: "summary.evaluated"
   metrics:
-    similarity_mean:
-      source: "HIGGS_VC_SIMILARITY_MEAN_MIN"
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
-      json_path: "summary.speaker_similarity_mean"
+    similarity_margin:
+      source: "HIGGS_VC_SIMILARITY_MARGIN_MIN"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
+      json_path: "summary.speaker_similarity_margin_mean"
       worst: min
       display:
-        label: "Speaker sim mean"
+        label: "Speaker sim margin"
         scale: 1
         digits: 4
       status: OK
@@ -190,11 +190,11 @@ tts_higgs_nonstream_utmos:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/utmos_results.json"
@@ -226,11 +226,11 @@ tts_higgs_nonstream_speed:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/speed_results.json"
@@ -292,11 +292,11 @@ tts_moss_nonstream_wer:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/wer_results.json"
@@ -328,26 +328,26 @@ tts_moss_nonstream_similarity:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 50
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
       json_path: "summary.total_samples"
     ok:
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
       json_path: "summary.evaluated"
   metrics:
-    similarity_mean:
-      source: "MOSS_VC_SIMILARITY_MEAN_MIN"
-      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/similarity_results.json"
-      json_path: "summary.speaker_similarity_mean"
+    similarity_margin:
+      source: "MOSS_VC_SIMILARITY_MARGIN_MIN"
+      json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/voice_copy_margin_results.json"
+      json_path: "summary.speaker_similarity_margin_mean"
       worst: min
       display:
-        label: "Speaker sim mean"
+        label: "Speaker sim margin"
         scale: 1
         digits: 4
       status: OK
@@ -364,11 +364,11 @@ tts_moss_nonstream_utmos:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/utmos_results.json"
@@ -400,11 +400,11 @@ tts_moss_nonstream_speed:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_non_streami0/vc_nonstream_c16/speed_results.json"
@@ -466,11 +466,11 @@ tts_higgs_stream_wer:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_streaming0/vc_stream_c16/wer_results.json"
@@ -502,11 +502,11 @@ tts_higgs_stream_speed:
   hf_model_ids:
     - "bosonai/higgs-audio-v3-tts-4b"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_streaming0/vc_stream_c16/speed_results.json"
@@ -558,11 +558,11 @@ tts_moss_stream_wer:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_streaming0/vc_stream_c16/wer_results.json"
@@ -594,11 +594,11 @@ tts_moss_stream_speed:
   hf_model_ids:
     - "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"
     - "Qwen/Qwen3-ASR-1.7B"
-  test_file_sha256: 7152ca23fd4963c64ca3e1a6ba3c027e0a5416203e8890eec0a7a68dbfbddd97
-  last_discovered_at: 2026-06-27T02:04:11Z
+  test_file_sha256: 3cce551489af28e58279e7469842965dab19a8db079a057b890a5b00b5054c9f
+  last_discovered_at: 2026-06-27T03:30:03Z
   expected_samples: 1088
   threshold_file: "tests/test_model/tts_ci_config.py"
-  threshold_file_sha256: cd2d70a68f15092241c1756a2bc3e2bcd18bb28c6215c42ae07d5d25fcbc562f
+  threshold_file_sha256: f8285d3c966fd9b035cf46111e374ea207ed741beb7722777203e286b5a8b3d9
   sample_counts:
     total:
       json_file: "test_voice_cloning_streaming0/vc_stream_c16/speed_results.json"
