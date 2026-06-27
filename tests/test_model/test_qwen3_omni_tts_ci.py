@@ -77,9 +77,10 @@ VC_N_ABOVE_50_MAX = 2
 # calibration" section of the PR description for the per-run numbers.
 VC_SIMILARITY_MEAN_MIN = 60.0
 # note (luojiaxuan): This is intentionally a margin floor, not a naked
-# similarity floor. tune-ci-thresholds should overwrite it from strict
-# worst-of-5 calibration once the CI-repro run is available.
-VC_SIMILARITY_MARGIN_MIN = 0.0
+# similarity floor. H200 worst-of-5 on SeedTTS-50 EN first 20 was negative
+# (worst=-1.7332, mean=-1.3416), so this is only a regression floor and not
+# evidence that voice-copy is better than no-copy.
+VC_SIMILARITY_MARGIN_MIN = -1.7333
 # Calibrated from worst-of-5 full generate+score runs on SeedTTS-50 EN, H200 SXM.
 # worst-of-5 = 4.1924 · mean = 4.2575 · stdev = 0.0487
 VC_UTMOS_MEAN_REFERENCE = 4.2537
