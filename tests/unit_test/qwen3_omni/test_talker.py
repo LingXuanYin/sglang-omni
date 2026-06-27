@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 from collections import deque
@@ -501,6 +500,20 @@ def test_partial_rejects_min_chunks_below_layout_floor(monkeypatch) -> None:
             enable_partial_start=True,
             partial_start_min_chunks=MIN_PARTIAL_START_CHUNKS - 1,
         )
+
+
+def test_partial_min_chunks_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_OMNI_QWEN3_PARTIAL_START_MIN_CHUNKS", "3")
+    monkeypatch.setattr(OmniScheduler, "__init__", lambda self, *a, **k: None)
+    live = QwenTalkerScheduler.__new__(QwenTalkerScheduler)
+
+    QwenTalkerScheduler.__init__(
+        live,
+        enable_partial_start=True,
+        partial_start_min_chunks=10,
+    )
+
+    assert live._partial_start_min_chunks == 3
 
 
 def test_partial_count_strips_only_trailing_im_end_chunk() -> None:
@@ -1801,33 +1814,28 @@ def _talker_seed_self(max_bs: int = 4, vocab: int = 8) -> SimpleNamespace:
         _sampling_top_ks=torch.ones(max_bs, dtype=torch.long),
         _sampling_min_ps=torch.zeros(max_bs),
         _sampling_seeds=torch.zeros(max_bs, dtype=torch.long),
-        _greedy_sample_fastpath_enabled=True,
-        _decode_all_greedy=False,
         _sampler=None,
     )
 
 
 def _talker_seed_req(
-    seed: int | None,
-    rid: str,
-    *,
-    temperature: float = 0.8,
-    suppress_tokens: list[int] | None = None,
+    seed: int | None, rid: str
 ) -> SimpleNamespace:
     sp = SimpleNamespace(
         repetition_penalty=1.0,  # keep rep/suppress branches off
-        temperature=temperature,
+        temperature=0.8,
         top_p=0.9,
         top_k=20,
         min_p=0.0,
         sampling_seed=seed,
     )
     req = SimpleNamespace(
-        sampling_params=sp, output_ids=[], _codec_suppress_tokens=None, rid=rid
+        sampling_params=sp,
+        output_ids=[],
+        _codec_suppress_tokens=None,
+        rid=rid,
     )
-    return SimpleNamespace(
-        data=SimpleNamespace(req=req, suppress_tokens=suppress_tokens)
-    )
+    return SimpleNamespace(data=SimpleNamespace(req=req, suppress_tokens=None))
 
 
 def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
@@ -1858,82 +1866,3 @@ def test_talker_prepare_decode_buffers_unseeded_seed_is_rank_shared() -> None:
     assert int(fake._sampling_seeds[1]) == derive_sampling_seed(
         "sglang-omni-unseeded-row", "unseeded"
     )
-
-
-def test_talker_emit_code_feedback_batches_clone_lifetime() -> None:
-    outbox: queue.Queue = queue.Queue()
-    fake = SimpleNamespace(
-        _outbox=outbox,
-        _code2wav_target="code2wav",
-        _enable_batched_emit=True,
-        model=SimpleNamespace(
-            _output_codes=torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
-            _output_embeds=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-        ),
-    )
-    schedule_batch = SimpleNamespace(
-        reqs=[SimpleNamespace(rid="req-1"), SimpleNamespace(rid="req-2")]
-    )
-    payload = SimpleNamespace(request=SimpleNamespace(params={"stream": True}))
-    requests = [
-        SimpleNamespace(
-            data=SimpleNamespace(stage_payload=payload, pending_feedback_queue=deque())
-        ),
-        SimpleNamespace(
-            data=SimpleNamespace(stage_payload=payload, pending_feedback_queue=deque())
-        ),
-    ]
-
-    QwenTalkerModelRunner._emit_code_chunks_and_feedback(
-        fake,
-        schedule_batch=schedule_batch,
-        requests=requests,
-    )
-    fake.model._output_codes.fill_(99)
-    fake.model._output_embeds.fill_(99.0)
-
-    first = outbox.get_nowait()
-    second = outbox.get_nowait()
-    assert torch.equal(first.data, torch.tensor([1, 2]))
-    assert torch.equal(second.data, torch.tensor([3, 4]))
-    assert torch.equal(
-        requests[0].data.pending_feedback_queue[0], torch.tensor([1.0, 2.0])
-    )
-    assert torch.equal(
-        requests[1].data.pending_feedback_queue[0], torch.tensor([3.0, 4.0])
-    )
-    assert first.metadata == {"stream": True}
-    assert first.target == "code2wav"
-
-
-def test_talker_decode_sampling_zero_temperature_uses_greedy_fastpath() -> None:
-    fake = _talker_seed_self(vocab=4)
-    requests = [
-        _talker_seed_req(None, "req-1", temperature=0.0),
-        _talker_seed_req(None, "req-2", temperature=0.0),
-    ]
-
-    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    sampled = Qwen3OmniTalker._sample_decode_tokens(
-        fake,
-        torch.tensor([[0.1, 5.0, 1.0, 2.0], [3.0, 0.5, 4.0, 1.0]]),
-        SimpleNamespace(positions=torch.arange(2)),
-    )
-
-    assert fake._decode_all_greedy is True
-    assert torch.equal(sampled, torch.tensor([1, 2]))
-
-
-def test_talker_decode_sampling_suppress_disables_greedy_fastpath() -> None:
-    fake = _talker_seed_self(vocab=4)
-    requests = [_talker_seed_req(None, "req-1", temperature=0.0, suppress_tokens=[1])]
-
-    Qwen3OmniTalker.prepare_decode_buffers(fake, requests)
-    sampled = Qwen3OmniTalker._sample_decode_tokens(
-        fake,
-        torch.tensor([[0.1, 5.0, 4.0, 2.0]]),
-        SimpleNamespace(positions=torch.arange(1)),
-    )
-
-    assert fake._decode_all_greedy is False
-    assert torch.equal(sampled, torch.tensor([2]))

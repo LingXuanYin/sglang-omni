@@ -3,15 +3,12 @@
 
 from __future__ import annotations
 
-import os
-import time
 from typing import Any
 
 import torch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.messages import OutgoingMessage
 
 
@@ -30,9 +27,6 @@ class QwenTalkerModelRunner(ModelRunner):
         self._outbox = outbox
         self._code2wav_target = code2wav_target
         self._feedback_enabled = bool(feedback_enabled)
-        self._enable_batched_emit = (
-            os.getenv("SGLANG_OMNI_QWEN3_BATCH_TALKER_EMIT", "1") != "0"
-        )
 
     def execute(self, scheduler_output: Any):
         return super().execute(scheduler_output)
@@ -120,31 +114,10 @@ class QwenTalkerModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        batch_size = len(requests)
-        if batch_size == 0:
-            return
-
-        start_ns = time.perf_counter_ns()
-        enable_batched_emit = getattr(self, "_enable_batched_emit", True)
-        if enable_batched_emit:
-            code_rows = self.model._output_codes[:batch_size].detach().clone().unbind(0)
-            feedback_rows = (
-                self.model._output_embeds[:batch_size].detach().clone().unbind(0)
-            )
-        else:
-            code_rows = [
-                self.model._output_codes[idx].detach().clone()
-                for idx in range(batch_size)
-            ]
-            feedback_rows = [
-                self.model._output_embeds[idx].detach().clone()
-                for idx in range(batch_size)
-            ]
-
         for idx, sched_req in enumerate(requests):
             req = schedule_batch.reqs[idx]
-            code_chunk = code_rows[idx]
-            feedback_row = feedback_rows[idx]
+            code_chunk = self.model._output_codes[idx].detach().clone()
+            feedback_row = self.model._output_embeds[idx].detach().clone()
             # Tell code2wav whether to forward audio chunks to the Coordinator.
             stage_payload = sched_req.data.stage_payload
             is_streaming = bool(
@@ -161,16 +134,6 @@ class QwenTalkerModelRunner(ModelRunner):
                 )
             )
             sched_req.data.pending_feedback_queue.append(feedback_row)
-        _emit_event(
-            request_id=schedule_batch.reqs[0].rid,
-            stage=None,
-            event_name="talker_emit_code_feedback",
-            metadata={
-                "batch_size": batch_size,
-                "batched": enable_batched_emit,
-                "duration_us": (time.perf_counter_ns() - start_ns) / 1000.0,
-            },
-        )
 
     def sample_before_post_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list
@@ -377,7 +340,6 @@ class QwenTalkerModelRunner(ModelRunner):
         if batch_size == 0:
             return
 
-        start_ns = time.perf_counter_ns()
         feedback_buffer = self.model._feedback_buffer
         feedback_mask = self.model._feedback_mask
         feedback_mask[:batch_size] = False
@@ -396,30 +358,10 @@ class QwenTalkerModelRunner(ModelRunner):
             rows.append(row_idx)
             embeds.append(combined)
         if rows:
+            rows_t = torch.tensor(rows, dtype=torch.long, device=feedback_buffer.device)
             embeds_stacked = torch.stack(embeds, dim=0)
-            if len(rows) == batch_size and rows[0] == 0 and rows[-1] == batch_size - 1:
-                feedback_buffer[:batch_size] = embeds_stacked
-                feedback_mask[:batch_size] = True
-            else:
-                rows_t = torch.tensor(
-                    rows,
-                    dtype=torch.long,
-                    device=feedback_buffer.device,
-                )
-                feedback_buffer[rows_t] = embeds_stacked
-                feedback_mask[rows_t] = True
-        _emit_event(
-            request_id=getattr(
-                getattr(requests[0].data, "req", None), "rid", "unknown"
-            ),
-            stage=None,
-            event_name="talker_feedback_buffer_write",
-            metadata={
-                "batch_size": batch_size,
-                "rows": len(rows),
-                "duration_us": (time.perf_counter_ns() - start_ns) / 1000.0,
-            },
-        )
+            feedback_buffer[rows_t] = embeds_stacked
+            feedback_mask[rows_t] = True
 
     @staticmethod
     def _data_has_next_decode_input(data: Any) -> bool:

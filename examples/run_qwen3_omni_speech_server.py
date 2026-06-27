@@ -133,8 +133,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable partial-prefix talker startup. Defaults to on for the "
-            "disaggregated speech topology and off for --colocated. Use "
+            "Enable partial-prefix talker startup. Defaults to the selected "
+            "speech pipeline config, currently on for both topologies. Use "
             "--no-enable-partial-start to disable."
         ),
     )
@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help=(
             "Chunk-count threshold for partial-start (default 5). "
-            "Only consumed when --enable-partial-start is set; "
+            "Only consumed when partial-start is enabled; "
             "must be >= MIN_PARTIAL_START_CHUNKS (3)."
         ),
     )
@@ -253,20 +253,9 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
     ):
         _validate_fraction(flag_name, value)
 
-    enable_partial_start = (
-        not args.colocated
-        if args.enable_partial_start is None
-        else bool(args.enable_partial_start)
+    requested_enable_partial_start = (
+        None if args.enable_partial_start is None else bool(args.enable_partial_start)
     )
-
-    if (
-        enable_partial_start
-        and args.partial_start_min_chunks < MIN_PARTIAL_START_CHUNKS
-    ):
-        raise ValueError(
-            f"--partial-start-min-chunks must be >= {MIN_PARTIAL_START_CHUNKS}, "
-            f"got {args.partial_start_min_chunks}"
-        )
 
     gpu_talker = (
         args.gpu_talker
@@ -393,18 +382,36 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
             updates=thinker_seq_len_updates,
         )
 
-    talker_partial_start_updates: dict[str, object] = {
-        "enable_partial_start": enable_partial_start,
-    }
+    talker = next(stage for stage in config.stages if stage.name == "talker_ar")
+    if requested_enable_partial_start is None:
+        enable_partial_start = bool(
+            (talker.factory_args or {}).get("enable_partial_start", False)
+        )
+        talker_partial_start_updates: dict[str, object] = {}
+    else:
+        enable_partial_start = requested_enable_partial_start
+        talker_partial_start_updates = {
+            "enable_partial_start": enable_partial_start,
+        }
+
+    if (
+        enable_partial_start
+        and args.partial_start_min_chunks < MIN_PARTIAL_START_CHUNKS
+    ):
+        raise ValueError(
+            f"--partial-start-min-chunks must be >= {MIN_PARTIAL_START_CHUNKS}, "
+            f"got {args.partial_start_min_chunks}"
+        )
     if enable_partial_start:
         talker_partial_start_updates["partial_start_min_chunks"] = int(
             args.partial_start_min_chunks
         )
-    _apply_stage_factory_updates(
-        config,
-        stage_name="talker_ar",
-        updates=talker_partial_start_updates,
-    )
+    if talker_partial_start_updates:
+        _apply_stage_factory_updates(
+            config,
+            stage_name="talker_ar",
+            updates=talker_partial_start_updates,
+        )
 
     launch_server(
         config,

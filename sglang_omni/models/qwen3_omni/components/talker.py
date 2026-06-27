@@ -4,7 +4,6 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 
 from __future__ import annotations
 
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -909,10 +908,6 @@ class Qwen3OmniTalker(nn.Module):
             device=device,
             dtype=self.model.codec_embedding.weight.dtype,
         )
-        self._greedy_sample_fastpath_enabled = (
-            os.getenv("SGLANG_OMNI_QWEN3_GREEDY_SAMPLE_FASTPATH", "1") != "0"
-        )
-        self._decode_all_greedy = False
         _bind_default_weight_loaders(self)
         self._cached_params_dict = dict(self.named_parameters())
         self._sampler = None
@@ -955,7 +950,6 @@ class Qwen3OmniTalker(nn.Module):
         rep_toks: list[int] = []
         sup_rows: list[int] = []
         sup_toks: list[int] = []
-        all_greedy = True
 
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -969,8 +963,6 @@ class Qwen3OmniTalker(nn.Module):
             top_ps.append(float(sp.top_p))
             top_ks.append(int(sp.top_k))
             min_ps.append(float(sp.min_p))
-            if temperature > 0.0:
-                all_greedy = False
             # Unseeded: rank-shared seed from the request id (same on every TP
             # rank), not os.urandom, else the ranks desync.
             seed = sp.sampling_seed
@@ -988,7 +980,6 @@ class Qwen3OmniTalker(nn.Module):
                     if 0 <= t < rep_vocab
                 }
                 if unique:
-                    all_greedy = False
                     rep_rows.extend([row_idx] * len(unique))
                     rep_toks.extend(unique)
 
@@ -1000,11 +991,8 @@ class Qwen3OmniTalker(nn.Module):
                     if 0 <= t < sup_vocab
                 ]
                 if valid_sup:
-                    all_greedy = False
                     sup_rows.extend([row_idx] * len(valid_sup))
                     sup_toks.extend(valid_sup)
-
-        self._decode_all_greedy = all_greedy
 
         rep_pen_dtype = self._repetition_penalties.dtype
         self._repetition_penalties[:batch_size, 0] = torch.tensor(
@@ -1174,13 +1162,6 @@ class Qwen3OmniTalker(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         batch_size = logits.shape[0]
-        if getattr(self, "_greedy_sample_fastpath_enabled", True) and getattr(
-            self,
-            "_decode_all_greedy",
-            False,
-        ):
-            return torch.argmax(logits, dim=-1)
-
         logits = logits.clone()
 
         penalties = self._repetition_penalties[:batch_size].to(dtype=logits.dtype)

@@ -86,7 +86,9 @@ def test_colocated_topology_uses_one_gpu_without_default_fusion(
     config = Qwen3OmniSpeechColocatedPipelineConfig(model_path="dummy")
 
     assert Variants["speech-colocated"] is Qwen3OmniSpeechColocatedPipelineConfig
-    assert _stage(config, "talker_ar").factory_args["enable_partial_start"] is False
+    assert _stage(config, "talker_ar").factory_args["enable_partial_start"] is True
+    assert _stage(config, "code2wav").factory_args["max_batch_wait_ms"] == 5
+    assert _stage(config, "code2wav").factory_args["non_stream_chunk_size"] == 20
     assert config.fused_stages == []
     for stage_name in (
         "image_encoder",

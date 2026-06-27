@@ -192,7 +192,11 @@ def _code2wav_stage(*, gpu: int, process: str) -> StageConfig:
         name="code2wav",
         process=process,
         factory=f"{_PKG}.components.code2wav_scheduler.create_code2wav_scheduler",
-        factory_args={"device": "cuda"},
+        factory_args={
+            "device": "cuda",
+            "max_batch_wait_ms": 5,
+            "non_stream_chunk_size": 20,
+        },
         gpu=gpu,
         terminal=True,
         can_accept_stream_before_payload=True,
@@ -349,7 +353,7 @@ class Qwen3OmniSpeechColocatedPipelineConfig(Qwen3OmniSpeechPipelineConfig):
             thinker_gpu=0,
             talker_gpu=0,
             process_by_stage=_SPEECH_DEFAULT_PROCESSES,
-            enable_partial_start=False,
+            enable_partial_start=True,
         )
     )
     fused_stages: list[list[str]] = Field(default_factory=_colocated_fused_stages)
