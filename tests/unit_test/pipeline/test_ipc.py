@@ -75,9 +75,8 @@ def _make_config(base_path: Path) -> PipelineConfig:
 
 @pytest.fixture(autouse=True)
 def _fake_stage_relay(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Relay construction now lives in the transport router, not the stage module.
     monkeypatch.setattr(
-        "sglang_omni.pipeline.transport.create_relay",
+        "sglang_omni.comm.router.create_relay",
         lambda relay_type, **kwargs: FakeRelay(device=kwargs.get("device", "cpu")),
     )
 

@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import pickle
 import queue
 from types import SimpleNamespace
 
@@ -11,9 +9,11 @@ import pytest
 import torch
 from pydantic import ValidationError
 
+from sglang_omni.comm import stage_io
+from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.engine import CommEngine
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
-from sglang_omni.pipeline import relay_io
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.proto import DataReadyMessage, OmniRequest, StagePayload
@@ -47,6 +47,7 @@ class _FakeControlPlane:
 
 class _FakeRelay:
     def __init__(self) -> None:
+        self.device = "cpu"
         self.puts = []
 
     async def put_async(self, tensor, request_id):
@@ -88,18 +89,10 @@ class _CallbackOp:
         self._on_wait()
 
 
-def _payload_metadata(payload: StagePayload) -> dict:
-    return {
-        "payload_pickle": base64.b64encode(pickle.dumps(payload)).decode("ascii"),
-        "relay_info": {"transfer_info": {"size": 1}},
-        "tensor_info": [],
-    }
-
-
 # Stream chunks now always move through the transport router's relay (CUDA-IPC on
 # GPU, shm on CPU). These helpers build real relay-backed messages over an
 # in-process ShmRelay so the receive path is exercised end to end, matching what
-# ``relay_io.send_stream_chunk`` / ``write_payload`` produce on the wire.
+# ``stage_io.send_stream_chunk`` / ``write_payload`` produce on the wire.
 
 
 async def _make_relay_chunk(
@@ -112,27 +105,19 @@ async def _make_relay_chunk(
     data,
     metadata: dict | None = None,
 ) -> DataReadyMessage:
-    blob_key = f"{request_id}:stream:{from_stage}:{to_stage}:{chunk_id}"
-    relay_metadata, op = await relay_io.write_blob(relay, blob_key, data)
-    await op.wait_for_completion()
-    if metadata:
-        cleaned, tensor_dict = relay_io.extract_tensors(metadata)
-        relay_metadata["chunk_metadata"] = cleaned
-        if tensor_dict:
-            refs: dict = {}
-            for idx, (key, tensor) in enumerate(tensor_dict.items()):
-                meta_key = f"{blob_key}:meta:{idx}"
-                meta_meta, meta_op = await relay_io.write_blob(relay, meta_key, tensor)
-                await meta_op.wait_for_completion()
-                refs[key] = {"blob_key": meta_key, "relay_metadata": meta_meta}
-            relay_metadata["chunk_metadata_tensors"] = refs
-    return DataReadyMessage(
+    control_plane = _FakeControlPlane()
+    await stage_io.send_stream_chunk(
+        relay,
+        control_plane,
         request_id=request_id,
+        data=data,
+        target_stage=to_stage,
+        target_endpoint=f"inproc://{to_stage}",
         from_stage=from_stage,
-        to_stage=to_stage,
-        shm_metadata=relay_metadata,
         chunk_id=chunk_id,
+        metadata=metadata,
     )
+    return control_plane.stage_messages[0][2]
 
 
 async def _make_relay_payload(
@@ -142,13 +127,13 @@ async def _make_relay_payload(
     from_stage: str = "tts_engine",
     to_stage: str = "vocoder",
 ) -> DataReadyMessage:
-    metadata, op = await relay_io.write_payload(relay, payload.request_id, payload)
+    data_ref, op = await stage_io.write_payload(relay, payload.request_id, payload)
     await op.wait_for_completion()
     return DataReadyMessage(
         request_id=payload.request_id,
         from_stage=from_stage,
         to_stage=to_stage,
-        shm_metadata=metadata,
+        data_ref=data_ref.to_dict(),
     )
 
 
@@ -235,7 +220,7 @@ def test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing() -> None
         assert msg.from_stage == "tts_engine"
         assert msg.to_stage == "vocoder"
         assert msg.chunk_id == 0
-        assert msg.shm_metadata["chunk_metadata"] == {"modality": "audio_codes"}
+        assert DataRef.from_dict(msg.data_ref).metadata == {"modality": "audio_codes"}
 
     asyncio.run(_run())
 
@@ -394,7 +379,7 @@ def test_stage_routes_pre_payload_stream_events_for_capable_receiver() -> None:
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata={},
+                data_ref=None,
                 is_done=True,
             )
         )
@@ -420,22 +405,16 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
     """Cross-GPU chunks emit receive only after relay data and metadata are restored."""
     order: list[str] = []
 
-    async def fake_read_blob(relay, key, metadata):
-        del relay, key, metadata
-        order.append("blob")
-        return "chunk"
-
-    async def fake_read_metadata(self, relay, shm_metadata, blob_key):
-        del self, relay, shm_metadata, blob_key
-        order.append("metadata")
-        return {"modality": "audio_codes"}
+    async def fake_read_stream_chunk(self, *, relay, data_ref):
+        del self, relay, data_ref
+        order.append("stream_chunk_read")
+        return "chunk", {"modality": "audio_codes"}
 
     async def fake_route(self, request_id, item):
         del self, request_id, item
         order.append("routed")
 
-    monkeypatch.setattr(relay_io, "read_blob", fake_read_blob)
-    monkeypatch.setattr(Stage, "_read_chunk_metadata", fake_read_metadata)
+    monkeypatch.setattr(CommEngine, "read_stream_chunk", fake_read_stream_chunk)
     monkeypatch.setattr(Stage, "_route_stream_item_or_fail", fake_route)
     monkeypatch.setattr(
         "sglang_omni.pipeline.stage.runtime._emit_event",
@@ -459,14 +438,23 @@ def test_stage_stream_chunk_received_after_relay_materialization(monkeypatch) ->
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata={"relay_info": {}},
+                data_ref=(
+                    await _make_relay_chunk(
+                        _FakeRelay(),
+                        request_id="req",
+                        from_stage="tts_engine",
+                        to_stage="vocoder",
+                        chunk_id=0,
+                        data=torch.empty(1),
+                    )
+                ).data_ref,
                 chunk_id=0,
             )
         )
 
     asyncio.run(_run())
 
-    assert order == ["blob", "metadata", "stage_stream_chunk_received", "routed"]
+    assert order == ["stream_chunk_read", "stage_stream_chunk_received", "routed"]
 
 
 def test_stage_stream_error_fails_request_even_with_stream_queue() -> None:
@@ -514,7 +502,7 @@ def test_send_stream_chunk_uses_relay() -> None:
         relay = _FakeRelay()
         codes = torch.empty(11, 1, dtype=torch.long)
 
-        await relay_io.send_stream_chunk(
+        await stage_io.send_stream_chunk(
             relay,
             control_plane,
             request_id="req",
@@ -530,9 +518,8 @@ def test_send_stream_chunk_uses_relay() -> None:
         assert len(control_plane.stage_messages) == 1
         _, _, msg = control_plane.stage_messages[0]
         expected_size = codes.contiguous().view(torch.uint8).numel()
-        assert msg.shm_metadata["relay_info"] == {
-            "transfer_info": {"size": expected_size}
-        }
+        data_ref = DataRef.from_dict(msg.data_ref)
+        assert data_ref.buffer.info == {"transfer_info": {"size": expected_size}}
 
     asyncio.run(_run())
 
@@ -560,20 +547,13 @@ def test_stage_drops_stream_chunk_after_abort_during_relay_read() -> None:
         stage._stream_queue = None
 
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata={
-                    "relay_info": {
-                        "transfer_info": {
-                            "size": codes.contiguous().view(torch.uint8).numel()
-                        }
-                    },
-                    "tensor_shape": list(codes.shape),
-                    "tensor_dtype": str(codes.dtype),
-                },
                 chunk_id=0,
+                data=codes,
             )
         )
 
@@ -604,31 +584,15 @@ def test_stage_drains_relay_stream_chunk_for_already_aborted_request() -> None:
             scheduler=scheduler,
         )
         stage._aborted.add("req")
-        size = codes.contiguous().view(torch.uint8).numel()
-        metadata = {
-            "relay_info": {"transfer_info": {"size": size}},
-            "tensor_shape": list(codes.shape),
-            "tensor_dtype": str(codes.dtype),
-            "chunk_metadata": {"latency": {"_tensor_placeholder": "latency"}},
-            "chunk_metadata_tensors": {
-                "latency": {
-                    "blob_key": "req:stream:tts_engine:vocoder:0:meta:0",
-                    "relay_metadata": {
-                        "relay_info": {"transfer_info": {"size": 4}},
-                        "tensor_shape": [1],
-                        "tensor_dtype": "torch.float32",
-                    },
-                }
-            },
-        }
-
         await stage._on_stream_chunk(
-            DataReadyMessage(
+            await _make_relay_chunk(
+                relay,
                 request_id="req",
                 from_stage="tts_engine",
                 to_stage="vocoder",
-                shm_metadata=metadata,
                 chunk_id=0,
+                data=codes,
+                metadata={"latency": torch.zeros(1)},
             )
         )
 
@@ -664,14 +628,7 @@ def test_stage_drains_relay_payload_for_already_aborted_request() -> None:
             data={},
         )
 
-        await stage._on_data_ready(
-            DataReadyMessage(
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                shm_metadata=_payload_metadata(payload),
-            )
-        )
+        await stage._on_data_ready(await _make_relay_payload(relay, payload))
 
         assert scheduler.inbox.empty()
         assert relay.gets == 1
@@ -748,14 +705,7 @@ def test_stage_drops_payload_after_abort_during_relay_read() -> None:
             data={},
         )
 
-        await stage._on_data_ready(
-            DataReadyMessage(
-                request_id="req",
-                from_stage="tts_engine",
-                to_stage="vocoder",
-                shm_metadata=_payload_metadata(payload),
-            )
-        )
+        await stage._on_data_ready(await _make_relay_payload(relay, payload))
 
         assert scheduler.inbox.empty()
 

@@ -19,11 +19,13 @@ from typing import Any, Callable, Literal
 
 import torch
 
-from sglang_omni.pipeline import relay_io
+from sglang_omni.comm import stage_io
+from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.engine import CommEngine
+from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
-from sglang_omni.pipeline.transport import TransportKind, TransportRouter
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
 from sglang_omni.profiler.event_recorder import set_active_stage as _set_active_stage
@@ -84,6 +86,7 @@ class Stage:
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
         gpu_stage_names: set[str] | None = None,
+        remote_stage_names: set[str] | None = None,
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
         can_accept_stream_before_payload: bool = False,
@@ -108,14 +111,16 @@ class Stage:
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
 
-        self._router = TransportRouter(
-            stage_name=name,
-            gpu_id=self.gpu_id,
-            same_process_targets=self._same_process_targets,
-            gpu_stage_names=gpu_stage_names or set(),
-            local_dispatcher=local_dispatcher,
-            relay_config=relay_config or {},
-            injected_relay=relay,
+        self._comm = CommEngine(
+            CommRouter(
+                stage_name=name,
+                gpu_id=self.gpu_id,
+                same_process_targets=self._same_process_targets,
+                gpu_stage_names=gpu_stage_names or set(),
+                remote_stage_names=remote_stage_names or set(),
+                relay_config=relay_config or {},
+                injected_relay=relay,
+            )
         )
 
         self._running = False
@@ -182,7 +187,7 @@ class Stage:
         self.control_plane.close()
         if self._tp_fanout is not None:
             self._tp_fanout.close()
-        self._router.close()
+        self._comm.close()
         logger.info("Stage %s stopped", self.name)
 
     async def run(self) -> None:
@@ -283,11 +288,14 @@ class Stage:
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
             self._stream_queue.open(request_id)
 
-        # Read payload using the transport the sender used (derived from
-        # placement, so both sides agree without a per-message tag).
-        relay = self._router.inbound_relay(msg.from_stage)
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            payload = await relay_io.read_payload(relay, request_id, msg.shm_metadata)
+            payload = await self._comm.read_payload(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
+            )
         except Exception as exc:
             logger.exception(
                 "Stage %s: relay read failed for %s", self.name, request_id
@@ -383,12 +391,12 @@ class Stage:
             return
         self._active_requests.add(request_id)
 
-        relay = self._relay_for_stream_message(msg)
-        blob_key = f"{request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            data = await relay_io.read_blob(relay, blob_key, msg.shm_metadata)
-            metadata = await self._read_chunk_metadata(
-                relay, msg.shm_metadata, blob_key
+            data, metadata = await self._comm.read_stream_chunk(
+                relay=relay,
+                data_ref=data_ref,
             )
         except Exception as exc:
             logger.error(
@@ -466,82 +474,21 @@ class Stage:
             self.scheduler.abort(request_id)
         await self._send_failure(request_id, str(error))
 
-    async def _read_chunk_metadata(
-        self, relay: Relay, shm_metadata: dict, blob_key: str
-    ) -> dict | None:
-        if not isinstance(shm_metadata, dict):
-            raise TypeError(
-                "stream chunk relay metadata must be a dict, got "
-                f"{type(shm_metadata).__name__}"
-            )
-        metadata = {}
-        chunk_meta = shm_metadata.get("chunk_metadata")
-        if chunk_meta is None:
-            pass
-        elif isinstance(chunk_meta, dict):
-            metadata.update(chunk_meta)
-        else:
-            raise TypeError(
-                "stream chunk_metadata must be a dict when present, got "
-                f"{type(chunk_meta).__name__}"
-            )
-
-        tensor_blobs = shm_metadata.get("chunk_metadata_tensors", {})
-        if not isinstance(tensor_blobs, dict):
-            raise TypeError(
-                "stream chunk_metadata_tensors must be a dict, got "
-                f"{type(tensor_blobs).__name__}"
-            )
-        tensor_dict = {}
-        for path, info in tensor_blobs.items():
-            if not isinstance(info, dict):
-                raise TypeError(
-                    "stream chunk metadata tensor entry must be a dict, got "
-                    f"{type(info).__name__} at {path!r}"
-                )
-            meta_blob_key = info["blob_key"]
-            meta_metadata = info["relay_metadata"]
-            if not isinstance(meta_blob_key, str):
-                raise TypeError(
-                    f"metadata tensor blob_key for {path!r} must be str, got "
-                    f"{type(meta_blob_key).__name__}"
-                )
-            if not isinstance(meta_metadata, dict):
-                raise TypeError(
-                    f"metadata tensor relay_metadata for {path!r} must be dict, "
-                    f"got {type(meta_metadata).__name__}"
-                )
-            tensor_dict[path] = await relay_io.read_blob(
-                relay, meta_blob_key, meta_metadata
-            )
-        if tensor_dict:
-            metadata = relay_io.restore_tensors(metadata, tensor_dict)
-        return metadata or None
-
-    def _relay_for_stream_message(self, msg: DataReadyMessage) -> Relay:
-        if not isinstance(msg.shm_metadata, dict):
-            raise TypeError(
-                "stream chunk relay metadata must be a dict, got "
-                f"{type(msg.shm_metadata).__name__}"
-            )
-        if "_transport" not in msg.shm_metadata:
-            raise ValueError("stream chunk relay metadata is missing '_transport'")
-        transport = msg.shm_metadata["_transport"]
-        if not isinstance(transport, str):
-            raise ValueError(
-                "stream chunk relay metadata is missing string '_transport'"
-            )
-        try:
-            transport_kind = TransportKind(transport)
-        except ValueError as exc:
-            raise ValueError(f"unknown stream transport {transport!r}") from exc
-        return self._router.relay(transport_kind)
+    def _data_ref_from_message(self, msg: DataReadyMessage) -> DataRef:
+        if msg.data_ref is None:
+            raise ValueError("data_ready message is missing transfer data_ref")
+        return DataRef.from_dict(msg.data_ref)
 
     async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
         request_id = msg.request_id
-        relay = self._router.inbound_relay(msg.from_stage)
         try:
-            await relay_io.read_payload(relay, request_id, msg.shm_metadata)
+            data_ref = self._data_ref_from_message(msg)
+            relay = self._comm.relay(data_ref.transport)
+            await self._comm.read_payload(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
+            )
         except Exception:
             logger.debug(
                 "Stage %s: failed to drain aborted payload for %s",
@@ -549,18 +496,15 @@ class Stage:
                 request_id,
                 exc_info=True,
             )
-            relay.cleanup(request_id)
+            self._comm.cleanup(request_id)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
         if msg.chunk_id is None:
             return
-        relay = self._relay_for_stream_message(msg)
-        blob_key = (
-            f"{msg.request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
-        )
         try:
-            await relay_io.read_blob(relay, blob_key, msg.shm_metadata)
-            await self._read_chunk_metadata(relay, msg.shm_metadata, blob_key)
+            data_ref = self._data_ref_from_message(msg)
+            relay = self._comm.relay(data_ref.transport)
+            await self._comm.read_stream_chunk(relay=relay, data_ref=data_ref)
         except Exception:
             logger.debug(
                 "Stage %s: failed to drain aborted stream chunk for %s",
@@ -874,7 +818,7 @@ class Stage:
                     request_id=request_id,
                     from_stage=self.name,
                     success=True,
-                    result=result.data,
+                    result=result.data if isinstance(result, StagePayload) else result,
                 )
             )
         else:
@@ -961,19 +905,20 @@ class Stage:
             )
             return
 
-        transport_kind = self._router.outbound(target)
-        if transport_kind is TransportKind.LOCAL:
-            # LOCAL has no relay; use SHM when object dispatch is unsafe.
-            transport_kind = TransportKind.SHM
-        relay = self._router.relay(transport_kind)
-        metadata, op = await relay_io.write_payload(
-            relay, request_id, projected_payload
+        transport_kind, relay = self._comm.router.relay_for(target)
+        data_ref, op = await self._comm.write_payload(
+            relay=relay,
+            request_id=request_id,
+            payload=projected_payload,
+            transport=transport_kind,
+            from_stage=self.name,
+            to_stage=target,
         )
         msg = DataReadyMessage(
             request_id=request_id,
             from_stage=self.name,
             to_stage=target,
-            shm_metadata=metadata,
+            data_ref=data_ref.to_dict(),
         )
         _emit_event(
             request_id=request_id,
@@ -1139,7 +1084,7 @@ class Stage:
                 "relay-backed stream chunks must be torch.Tensor, got "
                 f"{type(data).__name__}"
             )
-        transport_kind, relay = self._router.relay_for_stream(target, data)
+        transport_kind, relay = self._comm.router.relay_for_stream(target, data)
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -1151,9 +1096,9 @@ class Stage:
                 "transport": transport_kind.value,
             },
         )
-        await relay_io.send_stream_chunk(
-            relay,
-            self.control_plane,
+        await self._comm.send_stream_chunk(
+            relay=relay,
+            control_plane=self.control_plane,
             request_id=request_id,
             data=data,
             target_stage=target,
@@ -1161,7 +1106,7 @@ class Stage:
             from_stage=self.name,
             chunk_id=chunk_id,
             metadata=metadata,
-            transport_kind=transport_kind.value,
+            transport=transport_kind,
         )
 
     async def _send_stream_signal_to_target(
@@ -1196,7 +1141,7 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
-        await relay_io.send_stream_signal(
+        await stage_io.send_stream_signal(
             self.control_plane,
             request_id=request_id,
             target_stage=target,
@@ -1308,7 +1253,7 @@ class Stage:
                 self.scheduler.abort(request_id)
             await self._send_failure(request_id, error)
             with suppress(Exception):
-                self._router.cleanup(request_id)
+                self._comm.cleanup(request_id)
         self.control_plane.close()
 
     async def _abort_listener(self) -> None:
@@ -1334,7 +1279,7 @@ class Stage:
 
     def _on_abort(self, request_id: str) -> None:
         self._record_aborted_request_id(request_id)
-        self._router.cleanup(request_id)
+        self._comm.cleanup(request_id)
         self._clear_request_state(request_id)
         self.scheduler.abort(request_id)
 

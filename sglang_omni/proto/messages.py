@@ -10,50 +10,30 @@ from sglang_omni.proto.request import StagePayload
 
 @dataclass
 class DataReadyMessage:
-    """Notify next stage that data is ready.
-
-    Supports different metadata formats:
-    - Simple dict (for current NixlRelay with transfer_info)
-    - SHMMetadata (for backward compatibility)
-    - RdmaMetadata (for other relay types)
-    """
+    """Notify next stage that a data-plane object is ready."""
 
     request_id: str
     from_stage: str
     to_stage: str
-    shm_metadata: Any  # Can be dict, SHMMetadata, or RdmaMetadata
+    data_ref: dict[str, Any] | None
     chunk_id: int | None = None
     is_done: bool = False
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        # Handle different metadata types
-        if isinstance(self.shm_metadata, dict):
-            # Simple dict (current NixlRelay format)
-            metadata_dict = self.shm_metadata.copy()
-            metadata_dict["_type"] = "dict"  # Mark as simple dict
-        elif hasattr(self.shm_metadata, "to_dict"):
-            # SHMMetadata
-            metadata_dict = self.shm_metadata.to_dict()
-        elif hasattr(self.shm_metadata, "model_dump"):
-            # RdmaMetadata (Pydantic BaseModel)
-            metadata_dict = self.shm_metadata.model_dump()
-            metadata_dict["_type"] = "RdmaMetadata"  # Mark as RdmaMetadata
-        else:
-            # Fallback: try to convert to dict
-            metadata_dict = (
-                dict(self.shm_metadata)
-                if hasattr(self.shm_metadata, "__dict__")
-                else {}
-            )
-
         d = {
             "type": "data_ready",
             "request_id": self.request_id,
             "from_stage": self.from_stage,
             "to_stage": self.to_stage,
-            "shm_metadata": metadata_dict,
         }
+        if self.data_ref is not None:
+            if not isinstance(self.data_ref, dict):
+                raise TypeError(
+                    "DataReadyMessage.data_ref must be dict or None, got "
+                    f"{type(self.data_ref).__name__}"
+                )
+            d["data_ref"] = self.data_ref.copy()
         if self.chunk_id is not None:
             d["chunk_id"] = self.chunk_id
         if self.is_done:
@@ -64,61 +44,18 @@ class DataReadyMessage:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DataReadyMessage":
-        metadata_dict = d["shm_metadata"]
-
-        # Determine metadata type based on _type field first
-        metadata_type = metadata_dict.get("_type", "")
-
-        if metadata_type == "dict" or "transfer_info" in metadata_dict:
-            # Simple dict format (current NixlRelay design)
-            # Remove _type marker if present
-            metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif metadata_type == "RdmaMetadata":
-            # Try to import RdmaMetadata if available
-            try:
-                from sglang_omni.relay.operations.nixl import RdmaMetadata
-
-                clean_dict = {
-                    k: v
-                    for k, v in metadata_dict.items()
-                    if k not in ["_type", "shm_segments"]
-                }
-                metadata = RdmaMetadata(**clean_dict)
-            except (ImportError, Exception):
-                # Fallback to dict if RdmaMetadata not available
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif metadata_type == "SHMMetadata" or "shm_segments" in metadata_dict:
-            # Try to import SHMMetadata if available
-            try:
-                from sglang_omni.relay.nixl import SHMMetadata
-
-                metadata = SHMMetadata.from_dict(metadata_dict)
-            except (ImportError, Exception):
-                # Fallback to dict if SHMMetadata not available
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif "descriptors" in metadata_dict:
-            # Has descriptors but no _type - try RdmaMetadata first, fallback to dict
-            try:
-                from sglang_omni.relay.operations.nixl import RdmaMetadata
-
-                clean_dict = {
-                    k: v
-                    for k, v in metadata_dict.items()
-                    if k not in ["_type", "shm_segments"]
-                }
-                metadata = RdmaMetadata(**clean_dict)
-            except (ImportError, Exception):
-                # Fallback to dict
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        else:
-            # Default: use as dict (for current NixlRelay)
-            metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
+        data_ref = d.get("data_ref")
+        if data_ref is not None and not isinstance(data_ref, dict):
+            raise TypeError(
+                "data_ready data_ref must be dict or None, got "
+                f"{type(data_ref).__name__}"
+            )
 
         return cls(
             request_id=d["request_id"],
             from_stage=d["from_stage"],
             to_stage=d["to_stage"],
-            shm_metadata=metadata,
+            data_ref=data_ref,
             chunk_id=d.get("chunk_id"),
             is_done=d.get("is_done", False),
             error=d.get("error"),

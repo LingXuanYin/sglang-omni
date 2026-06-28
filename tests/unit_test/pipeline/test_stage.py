@@ -8,7 +8,8 @@ import logging
 import pytest
 import torch
 
-from sglang_omni.pipeline import relay_io
+from sglang_omni.comm import stage_io
+from sglang_omni.comm.data_ref import DataRef
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
@@ -126,7 +127,9 @@ def test_stage_routes_results_streams_and_clears_abort_state() -> None:
         decode_msg = next(
             msg for target, _, msg in control_plane.sent_to_stage if target == "decode"
         )
-        restored = await relay_io.read_payload(relay, "req-1", decode_msg.shm_metadata)
+        restored = await stage_io.read_payload(
+            relay, "req-1", DataRef.from_dict(decode_msg.data_ref)
+        )
         assert restored.data == {"marker": "decode-only", "data": {"answer": 1}}
         stream_msg = next(
             msg
@@ -244,16 +247,16 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     async def _run() -> None:
         relay = FakeRelay()
         payload = make_tensor_payload()
-        metadata, op = await relay_io.write_payload(relay, payload.request_id, payload)
+        data_ref, op = await stage_io.write_payload(relay, payload.request_id, payload)
         await op.wait_for_completion()
-        restored = await relay_io.read_payload(relay, payload.request_id, metadata)
+        restored = await stage_io.read_payload(relay, payload.request_id, data_ref)
         assert tensor_equal(restored.data, payload.data)
 
         log = EventLog()
         stream_relay = FakeRelay(log=log)
         control_plane = RecordingStageControlPlane()
         control_plane.log = log
-        await relay_io.send_stream_chunk(
+        await stage_io.send_stream_chunk(
             stream_relay,
             control_plane,
             request_id="req-1",
@@ -268,8 +271,9 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
         names = collect_event_names(log)
         assert names.index("stage_cp_send_to_stage") < names.index("op_wait")
         msg = control_plane.sent_to_stage[0][2]
-        assert msg.shm_metadata["chunk_metadata"]["token_id"] == 1
-        assert "hidden" in msg.shm_metadata["chunk_metadata_tensors"]
+        stream_ref = DataRef.from_dict(msg.data_ref)
+        assert stream_ref.metadata["token_id"] == 1
+        assert [ref.path for ref in stream_ref.metadata_tensors] == ["hidden"]
 
     asyncio.run(_run())
 
@@ -282,11 +286,11 @@ def test_stage_relay_read_failure_completes_with_error() -> None:
         control_plane = RecordingStageControlPlane()
         stage_obj = make_stage(relay=relay, control_plane=control_plane)
         payload = make_stage_payload(request_id="req-1")
-        metadata, _ = await relay_io.write_payload(relay, "req-1", payload)
+        data_ref, _ = await stage_io.write_payload(relay, "req-1", payload)
         relay.fail_get = RuntimeError("read failed")
 
         await stage_obj._on_data_ready(
-            DataReadyMessage("req-1", "upstream", "stage", metadata)
+            DataReadyMessage("req-1", "upstream", "stage", data_ref.to_dict())
         )
 
         assert control_plane.completions[0].success is False

@@ -865,7 +865,7 @@ def make_thinker_stream_output_builder():
             and (stage_payload.request.params or {}).get("stream", False)
         )
         if is_streaming:
-            # Wrap int — relay_io.write_blob is tensor-only.
+            # Wrap int; stream transport only accepts tensors.
             messages.append(
                 OutgoingMessage(
                     request_id=request_id,
