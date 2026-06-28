@@ -105,13 +105,6 @@ def parse_args() -> argparse.Namespace:
             "If omitted, SGLang chooses automatically."
         ),
     )
-    parser.add_argument(
-        "--relay-backend",
-        type=str,
-        default="shm",
-        choices=["shm", "nccl", "nixl"],
-        help="Relay backend for inter-stage data transfer",
-    )
     # Server
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
@@ -190,10 +183,7 @@ def _launch_text_server(args: argparse.Namespace) -> None:
 
     _validate_fraction("--mem-fraction-static", args.mem_fraction_static)
 
-    config = MingOmniPipelineConfig(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-    )
+    config = MingOmniPipelineConfig(model_path=args.model_path)
 
     if getattr(args, "thinker_only", False):
         if args.gpu_audio_encoder is not None or args.gpu_image_encoder is not None:

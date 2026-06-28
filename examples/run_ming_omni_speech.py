@@ -57,9 +57,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument(
-        "--relay-backend", type=str, default="shm", choices=["nixl", "shm"]
-    )
     parser.add_argument("--audio-path", type=str, default=None, help="Audio input path")
     parser.add_argument(
         "--output",
@@ -94,11 +91,6 @@ async def main_async(args: argparse.Namespace) -> None:
     from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
     from sglang_omni.proto import OmniRequest
 
-    gpu_placement = {
-        "thinker": args.gpu_thinker,
-        "talker": args.gpu_talker,
-    }
-
     overrides = {}
     if args.tp_size > 1:
         overrides["tp_size"] = args.tp_size
@@ -106,11 +98,9 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.cpu_offload_gb:
         overrides["cpu_offload_gb"] = args.cpu_offload_gb
 
-    config = MingOmniSpeechPipelineConfig(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-        gpu_placement=gpu_placement,
-    )
+    config = MingOmniSpeechPipelineConfig(model_path=args.model_path)
+    _set_stage_gpu(config, "thinker", args.gpu_thinker)
+    _set_stage_gpu(config, "talker", args.gpu_talker)
     if overrides:
         config.apply_server_args_overrides(stage_name="thinker", overrides=overrides)
     if args.mem_fraction_static is not None:
@@ -218,6 +208,14 @@ def _save_audio(result: dict, output_path: str) -> None:
         return
 
     logger.warning("No audio waveform found in pipeline result")
+
+
+def _set_stage_gpu(config, stage_name: str, gpu_id: int) -> None:
+    for stage in config.stages:
+        if stage.name == stage_name:
+            stage.gpu = int(gpu_id)
+            return
+    raise ValueError(f"Stage {stage_name!r} not found in config")
 
 
 def main() -> None:

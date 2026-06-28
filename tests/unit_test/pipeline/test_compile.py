@@ -299,7 +299,6 @@ def test_mp_runner_preserves_tp_rank_and_visible_device_contracts(tmp_path) -> N
         model_path="model",
         name="mp",
         endpoints=EndpointsConfig(base_path=str(tmp_path)),
-        relay_backend="nccl",
         env_defaults={"SGLANG_TEST_STAGE_ENV": "1"},
         stages=[
             stage(
@@ -361,4 +360,4 @@ def test_mp_runner_keeps_cpu_stage_without_gpu_identity(tmp_path) -> None:
         prep.runtime_dir.close()
 
     assert group.specs[0].gpu_id is None
-    assert group.specs[0].relay_config["gpu_id"] is None
+    assert "gpu_id" not in group.specs[0].comm_config

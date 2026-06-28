@@ -80,7 +80,7 @@ class Stage:
         control_plane: Any,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
-        relay_config: dict[str, Any] | None = None,
+        comm_config: dict[str, Any] | None = None,
         scheduler: Any = None,
         project_payload: dict[str, Callable[[Any], Any]] | None = None,
         stream_targets: list[str] | None = None,
@@ -118,7 +118,7 @@ class Stage:
                 same_process_targets=self._same_process_targets,
                 gpu_stage_names=gpu_stage_names or set(),
                 remote_stage_names=remote_stage_names or set(),
-                relay_config=relay_config or {},
+                comm_config=comm_config or {},
                 injected_relay=relay,
             )
         )
@@ -905,7 +905,12 @@ class Stage:
             )
             return
 
-        transport_kind, relay = self._comm.router.relay_for(target)
+        if target in self._same_process_targets:
+            transport_kind, relay = self._comm.router.relay_for_materialized_payload(
+                target
+            )
+        else:
+            transport_kind, relay = self._comm.router.relay_for(target)
         data_ref, op = await self._comm.write_payload(
             relay=relay,
             request_id=request_id,

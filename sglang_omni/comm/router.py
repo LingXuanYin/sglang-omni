@@ -26,7 +26,7 @@ class CommRouter:
         same_process_targets: set[str] | None,
         gpu_stage_names: set[str] | None,
         remote_stage_names: set[str] | None = None,
-        relay_config: dict[str, Any] | None = None,
+        comm_config: dict[str, Any] | None = None,
         injected_relay: Relay | None = None,
     ) -> None:
         self.stage_name = stage_name
@@ -34,9 +34,8 @@ class CommRouter:
         self.same_process_targets = set(same_process_targets or ())
         self.gpu_stage_names = set(gpu_stage_names or ())
         self.remote_stage_names = set(remote_stage_names or ())
-        self.relay_config = dict(relay_config or {})
+        self.comm_config = dict(comm_config or {})
         self.injected_relay = injected_relay
-        self.default_relay_transport = self._default_relay_transport()
         self._relays: dict[TransportKind, Relay] = {}
 
     @property
@@ -49,11 +48,14 @@ class CommRouter:
     def outbound(self, target: str) -> TransportKind:
         if target in self.same_process_targets:
             return TransportKind.LOCAL_OBJECT
+        return self._physical_outbound(target)
+
+    def _physical_outbound(self, target: str) -> TransportKind:
         if target in self.remote_stage_names:
             return TransportKind.MOONCAKE
         if self.self_is_gpu and target in self.gpu_stage_names:
             return TransportKind.CUDA_IPC
-        return self.default_relay_transport
+        return TransportKind.SHM
 
     def outbound_stream(self, target: str, data: torch.Tensor) -> TransportKind:
         if not isinstance(data, torch.Tensor):
@@ -63,7 +65,10 @@ class CommRouter:
             )
         kind = self.outbound(target)
         if kind is TransportKind.CUDA_IPC and not data.is_cuda:
-            return self.default_relay_transport
+            raise ValueError(
+                f"GPU stage edge {self.stage_name!r}->{target!r} selected "
+                "cuda_ipc, but the stream chunk is not CUDA-resident"
+            )
         return kind
 
     def inbound(self, from_stage: str) -> TransportKind:
@@ -71,7 +76,7 @@ class CommRouter:
             return TransportKind.MOONCAKE
         if self.self_is_gpu and from_stage in self.gpu_stage_names:
             return TransportKind.CUDA_IPC
-        return self.default_relay_transport
+        return TransportKind.SHM
 
     def relay(self, kind: TransportKind) -> Relay:
         if kind is TransportKind.LOCAL_OBJECT:
@@ -87,7 +92,17 @@ class CommRouter:
     def relay_for(self, target: str) -> tuple[TransportKind, Relay]:
         kind = self.outbound(target)
         if kind is TransportKind.LOCAL_OBJECT:
-            kind = self.default_relay_transport
+            raise ValueError(
+                f"same-process target {target!r} has no relay transport; "
+                "use local-object dispatch"
+            )
+        return kind, self.relay(kind)
+
+    def relay_for_materialized_payload(
+        self, target: str
+    ) -> tuple[TransportKind, Relay]:
+        """Return the physical relay for a payload that cannot use local objects."""
+        kind = self._physical_outbound(target)
         return kind, self.relay(kind)
 
     def relay_for_stream(
@@ -95,24 +110,17 @@ class CommRouter:
     ) -> tuple[TransportKind, Relay]:
         kind = self.outbound_stream(target, data)
         if kind is TransportKind.LOCAL_OBJECT:
-            kind = self.default_relay_transport
+            raise ValueError(
+                f"same-process stream target {target!r} has no relay transport; "
+                "use local-object dispatch"
+            )
         return kind, self.relay(kind)
 
     def inbound_relay(self, from_stage: str) -> Relay:
         return self.relay(self.inbound(from_stage))
 
-    def _default_relay_transport(self) -> TransportKind:
-        relay_type = (
-            self.relay_config["relay_type"]
-            if "relay_type" in self.relay_config
-            else "shm"
-        )
-        if relay_type == "mooncake":
-            return TransportKind.MOONCAKE
-        return TransportKind.SHM
-
     def _build_relay(self, kind: TransportKind) -> Relay:
-        cfg = self.relay_config
+        cfg = self.comm_config
         engine_id = (
             cfg["worker_id"] if "worker_id" in cfg else f"{self.stage_name}_relay"
         )
@@ -139,9 +147,15 @@ class CommRouter:
                 device=device,
                 slot_size_mb=slot_size_mb,
                 credits=credits,
-                protocol=cfg["protocol"] if "protocol" in cfg else "rdma",
-                hostname=cfg["hostname"] if "hostname" in cfg else None,
-                device_name=cfg["device_name"] if "device_name" in cfg else "",
+                protocol=(
+                    cfg["mooncake_protocol"] if "mooncake_protocol" in cfg else "rdma"
+                ),
+                hostname=(
+                    cfg["mooncake_hostname"] if "mooncake_hostname" in cfg else None
+                ),
+                device_name=(
+                    cfg["mooncake_device_name"] if "mooncake_device_name" in cfg else ""
+                ),
             )
         if kind is TransportKind.SHM:
             return create_relay(

@@ -66,8 +66,8 @@ class StageLaunchConfig:
     merge_fn: str | None = None
     project_payload: dict[str, str] = field(default_factory=dict)
 
-    # Relay
-    relay_config: dict[str, Any] = field(default_factory=dict)
+    # Communication pool/options. Transport selection belongs to CommRouter.
+    comm_config: dict[str, Any] = field(default_factory=dict)
 
     # Endpoints
     recv_endpoint: str = ""
@@ -78,7 +78,7 @@ class StageLaunchConfig:
     # Stream wiring
     stream_targets: list[str] = field(default_factory=list)
     stream_done_to_fn: str | None = None
-    # GPU-resident stage names (for the transport router to pick CUDA-IPC vs SHM).
+    # GPU-resident stage names (for the transport router to pick GPU vs host transport).
     gpu_stage_names: set[str] = field(default_factory=set)
     # Explicit cross-node stage names. These edges use Mooncake when present.
     remote_stage_names: set[str] = field(default_factory=set)
@@ -438,7 +438,7 @@ def _construct_stage(
     log: logging.Logger,
     local_dispatcher: LocalStageDispatcher | None = None,
 ) -> Stage:
-    gpu_id = spec.relay_config.get("gpu_id")
+    gpu_id = spec.comm_config.get("gpu_id")
     if gpu_id is None:
         gpu_id = spec.factory_args.get("gpu_id")
     if gpu_id is None and _factory_args_use_cuda(spec.factory_args):
@@ -611,7 +611,7 @@ def _construct_stage(
         endpoints=spec.stage_endpoints,
         control_plane=control_plane,
         input_handler=input_handler,
-        relay_config=spec.relay_config,
+        comm_config=spec.comm_config,
         scheduler=scheduler,
         project_payload=project_payload or None,
         stream_targets=spec.stream_targets or None,
@@ -720,8 +720,8 @@ def _prepare_cuda_environment(
 def _normalize_spec_gpu_id_to_local_device(spec: StageLaunchConfig) -> None:
     if "gpu_id" in spec.factory_args:
         spec.factory_args["gpu_id"] = 0
-    if "gpu_id" in spec.relay_config:
-        spec.relay_config["gpu_id"] = 0
+    if "gpu_id" in spec.comm_config:
+        spec.comm_config["gpu_id"] = 0
     spec.gpu_id = 0
 
 

@@ -62,9 +62,6 @@ def parse_args() -> argparse.Namespace:
             "If omitted, SGLang chooses automatically."
         ),
     )
-    parser.add_argument(
-        "--relay-backend", type=str, default="shm", choices=["nixl", "shm"]
-    )
     return parser.parse_args()
 
 
@@ -73,10 +70,7 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.cpu_offload_gb:
         overrides["cpu_offload_gb"] = args.cpu_offload_gb
 
-    config = MingOmniPipelineConfig(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-    )
+    config = MingOmniPipelineConfig(model_path=args.model_path)
     if overrides:
         config.apply_server_args_overrides(stage_name="thinker", overrides=overrides)
     if args.mem_fraction_static is not None:

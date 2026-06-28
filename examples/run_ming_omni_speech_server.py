@@ -68,9 +68,6 @@ def parse_args() -> argparse.Namespace:
 
     # Pipeline
     parser.add_argument(
-        "--relay-backend", type=str, default="shm", choices=["nixl", "shm"]
-    )
-    parser.add_argument(
         "--voice", type=str, default="DB30", help="Voice ID for the talker"
     )
     parser.add_argument(
@@ -177,17 +174,11 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
     _validate_fraction("--mem-fraction-static", args.mem_fraction_static)
 
     if getattr(args, "enable_streaming_tts", False):
-        config = MingOmniStreamingSpeechPipelineConfig(
-            model_path=args.model_path,
-            relay_backend=args.relay_backend,
-        )
+        config = MingOmniStreamingSpeechPipelineConfig(model_path=args.model_path)
         talker_stage_name = "talker_stream"
         gpu_validator = config._validate_talker_stream_gpu_not_in_thinker_tp_range
     else:
-        config = MingOmniSpeechPipelineConfig(
-            model_path=args.model_path,
-            relay_backend=args.relay_backend,
-        )
+        config = MingOmniSpeechPipelineConfig(model_path=args.model_path)
         talker_stage_name = "talker"
         gpu_validator = config._validate_talker_gpu_not_in_thinker_tp_range
 

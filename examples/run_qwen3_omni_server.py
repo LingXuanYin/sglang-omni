@@ -55,13 +55,6 @@ def parse_args() -> argparse.Namespace:
 
     # Pipeline options
     parser.add_argument(
-        "--relay-backend",
-        type=str,
-        default="shm",
-        choices=["shm", "nccl", "nixl"],
-        help="Relay type for inter-stage data transfer",
-    )
-    parser.add_argument(
         "--mem-fraction-static",
         type=float,
         default=None,
@@ -164,10 +157,7 @@ def _launch_text_server(args: argparse.Namespace) -> None:
     _validate_fraction("--mem-fraction-static", args.mem_fraction_static)
     _validate_encoder_mem_reserve(args.encoder_mem_reserve)
 
-    config = Qwen3OmniPipelineConfig(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-    )
+    config = Qwen3OmniPipelineConfig(model_path=args.model_path)
 
     stage_updates: dict[str, object] = {}
     preprocessing_updates: dict[str, object] = {}

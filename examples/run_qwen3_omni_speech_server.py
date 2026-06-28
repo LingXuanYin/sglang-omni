@@ -90,9 +90,6 @@ def parse_args() -> argparse.Namespace:
 
     # Pipeline
     parser.add_argument(
-        "--relay-backend", type=str, default="shm", choices=["nixl", "shm"]
-    )
-    parser.add_argument(
         "--thinker-max-seq-len",
         type=int,
         default=8192,
@@ -316,10 +313,7 @@ def _launch_speech_server(args: argparse.Namespace) -> None:
         if args.colocated
         else Qwen3OmniSpeechPipelineConfig
     )
-    config = config_cls(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-    )
+    config = config_cls(model_path=args.model_path)
 
     _set_stage_gpu(config, "image_encoder", gpu_image_encoder)
     _set_stage_gpu(config, "audio_encoder", gpu_audio_encoder)

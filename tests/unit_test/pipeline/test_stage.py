@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
@@ -165,7 +165,7 @@ def test_stage_process_rejects_dynamic_targets_outside_static_topology() -> None
             "decode": "inproc://decode",
             "talker": "inproc://talker",
         },
-        relay_config={"relay_type": "shm", "slot_size_mb": 1},
+        comm_config={"slot_size_mb": 1},
     )
     stage_obj = _construct_stage(spec, logging.getLogger(__name__))
     payload = make_stage_payload()
@@ -191,7 +191,7 @@ def test_stage_process_rejects_dynamic_wait_sources_outside_static_fanin() -> No
         coordinator_endpoint="inproc://coordinator",
         abort_endpoint="inproc://abort",
         stage_endpoints={"decode": "inproc://decode"},
-        relay_config={"relay_type": "shm", "slot_size_mb": 1},
+        comm_config={"slot_size_mb": 1},
     )
     stage_obj = _construct_stage(spec, logging.getLogger(__name__))
 
@@ -211,7 +211,7 @@ def test_stage_process_accepts_iterable_dynamic_wait_sources() -> None:
         coordinator_endpoint="inproc://coordinator",
         abort_endpoint="inproc://abort",
         stage_endpoints={"decode": "inproc://decode"},
-        relay_config={"relay_type": "shm", "slot_size_mb": 1},
+        comm_config={"slot_size_mb": 1},
     )
     stage_obj = _construct_stage(spec, logging.getLogger(__name__))
 
@@ -247,7 +247,12 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
     async def _run() -> None:
         relay = FakeRelay()
         payload = make_tensor_payload()
-        data_ref, op = await stage_io.write_payload(relay, payload.request_id, payload)
+        data_ref, op = await stage_io.write_payload(
+            relay,
+            payload.request_id,
+            payload,
+            transport=TransportKind.SHM,
+        )
         await op.wait_for_completion()
         restored = await stage_io.read_payload(relay, payload.request_id, data_ref)
         assert tensor_equal(restored.data, payload.data)
@@ -266,6 +271,7 @@ def test_relay_payload_and_cross_gpu_stream_contracts() -> None:
             from_stage="thinker",
             chunk_id=0,
             metadata={"token_id": 1, "hidden": torch.tensor([4])},
+            transport=TransportKind.SHM,
         )
 
         names = collect_event_names(log)
@@ -286,7 +292,12 @@ def test_stage_relay_read_failure_completes_with_error() -> None:
         control_plane = RecordingStageControlPlane()
         stage_obj = make_stage(relay=relay, control_plane=control_plane)
         payload = make_stage_payload(request_id="req-1")
-        data_ref, _ = await stage_io.write_payload(relay, "req-1", payload)
+        data_ref, _ = await stage_io.write_payload(
+            relay,
+            "req-1",
+            payload,
+            transport=TransportKind.SHM,
+        )
         relay.fail_get = RuntimeError("read failed")
 
         await stage_obj._on_data_ready(
@@ -474,7 +485,7 @@ def test_stage_local_object_preserves_fan_in_semantics() -> None:
     asyncio.run(_run())
 
 
-def test_stage_fan_out_payloads_fall_back_to_relay() -> None:
+def test_stage_fan_out_payloads_materialize_when_local_object_is_unsafe() -> None:
     async def _run() -> None:
         relay = FakeRelay()
         control_plane = RecordingStageControlPlane()

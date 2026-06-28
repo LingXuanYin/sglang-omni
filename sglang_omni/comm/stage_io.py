@@ -10,11 +10,11 @@ import torch
 
 from sglang_omni.comm.data_ref import (
     BackendRef,
+    DataKind,
+    DataLayout,
+    DataRef,
     MetadataTensorRef,
     TensorMeta,
-    DataRef,
-    DataLayout,
-    DataKind,
     TransportKind,
 )
 from sglang_omni.proto import DataReadyMessage, StagePayload
@@ -89,7 +89,7 @@ async def write_payload(
     request_id: str,
     payload: StagePayload,
     *,
-    transport: TransportKind = TransportKind.SHM,
+    transport: TransportKind,
     from_stage: str | None = None,
     to_stage: str | None = None,
 ) -> tuple[DataRef, Any]:
@@ -147,7 +147,7 @@ async def write_tensor(
     object_id: str,
     tensor: torch.Tensor,
     *,
-    transport: TransportKind = TransportKind.SHM,
+    transport: TransportKind,
     kind: DataKind = DataKind.STREAM_CHUNK,
     request_id: str | None = None,
     from_stage: str | None = None,
@@ -167,20 +167,23 @@ async def write_tensor(
             [torch.zeros(offset, dtype=torch.uint8, device=target_device), packed]
         )
     op = await relay.put_async(packed, request_id=object_id)
-    return DataRef(
-        version=1,
-        object_id=object_id,
-        kind=kind,
-        transport=transport,
-        layout=DataLayout.RAW_TENSOR,
-        buffer=BackendRef.from_relay_info(
+    return (
+        DataRef(
+            version=1,
+            object_id=object_id,
+            kind=kind,
             transport=transport,
-            relay_info=op.metadata,
+            layout=DataLayout.RAW_TENSOR,
+            buffer=BackendRef.from_relay_info(
+                transport=transport,
+                relay_info=op.metadata,
+            ),
+            shape=tuple(int(dim) for dim in tensor.shape),
+            dtype=str(tensor.dtype),
+            offset=offset,
         ),
-        shape=tuple(int(dim) for dim in tensor.shape),
-        dtype=str(tensor.dtype),
-        offset=offset,
-    ), op
+        op,
+    )
 
 
 async def read_tensor(
@@ -214,7 +217,7 @@ async def send_stream_chunk(
     from_stage: str,
     chunk_id: int,
     metadata: dict | None = None,
-    transport: TransportKind = TransportKind.SHM,
+    transport: TransportKind,
 ) -> None:
     object_id = f"{request_id}:stream:{from_stage}:{target_stage}:{chunk_id}"
     data_ref, op = await write_tensor(

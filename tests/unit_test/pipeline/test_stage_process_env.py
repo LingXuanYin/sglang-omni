@@ -62,14 +62,14 @@ def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
         tp_size=2,
         gpu_id=1,
         factory_args={"gpu_id": 1},
-        relay_config={"gpu_id": 1},
+        comm_config={"gpu_id": 1},
     )
 
     stage_workers._prepare_cuda_environment(spec, _RecordingLog())
 
     assert spec.gpu_id == 0
     assert spec.factory_args["gpu_id"] == 0
-    assert spec.relay_config["gpu_id"] == 0
+    assert spec.comm_config["gpu_id"] == 0
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "4"
 
 

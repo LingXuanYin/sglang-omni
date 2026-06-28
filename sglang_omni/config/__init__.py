@@ -10,11 +10,11 @@ from sglang_omni.config.placement import (
 )
 from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.config.schema import (
+    CommConfig,
     EndpointsConfig,
     ParallelismConfig,
     PipelineConfig,
     PlacementConfig,
-    RelayConfig,
     SGLangServerArgsConfig,
     StageConfig,
     StageResourceConfig,
@@ -49,6 +49,6 @@ __all__ = [
     "SGLangServerArgsConfig",
     "StageRuntimeConfig",
     "PlacementConfig",
-    "RelayConfig",
+    "CommConfig",
     "EndpointsConfig",
 ]

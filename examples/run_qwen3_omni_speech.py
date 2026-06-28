@@ -9,7 +9,7 @@ Usage::
     # With custom GPU mapping:
     python examples/run_qwen3_omni_speech.py \
         --prompt "Hello, how are you?" \
-        --gpu-thinker 0 --gpu-talker 1 --gpu-code-predictor 2
+        --gpu-thinker 0 --gpu-talker 1 --gpu-code2wav 1
 
     # Save audio to file:
     python examples/run_qwen3_omni_speech.py \
@@ -51,9 +51,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument(
-        "--relay-backend", type=str, default="shm", choices=["nixl", "shm"]
-    )
-    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -61,7 +58,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-thinker", type=int, default=0)
     parser.add_argument("--gpu-talker", type=int, default=1)
-    parser.add_argument("--gpu-code-predictor", type=int, default=2)
     parser.add_argument("--gpu-code2wav", type=int, default=0)
     parser.add_argument("--gpu-image-encoder", type=int, default=0)
     parser.add_argument("--gpu-audio-encoder", type=int, default=0)
@@ -103,19 +99,12 @@ async def main_async(args: argparse.Namespace) -> None:
     from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
     from sglang_omni.proto import OmniRequest
 
-    # Build GPU placement from CLI args
-    gpu_placement = {
-        "thinker": args.gpu_thinker,
-        "talker_ar": args.gpu_talker,
-        "code_predictor": args.gpu_code_predictor,
-        "code2wav": args.gpu_code2wav,
-    }
-
-    config = Qwen3OmniSpeechPipelineConfig(
-        model_path=args.model_path,
-        relay_backend=args.relay_backend,
-        gpu_placement=gpu_placement,
-    )
+    config = Qwen3OmniSpeechPipelineConfig(model_path=args.model_path)
+    _set_stage_gpu(config, "thinker", args.gpu_thinker)
+    _set_stage_gpu(config, "talker_ar", args.gpu_talker)
+    _set_stage_gpu(config, "code2wav", args.gpu_code2wav)
+    _set_stage_gpu(config, "image_encoder", args.gpu_image_encoder)
+    _set_stage_gpu(config, "audio_encoder", args.gpu_audio_encoder)
     resolve_and_apply_speech_mem_fraction(
         config,
         global_mem_fraction_static=args.mem_fraction_static,
@@ -208,6 +197,14 @@ def _save_audio(result: dict, output_path: str) -> None:
         return
 
     logger.warning("No audio waveform found in pipeline result")
+
+
+def _set_stage_gpu(config, stage_name: str, gpu_id: int) -> None:
+    for stage in config.stages:
+        if stage.name == stage_name:
+            stage.gpu = int(gpu_id)
+            return
+    raise ValueError(f"Stage {stage_name!r} not found in config")
 
 
 def main() -> None:

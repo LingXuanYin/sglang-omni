@@ -10,7 +10,7 @@ import torch
 from pydantic import ValidationError
 
 from sglang_omni.comm import stage_io
-from sglang_omni.comm.data_ref import DataRef
+from sglang_omni.comm.data_ref import DataRef, TransportKind
 from sglang_omni.comm.engine import CommEngine
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s2_pro.config import S2ProPipelineConfig
@@ -116,6 +116,7 @@ async def _make_relay_chunk(
         from_stage=from_stage,
         chunk_id=chunk_id,
         metadata=metadata,
+        transport=TransportKind.SHM,
     )
     return control_plane.stage_messages[0][2]
 
@@ -127,7 +128,12 @@ async def _make_relay_payload(
     from_stage: str = "tts_engine",
     to_stage: str = "vocoder",
 ) -> DataReadyMessage:
-    data_ref, op = await stage_io.write_payload(relay, payload.request_id, payload)
+    data_ref, op = await stage_io.write_payload(
+        relay,
+        payload.request_id,
+        payload,
+        transport=TransportKind.SHM,
+    )
     await op.wait_for_completion()
     return DataReadyMessage(
         request_id=payload.request_id,
@@ -511,6 +517,7 @@ def test_send_stream_chunk_uses_relay() -> None:
             target_endpoint="inproc://vocoder",
             from_stage="tts_engine",
             chunk_id=0,
+            transport=TransportKind.SHM,
         )
 
         assert len(relay.puts) == 1

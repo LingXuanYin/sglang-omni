@@ -151,21 +151,20 @@ control message. Both put and get operations expose
 `await wait_for_completion(timeout=...)`. Stages keep the operation alive until
 the transfer is safe to release.
 
-## Backends
+## Transport Selection
 
-`PipelineConfig.relay_backend` accepts `shm`, `nccl`, `nixl`, or `mooncake`.
-`RelayConfig` can override slot size, credits, rank, world size, and device per
-stage. If no per-stage relay config is provided, runtime prep infers the relay
-device from stage placement. For `shm`, it keeps relay buffers on CPU because
-the backend copies through host shared memory.
+There is no public backend selector. `CommRouter` derives the transport from
+stage locality and placement:
 
+| Transport | Selection rule |
+| --- | --- |
+| `local_object` | Source and target stages share one OS process and the payload is eligible for direct local dispatch. |
+| `cuda_ipc` | Source and target are same-node GPU stages. CUDA IPC requires CUDA-resident tensors on stream edges. |
+| `shm` | Same-node host/CPU transfer where the selected edge is not GPU-to-GPU. |
+| `mooncake` | Cross-node stage edges listed as remote. Mooncake owns protocol selection for those transfers. |
 
-| Backend    | Current behavior                                                                                                                                                            |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `shm`      | Creates a Python shared-memory block, copies tensor bytes into it, and lets the receiver copy out and unlink the block. Useful for local process transfer and CPU fallback. |
-| `nccl`     | Uses`torch.distributed` NCCL `isend`/`irecv` with explicit send and receive rank topology. Useful for GPU-to-GPU transfer inside an NCCL world.                             |
-| `nixl`     | Uses a preallocated registered memory pool, NIXL agent metadata, remote reads, completion notifications, and credits for safe buffer reuse.                                 |
-| `mooncake` | Uses Mooncake Transfer Engine with a registered memory pool, P2P session metadata, protocol selection, notifications, and credits.                                          |
+`CommConfig` can tune slot size, credits, and Mooncake connection options per
+stage. It does not select a transport backend.
 
 Each backend owns only transport mechanics. It does not route requests, perform
 fan-in, choose downstream stages, or interpret model payloads.

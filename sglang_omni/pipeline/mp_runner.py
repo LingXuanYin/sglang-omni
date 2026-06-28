@@ -25,7 +25,7 @@ from sglang_omni.pipeline import Coordinator
 from sglang_omni.pipeline.runtime_config import (
     IpcRuntimeDir,
     PipelineRuntimePrep,
-    build_relay_config,
+    build_comm_config,
     prepare_pipeline_runtime,
 )
 from sglang_omni.pipeline.stage_workers import (
@@ -66,7 +66,7 @@ def _build_stage_groups(
     nccl_port_counter = _NcclPortAllocator()
 
     # GPU-resident stages, shared by every stage so the transport router can
-    # decide CUDA-IPC vs SHM per edge from static placement alone. Include the
+    # decide GPU vs host transport per edge from static placement alone. Include the
     # pre-fusion aliases so lookups work whether an edge names a stage by its
     # raw or canonical (fused) name.
     gpu_canonical = resolve_gpu_stage_names(placement_plan)
@@ -213,7 +213,7 @@ def _build_single_stage_spec(
     factory_args = dict(base_factory_args)
     if "gpu_id" in base_factory_args:
         factory_args["gpu_id"] = gpu_id
-    relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
+    comm_config = _resolve_comm_config(stage_cfg, gpu_id=gpu_id)
     return StageLaunchConfig(
         role="single",
         tp_rank=0,
@@ -221,7 +221,7 @@ def _build_single_stage_spec(
         gpu_id=gpu_id,
         nccl_port=None,
         factory_args=factory_args,
-        relay_config=relay_config,
+        comm_config=comm_config,
         recv_endpoint=recv_endpoint,
         **stage_kwargs,
     )
@@ -254,7 +254,7 @@ def _build_tp_stage_specs(
         factory_args["tp_size"] = stage_cfg.tp_size
         factory_args["nccl_port"] = nccl_port
 
-        relay_config = _resolve_relay_config(stage_cfg, config, gpu_id=gpu_id)
+        comm_config = _resolve_comm_config(stage_cfg, gpu_id=gpu_id)
 
         if tp_rank == 0:
             specs.append(
@@ -265,7 +265,7 @@ def _build_tp_stage_specs(
                     gpu_id=gpu_id,
                     nccl_port=nccl_port,
                     factory_args=factory_args,
-                    relay_config=relay_config,
+                    comm_config=comm_config,
                     recv_endpoint=recv_endpoint,
                     follower_work_queues=follower_work_queues,
                     follower_abort_queues=follower_abort_queues,
@@ -284,7 +284,7 @@ def _build_tp_stage_specs(
                 gpu_id=gpu_id,
                 nccl_port=nccl_port,
                 factory_args=factory_args,
-                relay_config=relay_config,
+                comm_config=comm_config,
                 recv_endpoint="",
                 internal_work_queue=follower_work_queues[idx],
                 internal_abort_queue=follower_abort_queues[idx],
@@ -296,19 +296,16 @@ def _build_tp_stage_specs(
     return specs
 
 
-def _resolve_relay_config(
+def _resolve_comm_config(
     stage_cfg: StageConfig,
-    config: PipelineConfig,
     *,
     gpu_id: int | None,
 ) -> dict[str, Any]:
-    """Build relay config, overriding gpu_id from placement."""
-    relay_config = build_relay_config(stage_cfg, config)
-    # shm copies into host shared memory, so CUDA staging only creates extra
-    # GPU allocator pressure.
-    if stage_cfg.gpu is not None and config.relay_backend != "shm":
-        relay_config["gpu_id"] = gpu_id
-    return relay_config
+    """Build stage-local communication options from placement."""
+    comm_config = build_comm_config(stage_cfg)
+    if stage_cfg.gpu is not None:
+        comm_config["gpu_id"] = gpu_id
+    return comm_config
 
 
 class _NcclPortAllocator:
