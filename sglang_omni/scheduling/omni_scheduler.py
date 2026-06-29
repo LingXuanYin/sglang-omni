@@ -2392,6 +2392,65 @@ class OmniScheduler:
             "guard."
         )
 
+    def get_next_batch_to_run(self):
+        """Upstream batch selection + voice-fusion group-atomic prefill admission.
+
+        Delegates to the upstream SGLang scheduler, then enforces that a fusion
+        group's sibling rows are prefilled together: if the chosen *prefill*
+        batch contains only some members of a fusion group, the present members
+        are deferred back to the waiting queue so the whole group enters on a
+        later step as one unit. This is what keeps the decode-time group-
+        completeness guard (see HiggsTTSModel) from ever firing in normal
+        operation — siblings reach the running batch together and then, kept in
+        lock-step by the shared seed + done-barrier, retire together.
+
+        Decode batches are passed through untouched (membership only needs to be
+        established once, at prefill; the done-barrier handles co-retirement).
+        Non-fusion batches are likewise untouched: ``_fusion_group_members`` is
+        empty, so the scan is a cheap no-op on the hot path.
+        """
+        batch = _Upstream.get_next_batch_to_run(self)
+        if batch is None or not self._fusion_group_members:
+            return batch
+        reqs = getattr(batch, "reqs", None)
+        if not reqs or self._batch_is_decode(batch):
+            return batch
+
+        # Prefill batch: find fusion groups that are only partially present.
+        present_by_group: dict[frozenset, set[str]] = {}
+        for req in reqs:
+            members = self._fusion_group_members.get(req.rid)
+            if members is None:
+                continue
+            present_by_group.setdefault(frozenset(members), set()).add(req.rid)
+
+        defer_rids: set[str] = set()
+        for members, present in present_by_group.items():
+            if present != set(members):
+                # Partial group in this prefill batch → defer the present
+                # members; the whole group will be admitted together once the
+                # engine can prefill all of them in one batch.
+                defer_rids |= present
+        if not defer_rids:
+            return batch
+
+        deferred_reqs = [req for req in reqs if req.rid in defer_rids]
+        batch.reqs = [req for req in reqs if req.rid not in defer_rids]
+        if not batch.reqs:
+            batch.batch_is_full = False
+        # Return deferred siblings to the front of the waiting queue so they are
+        # retried next round (ahead of newer work) and the group coalesces fast.
+        with self._request_admission_lock:
+            self.waiting_queue[0:0] = deferred_reqs
+        logger.debug(
+            "Deferred %d fusion sibling(s) to keep group prefill atomic: %s",
+            len(deferred_reqs),
+            sorted(defer_rids),
+        )
+        if not batch.reqs:
+            return None
+        return batch
+
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:
         mode = batch.forward_mode

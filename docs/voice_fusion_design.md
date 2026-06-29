@@ -125,3 +125,40 @@ follower row 未释放 → 旧计数残留 → expected 永远偏大 → 该 gid
 co-batching 必须由调度器**强制保证**(把 sibling 钉在同一 batch + 同生同灭 retract),
 而非在 decode 时**断言**。这正是第二轮审查就指出、但当时选择了"fail-loud 兜底"的硬约束——
 事实证明 fail-loud 不是兜底,而是把问题从"静默错误"变成"必崩"。
+
+## 方案1 实现:两层 co-batching 保证(2026-06,第三轮审查后定稿)
+第三轮端到端审查(数据流 API→preprocess→builder→scheduler→model)抓到致命 bug A
+(follower 跳过了 _mark_sampler_finished → leader 退出后 follower 滞留 → 自己的 fail-loud
+断言把整批炸掉)及 B/C/D/F。结论:"fail-loud 断言 + 共享 seed 锁步" 单靠断言与连续批处理
+引擎对抗,必须由调度器主动保证同批。已据此重构为两层:
+
+**第一层 — 调度器组原子准入(正常路径,使断言永不触发):**
+- `OmniScheduler._enqueue_built_request`:N siblings 一起入队,并在 `_fusion_group_members`
+  记录完整组成员关系。
+- `OmniScheduler.get_next_batch_to_run`(override 上游):上游选完 prefill batch 后,若某
+  fusion 组只有部分成员在 batch 内,把这部分**整体退回 waiting_queue 队首**,使全组下一轮
+  一起 prefill。decode batch 与非融合 batch 零开销透传。
+
+**第二层 — decode 时 fail-loud 兜底(极端 KV 压力):**
+- `fuse_group_logits` 前的组完整性检查(model.py `_batch_local_fusion` / runner
+  `_populate_fusion_buffers`):若某组在本 step 缺员(被上游 KV-retract 拆散),抛
+  RuntimeError 而非静默产出未融合音频。宁可可观测失败、可重试。
+
+**bug 修复(第三轮):**
+- A:follower 现在**先**经 `_mark_sampler_finished` 标记完成(与 leader 同步退出),**再**跳过音频
+  append/emit。三个 collect 路径(CG decode / async resolve / prefill)全部修正。
+- C:`fuse_group_logits` 对单成员组返回 `logits/T`(下游 softmax 后**字节级**等于 baseline),
+  仅对真融合组返回 `log(blend)`,用按行 `torch.where` 选择 → CG 安全且非融合请求零影响。
+  新增单测断言此字节级 identity。
+- D:fusion registry 三个 dict 加 `_fusion_lock`;decode 步用 `fusion_membership_snapshot`
+  取一致快照,杜绝读到半注册状态。
+- F:`expected_fusion_group_size` 实时从成员派生(不再单独累加计数),retry 复用 rid 不再泄漏。
+
+**已知待 Linux 实测验证项(本机 Windows 无法跑 sglang 引擎):**
+1. **KV 回收**:`get_next_batch_to_run` 把 deferred siblings 从 `batch.reqs` 移除并退回
+   waiting_queue 时,上游 `PrefillAdder` 已分配的 KV 是否自动回收?需在真实引擎确认无 KV 泄漏。
+2. **死锁前提**:组原子准入假设 KV 总量 ≥ 一个组的 prefill 占用。若 `max_running_requests`
+   或 KV 池太小容不下整组,组会被无限退回 → 死锁。部署须按"1 融合请求 = N 行"给 KV/并发计费。
+3. **prefill→decode 过渡**:全组同批 prefill 后是否同步进入 running_batch 首个 decode step
+   (而非某行先 decode 一步)。依赖上游 prefill-vs-decode 优先策略,需实测。
+4. CUDA graph 捕获下 `_cg_fusion_group`/`_cg_fusion_weight` 每步重填是否与图重放兼容。
