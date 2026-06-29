@@ -242,6 +242,11 @@ class HiggsTTSModel(nn.Module):
         self._fusion_group_of: dict[str, str] = {}
         self._fusion_weight_of: dict[str, float] = {}
         self._fusion_leader: dict[str, bool] = {}
+        # Expected member count per fusion group id, set at registration. The
+        # decode reduction checks the per-step batch contains all members; a
+        # short count means the upstream scheduler split the group (e.g. KV
+        # retract) and we fail loud rather than emit silently un-fused audio.
+        self._fusion_group_size: dict[str, int] = {}
 
     @property
     def language_model(self) -> Qwen3ForCausalLM:
@@ -260,13 +265,24 @@ class HiggsTTSModel(nn.Module):
         decoded codes are emitted as audio. Idempotent.
         """
         if group_id is None:
-            self._fusion_group_of.pop(req_id, None)
+            old = self._fusion_group_of.pop(req_id, None)
             self._fusion_weight_of.pop(req_id, None)
             self._fusion_leader.pop(req_id, None)
+            if old is not None:
+                # Drop the size entry once every member of the group has cleared.
+                remaining = sum(1 for g in self._fusion_group_of.values() if g == old)
+                if remaining == 0:
+                    self._fusion_group_size.pop(old, None)
             return
         self._fusion_group_of[req_id] = group_id
         self._fusion_weight_of[req_id] = float(weight)
         self._fusion_leader[req_id] = bool(is_leader)
+        # Track the expected member count so the decode-time reduction can
+        # fail loud if the upstream scheduler ever splits a group across steps
+        # (see fuse-group barrier; a partial group would silently un-fuse).
+        self._fusion_group_size[group_id] = (
+            self._fusion_group_size.get(group_id, 0) + 1
+        )
 
     def is_fusion_leader(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member and the group's output leader."""
@@ -367,6 +383,7 @@ class HiggsTTSModel(nn.Module):
         group = list(range(B))
         weight = [1.0] * B
         seen: dict[str, int] = {}
+        present: dict[str, int] = {}
         is_fused = False
         for b, p in enumerate(gen_params):
             gid = p.fusion_group_id
@@ -377,6 +394,23 @@ class HiggsTTSModel(nn.Module):
                 seen[gid] = b  # first member's row index anchors the group
             group[b] = seen[gid]
             weight[b] = p.fusion_weight
+            present[gid] = present.get(gid, 0) + 1
+
+        # Fail loud if the upstream scheduler split a group across decode steps
+        # (e.g. KV-pressure retract). A partial group would blend an incomplete
+        # set of sibling distributions and silently emit wrong (un-fused) audio;
+        # better to fail the request — observable and retryable — than ship that.
+        for gid, n_present in present.items():
+            expected = self._fusion_group_size.get(gid)
+            if expected is not None and n_present != expected:
+                raise RuntimeError(
+                    f"voice-fusion group {gid!r} split across a decode step: "
+                    f"{n_present}/{expected} sibling rows present in the batch. "
+                    f"The serving engine scheduled the group's rows apart "
+                    f"(likely a KV-pressure retract); raise max_running_requests "
+                    f"or reduce concurrency so fusion siblings stay co-batched."
+                )
+
         group_B = torch.tensor(group, dtype=torch.long, device=device)
         weight_B = torch.tensor(weight, dtype=torch.float32, device=device)
         return group_B, weight_B, is_fused
@@ -435,6 +469,16 @@ class HiggsTTSModel(nn.Module):
         # fusion id form singleton groups (identity blend). The blended log-probs
         # then replace the raw logits and temperature is folded in, so the
         # sampler runs at temperature 1.
+        #
+        # ``_gen_params_for_batch`` cannot know fusion membership (it only sees
+        # ``sampling_info``, not req_ids), so backfill each row's group id +
+        # weight here from the registry keyed by req_id. Non-fusion req_ids are
+        # absent from the maps → fields stay None/1.0 → singleton/identity.
+        for rid, p in zip(req_ids, gen_params):
+            p.fusion_group_id = self._fusion_group_of.get(rid)
+            if p.fusion_group_id is not None:
+                p.fusion_weight = self._fusion_weight_of.get(rid, 1.0)
+
         group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
         if is_fused:
             logits_BNV = fuse_group_logits(

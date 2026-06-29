@@ -305,6 +305,30 @@ class HiggsTTSModelRunner(ModelRunner):
                 seen[gid] = b  # first member's row anchors the batch-local id
             group[b] = seen[gid]
             weight[b] = model._fusion_weight_of.get(rid, 1.0)
+
+        # Fail loud if a fusion group is split across this decode step: every
+        # registered member must be present in the batch, else the blend would
+        # average an incomplete set of sibling distributions and silently emit
+        # un-fused audio. A short count means the upstream engine scheduled the
+        # group's rows apart (e.g. a KV-pressure retract dropped some members).
+        present: dict[str, int] = {}
+        for gid in (
+            model._fusion_group_of.get(req.request_id)
+            for req in requests[:n_real]
+        ):
+            if gid is not None:
+                present[gid] = present.get(gid, 0) + 1
+        for gid, n_present in present.items():
+            expected = model._fusion_group_size.get(gid)
+            if expected is not None and n_present != expected:
+                raise RuntimeError(
+                    f"voice-fusion group {gid!r} split across a decode step: "
+                    f"{n_present}/{expected} sibling rows present in the batch. "
+                    f"The serving engine scheduled the group's rows apart "
+                    f"(likely a KV-pressure retract); raise max_running_requests "
+                    f"or reduce concurrency so fusion siblings stay co-batched."
+                )
+
         model._cg_fusion_group[:bs] = torch.tensor(
             group, dtype=torch.long, device=model._cg_fusion_group.device
         )

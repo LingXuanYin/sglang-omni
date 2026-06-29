@@ -499,6 +499,11 @@ class OmniScheduler:
         self._first_emit_done: set[str] = set()
         self._prefill_start_done: set[str] = set()
         self._prefill_end_done: set[str] = set()
+        # Voice-fusion: maps every sibling rid -> the full set of rids in its
+        # fusion group (including itself). Lets ``abort`` cascade to the whole
+        # group so a follower's sampler slot can't leak when the leader is
+        # aborted. Empty for all non-fusion requests.
+        self._fusion_group_members: dict[str, set[str]] = {}
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
@@ -1155,6 +1160,34 @@ class OmniScheduler:
     ) -> None:
         req_id = payload.request_id
         self._deferred_request_payloads.pop(req_id, None)
+
+        # Voice-fusion fan-out: a builder may attach sibling request-data objects
+        # (extra reference-voice contexts that decode in lock-step with the main
+        # request and are blended at sampling time). Each sibling is enqueued as
+        # its own waiting-queue entry so the engine schedules them as ordinary
+        # batch rows; the model layer blends their output distributions and emits
+        # only the leader's audio. Non-fusion requests never carry siblings, so
+        # this is a no-op on the normal path. Detached before recursion so a
+        # sibling can never itself carry siblings (single-level fan-out).
+        siblings = getattr(req_data, "fusion_siblings", None)
+        if siblings:
+            req_data.fusion_siblings = None
+            # Record the full group membership so an abort of any member can
+            # cascade to the rest (prevents a follower's sampler slot leaking
+            # when the leader is aborted mid-flight).
+            group_rids = {req_data.req.rid} | {
+                sibling_data.req.rid for sibling_data in siblings
+            }
+            for rid in group_rids:
+                self._fusion_group_members[rid] = group_rids
+            for sibling_data in siblings:
+                self._enqueue_built_request(
+                    payload,
+                    False,
+                    sibling_data,
+                    request_admission_lock_held=request_admission_lock_held,
+                )
+
         req = req_data.req
         self._normalize_req_token_arrays(req)
         req_id = req.rid
@@ -1623,6 +1656,22 @@ class OmniScheduler:
                 _detach_request_data(req)
                 continue
 
+            # Voice-fusion followers produce no standalone result: their decoded
+            # codes duplicate the leader's (shared fused distribution + shared
+            # seed) and were never emitted as audio. On finish, just release the
+            # follower's engine slot (sampler row) and skip result emission — the
+            # follower carries no stage_payload, so running the result adapter
+            # would fault. The leader emits the single fused result as usual.
+            if getattr(data, "fusion_group_id", None) is not None and not getattr(
+                data, "fusion_is_leader", True
+            ):
+                self._first_emit_done.discard(rid)
+                self._prefill_start_done.discard(rid)
+                self._fusion_group_members.pop(rid, None)
+                if self._abort_callback is not None:
+                    self._abort_callback(rid)
+                continue
+
             result = None
             terminal_error = None
             try:
@@ -1679,6 +1728,11 @@ class OmniScheduler:
                 continue
 
             self._first_emit_done.discard(rid)
+            self._prefill_start_done.discard(rid)
+            # Fusion leader finished: drop the group membership registry entry so
+            # it can't leak (followers were already released above). No-op for
+            # ordinary requests, which never registered a group.
+            self._fusion_group_members.pop(rid, None)
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
@@ -1766,6 +1820,20 @@ class OmniScheduler:
         self._request_build_executor = None
 
     def abort(self, request_id: str, *, defer_running_cleanup: bool = True) -> None:
+        # Voice-fusion: members of a fusion group decode in lock-step and share
+        # one logical result, so aborting any member must abort the whole group.
+        # Pop the membership first so the recursive aborts don't re-trigger the
+        # cascade (and so a half-aborted group can't leak sampler-pool rows).
+        group = self._fusion_group_members.pop(request_id, None)
+        if group is not None:
+            for member_id in group:
+                self._fusion_group_members.pop(member_id, None)
+            for member_id in group:
+                if member_id != request_id:
+                    self.abort(
+                        member_id, defer_running_cleanup=defer_running_cleanup
+                    )
+
         with self._request_admission_lock:
             if request_id not in self._aborted_request_ids:
                 if len(self._aborted_request_ids) >= _ABORTED_REQUEST_ID_LIMIT:

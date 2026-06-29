@@ -66,3 +66,17 @@ fused_logits = (fused[group_id_B] + 1e-30).log()             # 广播回各行 �
    使 delay_count/eoc_countdown 天然同步,屏障只需同步 generation_done。对齐在 prefill 构造处做。
 4. **端到端激活**:builder fan-out + `_gen_params_for_batch` 透传 fusion 字段,见下方文件清单(A)。
 
+
+## 调度同批约束(2026-06,第二轮审查结论 — 关键)
+深挖确认:higgs 走 `OmniScheduler` + 上游 sglang `get_next_batch_to_run` 驱动;仓库内
+`PrefillManager`/`DecodeManager` 在此路径上是死代码。**同组同批 / 同组 retract 完全由上游驱动,
+无 fusion 感知**——拆批、prefill→decode 过渡窗口、KV 压力下 retract 子集,均会静默破坏融合。
+这是无法靠"写得仔细"消除、且不应 hack 上游调度器的硬约束。
+
+**生产级对策(只动我们自己的 OmniScheduler + model 层,不碰上游):**
+1. **原子入队 + 组计费**:N 个 sibling 作为一个单元一起入 `waiting_que`(已实现);sampler pool 与
+   `max_running_requests` 须按"1 融合请求 = N 行"计费,避免组被池容量从中切断。
+2. **运行时 fail-loud 断言(核心防御)**:在 `fuse_group_logits` 归约点,若本 step batch 未包含某组的
+   全部成员(即组被上游拆散/retract),**明确抛错而非静默产出未融合音频**。宁可整请求失败、可观测、可重试,
+   也不交付错误结果。这把"上游不保证同批"从隐性正确性 bug 转成显式契约违例。
+3. PR 描述里把该约束列为已知限制,并建议上游加 fusion-group-aware 调度作为 follow-up。

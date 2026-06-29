@@ -123,6 +123,58 @@ def _without_consumed_reference_media(inputs: Any) -> Any:
     }
 
 
+def _fusion_ref_entries(inputs: dict) -> list[dict] | None:
+    """Detect a voice-fusion request and normalize its reference entries.
+
+    A request is a fusion request when ``references`` is a list of >= 2 entries
+    *and at least one entry carries a ``weight``* (the weight is what marks the
+    intent to blend rather than the legacy "first ref wins" behavior). Returns a
+    list of ``{"audio": <source>, "codes": <raw [T,N] or None>, "weight": float,
+    "reference_text": str | None}`` — one per voice — or ``None`` for the
+    ordinary single-reference path.
+
+    ``audio`` is whatever ``load_audio_to_24k`` accepts (path / url / dict with
+    bytes|base64|data); ``codes`` is set instead when the entry supplies
+    pre-encoded ``reference_codes``. Exactly one of the two is non-None.
+    """
+    refs = inputs.get("references")
+    if not isinstance(refs, list) or len(refs) < 2:
+        return None
+    if not any(isinstance(r, dict) and r.get("weight") is not None for r in refs):
+        return None
+
+    entries: list[dict] = []
+    for i, r in enumerate(refs):
+        if not isinstance(r, dict):
+            raise ValueError(f"references[{i}] must be an object for voice fusion")
+        weight = r.get("weight")
+        weight = 1.0 if weight is None else float(weight)
+        if weight < 0:
+            raise ValueError(f"references[{i}].weight must be >= 0, got {weight}")
+        reference_text = r.get("text") or r.get("reference_text")
+        codes = r.get("reference_codes")
+        if codes is not None:
+            entries.append(
+                {"audio": None, "codes": codes, "weight": weight,
+                 "reference_text": reference_text}
+            )
+            continue
+        if "bytes" in r or "base64" in r or "data" in r:
+            audio: Any = r
+        else:
+            audio = r.get("audio_path") or r.get("path")
+        if audio is None:
+            raise ValueError(
+                f"references[{i}] must supply audio_path/path/bytes/base64/data "
+                f"or reference_codes"
+            )
+        entries.append(
+            {"audio": audio, "codes": codes, "weight": weight,
+             "reference_text": reference_text}
+        )
+    return entries
+
+
 def _reference_code_cache_key_from_waveform(
     waveform: torch.Tensor, sample_rate: int
 ) -> str:
@@ -242,11 +294,87 @@ def create_preprocessing_executor(
     reference_waveform_cache_lock = threading.Lock()
     speaker_cache = get_speaker_artifact_cache()
 
+    def _load_fusion_waveform(audio: Any) -> torch.Tensor:
+        """Load a fusion reference's audio source to a ``[1, 1, L]`` 24 kHz tensor."""
+        waveform_np, sample_rate = load_audio_to_24k(audio)
+        wav = torch.from_numpy(waveform_np)
+        if sample_rate != 24000:
+            wav = F_audio.resample(wav, sample_rate, 24000)
+        if wav.shape[-1] > _MAX_REF_AUDIO_SEC * 24000:
+            raise ValueError(
+                f"a fusion reference is too long "
+                f"({wav.shape[-1] / 24000:.1f}s); cap at {_MAX_REF_AUDIO_SEC}s."
+            )
+        return wav.view(1, 1, -1).contiguous().float()
+
+    def _build_fusion_state(
+        text: str, specs: list[dict], params: dict
+    ) -> HiggsTtsState:
+        """Turn >= 2 weighted references into a ``fusion_refs`` state.
+
+        Pre-encoded entries are delayed + prompt-built here; raw-audio entries
+        carry their waveform forward (``codes_delayed`` stays None) for the
+        audio_encoder GPU stage to encode. The request builder later fans these
+        out into sibling rows that blend at sampling time.
+        """
+        fusion_refs: list[dict[str, Any]] = []
+        for i, spec in enumerate(specs):
+            entry: dict[str, Any] = {
+                "weight": float(spec["weight"]),
+                "reference_text": spec.get("reference_text"),
+                "codes_delayed": None,
+                "prompt_token_ids": None,
+                "waveform": None,
+            }
+            codes = spec.get("codes")
+            if codes is not None:
+                codes_TN = to_codes_TN(codes, num_codebooks)
+                if codes_TN is None:
+                    raise ValueError(f"references[{i}].reference_codes is empty")
+                if codes_TN.shape[0] > _MAX_REF_AUDIO_SEC * 75:
+                    raise ValueError(
+                        f"references[{i}].reference_codes too long "
+                        f"({codes_TN.shape[0]} frames); cap {_MAX_REF_AUDIO_SEC}s."
+                    )
+                delayed = apply_delay_pattern(codes_TN)
+                entry["codes_delayed"] = delayed.tolist()
+                entry["prompt_token_ids"] = adapter.build_prompt(
+                    text,
+                    num_ref_tokens=delayed.shape[0],
+                    reference_text=spec.get("reference_text"),
+                )
+            else:
+                entry["waveform"] = _load_fusion_waveform(spec["audio"])
+            fusion_refs.append(entry)
+
+        return HiggsTtsState(
+            prompt_token_ids=[],
+            fusion_refs=fusion_refs,
+            target_text=text,
+            num_codebooks=num_codebooks,
+            codebook_size=codebook_size,
+            max_new_tokens=int(params.get("max_new_tokens", 2048)),
+            temperature=float(params.get("temperature", 1.0)),
+            top_p=params.get("top_p"),
+            top_k=params.get("top_k"),
+            seed=params.get("seed"),
+        )
+
     def _preprocess(payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs or {}
         params = payload.request.params or {}
         if isinstance(inputs, str):
             inputs = {"text": inputs}
+
+        # Voice fusion: >= 2 weighted references → blend at the output layer.
+        fusion_specs = _fusion_ref_entries(inputs)
+        if fusion_specs is not None:
+            text = inputs.get("input") or inputs.get("text") or ""
+            payload.data = _build_fusion_state(text, fusion_specs, params).to_dict()
+            payload.request.inputs = _without_consumed_reference_media(
+                payload.request.inputs
+            )
+            return payload
 
         raw_refs = inputs.get("references")
         if raw_refs and isinstance(raw_refs, list):
@@ -415,8 +543,47 @@ def create_audio_encoder_executor(
     )
     speaker_cache = get_speaker_artifact_cache()
 
+    def _encode_one(waveform: torch.Tensor) -> list[list[int]]:
+        """Codec-encode one 24 kHz mono waveform → delayed code rows."""
+        ref_codes_TN = codec.encode_reference(waveform, sample_rate=24000).to(
+            torch.long
+        )
+        if ref_codes_TN.ndim != 2 or ref_codes_TN.shape[1] != num_codebooks:
+            raise ValueError(
+                f"codec output must be [T, {num_codebooks}], got "
+                f"{tuple(ref_codes_TN.shape)}"
+            )
+        return apply_delay_pattern(ref_codes_TN).tolist()
+
     def _encode(payload: StagePayload) -> StagePayload:
         state = HiggsTtsState.from_dict(payload.data)
+
+        # Voice fusion: encode each reference that preprocessing left as a raw
+        # waveform, delay it, and prebuild that sibling's prompt. Pre-encoded
+        # refs already carry ``codes_delayed`` + ``prompt_token_ids`` and pass
+        # through untouched. The request builder fans these out into N siblings.
+        if state.fusion_refs:
+            for ref in state.fusion_refs:
+                if ref.get("codes_delayed") is not None:
+                    continue
+                wav = ref.pop("waveform", None)
+                if wav is None:
+                    raise ValueError(
+                        "fusion ref has neither codes_delayed nor waveform"
+                    )
+                if not isinstance(wav, torch.Tensor):
+                    wav = torch.as_tensor(wav, dtype=torch.float32)
+                delayed_rows = _encode_one(wav)
+                ref["codes_delayed"] = delayed_rows
+                ref["prompt_token_ids"] = adapter.build_prompt(
+                    state.target_text or "",
+                    num_ref_tokens=len(delayed_rows),
+                    reference_text=ref.get("reference_text"),
+                )
+            state.target_text = None
+            payload.data = state.to_dict()
+            return payload
+
         waveform = state.reference_waveform
         if waveform is None:
             return payload
