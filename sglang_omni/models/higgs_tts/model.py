@@ -12,6 +12,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from torch import nn
 
+from sglang_omni.models.higgs_tts.fusion import (
+    fuse_group_generation_done,
+    fuse_group_logits,
+)
 from sglang_omni.models.higgs_tts.hf_config import HiggsMultimodalQwen3Config
 from sglang_omni.models.higgs_tts.modeling import (
     HiggsFusedMultiTextEmbedding,
@@ -45,6 +49,14 @@ class HiggsGenParams:
     temperature: float = 1.0
     top_p: float | None = None
     top_k: int | None = None
+    # Voice-fusion sibling grouping. ``fusion_group_id`` is ``None`` for a normal
+    # (single-reference) request; for a fusion request all N sibling rows share
+    # the same id and their output-distribution logits are weighted-averaged
+    # before sampling (see :meth:`HiggsTTSModel.decode_codebooks_batch`).
+    # ``fusion_weight`` is this row's blend weight (group weights are normalized
+    # to sum to 1 at fuse time).
+    fusion_group_id: str | None = None
+    fusion_weight: float = 1.0
 
 
 def _resolve_max_running_requests() -> int:
@@ -211,11 +223,61 @@ class HiggsTTSModel(nn.Module):
             pool_size, dtype=torch.long, device=cg_device
         )
 
+        # Voice-fusion shadow buffers. ``_cg_fusion_group`` holds, per batch
+        # slot, the *batch-local* group id used to blend sibling rows' output
+        # distributions in ``decode_codebooks_batch_cg``; ``_cg_fusion_weight``
+        # is the per-row blend weight. Default (filled each step by the runner):
+        # group id = own slot index, weight = 1.0 → the blend is a no-op, so
+        # non-fusion decoding is numerically unchanged.
+        self._cg_fusion_group = torch.arange(
+            pool_size, dtype=torch.long, device=cg_device
+        )
+        self._cg_fusion_weight = torch.ones(
+            pool_size, dtype=torch.float32, device=cg_device
+        )
+        # Engine-side fusion bookkeeping. ``_fusion_group_of[req_id]`` maps a
+        # sibling request id to its shared fusion group id; ``_fusion_weight_of``
+        # to its blend weight; ``_fusion_leader`` records which member emits
+        # audio. Populated by :meth:`set_fusion_group`.
+        self._fusion_group_of: dict[str, str] = {}
+        self._fusion_weight_of: dict[str, float] = {}
+        self._fusion_leader: dict[str, bool] = {}
+
     @property
     def language_model(self) -> Qwen3ForCausalLM:
         """Decoder handle for SGLang prefill-graph discovery; a property
         keeps the parameter tree free of a duplicate alias."""
         return self.backbone
+
+    def set_fusion_group(
+        self, req_id: str, group_id: str | None, weight: float, *, is_leader: bool
+    ) -> None:
+        """Register ``req_id`` as a member of voice-fusion group ``group_id``.
+
+        ``group_id is None`` clears any fusion membership (normal request).
+        Sibling rows sharing a ``group_id`` get their per-codebook output
+        distributions weighted-averaged before sampling; only the leader's
+        decoded codes are emitted as audio. Idempotent.
+        """
+        if group_id is None:
+            self._fusion_group_of.pop(req_id, None)
+            self._fusion_weight_of.pop(req_id, None)
+            self._fusion_leader.pop(req_id, None)
+            return
+        self._fusion_group_of[req_id] = group_id
+        self._fusion_weight_of[req_id] = float(weight)
+        self._fusion_leader[req_id] = bool(is_leader)
+
+    def is_fusion_leader(self, req_id: str) -> bool:
+        """True iff ``req_id`` is a fusion member and the group's output leader."""
+        return self._fusion_leader.get(req_id, True)
+
+    def is_fusion_follower(self, req_id: str) -> bool:
+        """True iff ``req_id`` is a fusion member that is NOT the leader (its
+        decoded codes duplicate the leader's and must not be emitted)."""
+        return req_id in self._fusion_group_of and not self._fusion_leader.get(
+            req_id, True
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -272,6 +334,7 @@ class HiggsTTSModel(nn.Module):
         if row is not None:
             self._free_rows.append(row)
         self._output_codes.pop(req_id, None)
+        self.set_fusion_group(req_id, None, 1.0, is_leader=True)
 
     def reset_request(self, req_id: str) -> None:
         self.release_row(req_id)
@@ -285,6 +348,38 @@ class HiggsTTSModel(nn.Module):
                 device=self.multimodal_embedding.modality_embedding_0.weight.device,
             )
         return torch.stack(codes, dim=0).to(torch.long)
+
+    def _batch_local_fusion(
+        self, gen_params: list[HiggsGenParams], device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Map per-row ``fusion_group_id`` to batch-local group indices.
+
+        Returns ``(group_B, weight_B, is_fused)``:
+        - ``group_B`` ``[B]`` long: rows sharing a fusion id get the same index;
+          unfused rows are their own singleton group (index = own row). The
+          indices are batch-local (in ``[0, B)``) so they can drive the
+          ``scatter_add_`` blend directly.
+        - ``weight_B`` ``[B]`` float: per-row blend weight (1.0 when unfused).
+        - ``is_fused``: ``False`` when no row carries a fusion id, letting the
+          caller skip the blend entirely.
+        """
+        B = len(gen_params)
+        group = list(range(B))
+        weight = [1.0] * B
+        seen: dict[str, int] = {}
+        is_fused = False
+        for b, p in enumerate(gen_params):
+            gid = p.fusion_group_id
+            if gid is None:
+                continue
+            is_fused = True
+            if gid not in seen:
+                seen[gid] = b  # first member's row index anchors the group
+            group[b] = seen[gid]
+            weight[b] = p.fusion_weight
+        group_B = torch.tensor(group, dtype=torch.long, device=device)
+        weight_B = torch.tensor(weight, dtype=torch.float32, device=device)
+        return group_B, weight_B, is_fused
 
     @torch.no_grad()
     def decode_codebooks_batch(
@@ -335,6 +430,18 @@ class HiggsTTSModel(nn.Module):
             device=device,
         )
 
+        # Voice fusion (eager path, mirrors decode_codebooks_batch_cg). Map each
+        # row's ``fusion_group_id`` to a batch-local group index; rows with no
+        # fusion id form singleton groups (identity blend). The blended log-probs
+        # then replace the raw logits and temperature is folded in, so the
+        # sampler runs at temperature 1.
+        group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
+        if is_fused:
+            logits_BNV = fuse_group_logits(
+                logits_BNV, group_B, weight_B, temperature_B=temperature
+            )
+            temperature = torch.ones_like(temperature)
+
         was_done = self._sampler_pool.generation_done[row_indices].clone()
 
         codes_BN = batched_step(
@@ -346,11 +453,23 @@ class HiggsTTSModel(nn.Module):
             top_k_buf=top_k_buf,
         )
 
+        if is_fused:
+            # Group barrier: sync generation_done across siblings, then persist
+            # it back into the pool so the scheduler ends the group together.
+            synced_done = fuse_group_generation_done(
+                self._sampler_pool.generation_done[row_indices], group_B
+            )
+            self._sampler_pool.generation_done[row_indices] = synced_done
+
         # Note(yichi): One D2H per step to skip STOP-sentinel rows in the Python append loop.
         was_done_cpu = was_done.cpu().tolist()
         codes_BN = codes_BN.detach().to(torch.long)
         for b in range(batch_size):
             if was_done_cpu[b]:
+                continue
+            # Fusion followers' codes duplicate the leader's; don't accumulate
+            # them (only the leader is decoded to audio).
+            if self.is_fusion_follower(req_ids[b]):
                 continue
             self._output_codes.setdefault(req_ids[b], []).append(codes_BN[b])
 
@@ -376,6 +495,21 @@ class HiggsTTSModel(nn.Module):
         top_p = self._cg_top_p[:batch_size]
         top_k_buf = self._cg_top_k_buf[:batch_size]
 
+        # Voice fusion: blend sibling rows' output distributions before sampling.
+        # ``_cg_fusion_group``/``_cg_fusion_weight`` default to singleton groups
+        # (group = own slot, weight = 1), making this a numerical no-op for
+        # non-fusion batches. Returns log-probs that feed the sampler as logits;
+        # the shared seed (set equal across siblings by the runner) then draws
+        # the same frame for every group member.
+        fusion_group_B = self._cg_fusion_group[:batch_size]
+        fusion_weight_B = self._cg_fusion_weight[:batch_size]
+        logits_BNV = fuse_group_logits(
+            logits_BNV,
+            fusion_group_B,
+            fusion_weight_B,
+            temperature_B=temperature,
+        )
+
         delay_count_B = self._cg_active_delay_count[:batch_size].to(torch.long)
         eoc_countdown_B = self._cg_active_eoc_countdown[:batch_size].to(torch.long)
         generation_done_B = self._cg_active_generation_done[:batch_size]
@@ -384,6 +518,10 @@ class HiggsTTSModel(nn.Module):
         step_count_B = self._cg_active_step_count[:batch_size]
 
         self._cg_was_done[:batch_size] = generation_done_B
+
+        # ``fuse_group_logits`` already applied temperature; pass temperature=1
+        # so the sampler doesn't divide the blended log-probs a second time.
+        sampler_temperature = torch.ones_like(temperature)
 
         (
             codes_BN,
@@ -398,11 +536,17 @@ class HiggsTTSModel(nn.Module):
             eoc_countdown_B,
             generation_done_B,
             last_codes_BN_in,
-            temperature=temperature,
+            temperature=sampler_temperature,
             top_p=top_p,
             top_k_buf=top_k_buf,
             seeds=seeds_B,
             step_count=step_count_B,
+        )
+        # Group barrier: any sibling reaching EOC ends the whole group on the
+        # same step, so the N KV contexts never desynchronize. No-op for
+        # singleton groups.
+        new_generation_done_B = fuse_group_generation_done(
+            new_generation_done_B, fusion_group_B
         )
         self._cg_active_step_count[:batch_size] = new_step_count_B
         self._cg_active_delay_count[:batch_size] = new_delay_count_B.to(

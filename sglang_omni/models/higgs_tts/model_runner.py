@@ -279,6 +279,39 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_active_seeds[:bs] = pool.seeds[rows_t]
         model._cg_active_step_count[:bs] = pool.step_count[rows_t]
 
+        self._populate_fusion_buffers(requests, bs, n_real)
+
+    def _populate_fusion_buffers(self, requests, bs: int, n_real: int) -> None:
+        """Fill the model's voice-fusion CG buffers for one decode step.
+
+        Maps each real row's ``fusion_group_id`` to a *batch-local* group index
+        (the row index of the group's first member, always in ``[0, n_real)``)
+        and its blend weight; rows with no fusion id — and all padding rows —
+        become singleton groups (group = own slot, weight = 1.0), which makes
+        :func:`fusion.fuse_group_logits` an identity no-op. Resetting every slot
+        each step prevents a stale group id from a prior (larger) batch leaking
+        an out-of-range scatter index into the captured graph.
+        """
+        model = self.model
+        group = list(range(bs))  # default: every slot its own singleton group
+        weight = [1.0] * bs
+        seen: dict[str, int] = {}
+        for b, req in enumerate(requests[:n_real]):
+            rid = req.request_id
+            gid = model._fusion_group_of.get(rid)
+            if gid is None:
+                continue
+            if gid not in seen:
+                seen[gid] = b  # first member's row anchors the batch-local id
+            group[b] = seen[gid]
+            weight[b] = model._fusion_weight_of.get(rid, 1.0)
+        model._cg_fusion_group[:bs] = torch.tensor(
+            group, dtype=torch.long, device=model._cg_fusion_group.device
+        )
+        model._cg_fusion_weight[:bs] = torch.tensor(
+            weight, dtype=torch.float32, device=model._cg_fusion_weight.device
+        )
+
     @staticmethod
     def _extract_decode_sampling_params(requests):
         """Read per-row sampling parameters from request-side host state.
@@ -393,6 +426,13 @@ class HiggsTTSModelRunner(ModelRunner):
             if was_done_cpu[b]:
                 cb0_per_row.append(0)
                 continue
+            # Voice-fusion followers decode the same frame as their group leader
+            # (shared fused distribution + shared seed); only the leader is
+            # emitted as audio. Skip followers so their duplicate codes are
+            # neither appended nor streamed to the vocoder.
+            if self.model.is_fusion_follower(sched_req.request_id):
+                cb0_per_row.append(0)
+                continue
             codes_N = self._append_output_code(data, codes_BN_cpu[b])
             if logprobs_cpu is not None and self._request_captures_rollout_logprobs(
                 sched_req
@@ -482,11 +522,15 @@ class HiggsTTSModelRunner(ModelRunner):
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
+            # Fusion followers carry no accumulated codes (decode_codebooks_batch
+            # skips their append); the ``not codes_log`` guard below already drops
+            # them, but check explicitly so intent is local to this loop.
             if (
                 req.inflight_middle_chunks > 0
                 or row is None
                 or not codes_log
                 or req.finished()
+                or model.is_fusion_follower(rid)
             ):
                 cb0_per_row.append(0)
                 continue
