@@ -63,6 +63,14 @@ def fuse_group_logits(
     group ``g``, with group weights renormalized to sum to 1. Because group
     membership is expressed purely through ``scatter_add_`` + advanced indexing,
     the op is shape-static and safe inside a captured CUDA graph.
+
+    Singleton-group rows (the entire non-fusion batch) are returned as
+    ``logits / temperature`` **unchanged** — bit-identical to what the sampler
+    would have received without fusion — rather than routed through
+    ``log(softmax(...))``, whose ``exp``/``log`` round-trip and ``_LOG_FLOOR``
+    would perturb the distribution tail. The singleton-vs-blended choice is a
+    per-row ``torch.where`` (tensor op, no host branch), so it stays
+    CUDA-Graph-safe in a mixed fusion/non-fusion batch.
     """
     if logits_BNV.ndim != 3:
         raise ValueError(f"logits_BNV must be [B, N, V], got {tuple(logits_BNV.shape)}")
@@ -78,10 +86,15 @@ def fuse_group_logits(
     gid = group_id_B.to(device=device, dtype=torch.long)
     w = weight_B.to(device=device, dtype=torch.float32)
 
-    # Per-group weight normalization: divide each row's weight by its group's
-    # total, so blended probabilities stay a valid distribution.
+    # Per-group member count + weight sum (both via scatter_add_, CG-safe).
+    ones = torch.ones(B, dtype=torch.float32, device=device)
+    group_count = torch.zeros(B, dtype=torch.float32, device=device)
+    group_count.scatter_add_(0, gid, ones)
     group_weight_sum = torch.zeros(B, dtype=torch.float32, device=device)
     group_weight_sum.scatter_add_(0, gid, w)
+
+    # Per-group weight normalization: divide each row's weight by its group's
+    # total, so blended probabilities stay a valid distribution.
     norm_w = w / group_weight_sum[gid].clamp_min(_LOG_FLOOR)  # [B]
 
     weighted = probs_BNV * norm_w.view(B, 1, 1)  # [B, N, V]
@@ -89,9 +102,16 @@ def fuse_group_logits(
     fused = torch.zeros_like(probs_BNV)
     fused.scatter_add_(0, idx, weighted)  # group g accumulates its members
 
-    # Broadcast each group's fused distribution back onto all its member rows.
+    # Broadcast each group's fused distribution back onto all its member rows,
+    # then take log so the result feeds the sampler as logits.
     fused_BNV = fused.index_select(0, gid)
-    return (fused_BNV + _LOG_FLOOR).log()
+    blended_logits = (fused_BNV + _LOG_FLOOR).log()
+
+    # Rows in a real (size > 1) group get the blended log-probs; singleton rows
+    # keep their exact (temperature-scaled) logits so non-fusion decoding is
+    # bit-identical to baseline. Per-row select — no host branch.
+    is_grouped = (group_count.index_select(0, gid) > 1.5).view(B, 1, 1)
+    return torch.where(is_grouped, blended_logits, logits)
 
 
 def fuse_group_generation_done(

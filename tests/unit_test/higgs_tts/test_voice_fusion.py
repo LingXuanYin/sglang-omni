@@ -30,6 +30,44 @@ def test_singleton_is_sampling_identity():
     torch.testing.assert_close(out.softmax(-1), logits.float().softmax(-1), atol=1e-5, rtol=1e-4)
 
 
+def test_singleton_is_byte_identical_to_scaled_logits():
+    """Bug-C guard: a singleton row returns logits/T *exactly* (byte-identical),
+    so a mixed batch's non-fusion rows are unchanged vs. the no-fusion baseline.
+
+    The sampler consumes the returned tensor as logits at temperature 1, i.e.
+    ``softmax(out / 1)``. For a singleton the contract is ``out == logits / T``
+    bit-for-bit, not merely sample-equivalent.
+    """
+    torch.manual_seed(7)
+    B, N, V = 3, 8, 1026
+    logits = torch.randn(B, N, V)
+    gid, w = _singleton_groups(B)
+    # temperature == 1: out must equal the raw logits exactly.
+    out1 = fuse_group_logits(logits, gid, w, temperature_B=torch.ones(B))
+    assert torch.equal(out1, logits.float())
+    # arbitrary per-row temperature: out must equal logits / T exactly.
+    temp = torch.tensor([0.7, 1.0, 1.5])
+    out2 = fuse_group_logits(logits, gid, w, temperature_B=temp)
+    assert torch.equal(out2, logits.float() / temp.view(B, 1, 1))
+
+
+def test_mixed_batch_singleton_rows_byte_identical():
+    """In a batch mixing a fused group with singletons, the singleton rows are
+    byte-identical to logits/T while the fused rows blend (Bug-C contract)."""
+    torch.manual_seed(8)
+    N, V = 8, 1026
+    logits = torch.randn(4, N, V)
+    gid = torch.tensor([0, 0, 2, 3], dtype=torch.long)  # rows 0,1 fused; 2,3 alone
+    w = torch.tensor([0.5, 0.5, 1.0, 1.0], dtype=torch.float32)
+    temp = torch.tensor([1.0, 1.0, 0.8, 1.3])
+    out = fuse_group_logits(logits, gid, w, temperature_B=temp)
+    # singleton rows: exact logits/T
+    assert torch.equal(out[2], logits[2].float() / 0.8)
+    assert torch.equal(out[3], logits[3].float() / 1.3)
+    # fused rows: blended (not equal to either raw row)
+    assert not torch.equal(out[0], logits[0].float())
+
+
 def test_two_member_equal_weight_is_prob_average():
     """A 2-row group at 0.5/0.5 yields the arithmetic mean of the two softmaxes."""
     torch.manual_seed(1)

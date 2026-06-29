@@ -80,3 +80,48 @@ fused_logits = (fused[group_id_B] + 1e-30).log()             # 广播回各行 �
    全部成员(即组被上游拆散/retract),**明确抛错而非静默产出未融合音频**。宁可整请求失败、可观测、可重试,
    也不交付错误结果。这把"上游不保证同批"从隐性正确性 bug 转成显式契约违例。
 3. PR 描述里把该约束列为已知限制,并建议上游加 fusion-group-aware 调度作为 follow-up。
+
+## 第三轮对抗审查(2026-06)— 致命问题,需架构调整
+
+全链路审查(顺数据流 7 文件)抓到的真实 bug,按严重度:
+
+### BUG A(致命,必中)— follower 永不 finished → 自己的 fail-loud 把整批炸了
+三个 collect 路径(`_decode_collect_host` / `_collect_step_outputs` / eager append loop)
+里 follower-skip 的 `continue` 放在了 `_mark_sampler_finished` **之前**。`_mark_sampler_finished`
+是 Higgs 路径上唯一设置 `Req.finished_reason` 的地方。后果链:
+leader EOC → 被上游移出 batch;follower 无 finished_reason → 滞留 →
+下一 decode step 组只剩 follower → `_populate_fusion_buffers` 的完整性检查
+`present(1) != expected(2)` → RuntimeError → `_handle_batch_failure` abort **整批**
+(含无关并发请求)。**每个正常完成的融合请求都会触发。** 是我自己的防御性断言被自己引爆。
+
+### BUG B(架构级)— 同批不变量不可强制,fail-loud 把常规调度决策变成致命错误
+完整性检查假设 N 个 sibling 每一步都同批。连续批处理引擎不保证:不等长参考 →
+prefill 时长不同 → 短的先进 decode、长的还在 prefill → present<expected → 崩 + 连累整批。
+"fail loud" 把一次普通调度决策升级成不可重试的致命错。共享 seed 锁步模型与引擎的
+独立行调度根本对抗。
+
+### BUG C(契约违反,静默)— CG 路径未 gate is_fused,污染所有非融合请求
+`decode_codebooks_batch_cg` 无条件调 `fuse_group_logits`(eager 路径有 `is_fused` gate)。
+单行组经 `log(softmax+1e-30)` 后分布尾部与 baseline 不再 byte 一致。违反"非融合请求行为
+完全不变"的契约。多被 top_k/top_p 掩盖,但仍是契约违反 + 每步额外 softmax+scatter+log。
+
+### BUG D — fusion registry 跨线程无锁
+`_fusion_group_of/_fusion_weight_of/_fusion_group_size` 由 build-executor 线程写、
+GPU-worker 线程每步读,无锁。registration/release 与 decode 交错时,完整性检查可能读到
+部分状态 → 虚假 "group split" 崩 / 错误 weight。概率性。
+
+### BUG F — _fusion_group_size 跨 retry 膨胀
+size 只在全部成员清除时才减。retry 复用 request_id → 同 gid;若上次因 A/B 中途崩、
+follower row 未释放 → 旧计数残留 → expected 永远偏大 → 该 gid 永久崩。与 A 复合。
+
+### 审查确认 OK 的部分
+- payload_types fusion_refs(含 torch.Tensor waveform)经 relay extract/restore_tensors 正确 round-trip
+- 共享 seed 同帧抽样(**前提是同批**)
+- batch-local group index 在 [0,B) 内,scatter_add_/index_select CG-safe
+- abort 级联无无限递归/双重清理
+
+### 根因
+"fail-loud 断言 + 共享 seed 锁步"与连续批处理引擎的独立行调度对抗。要真正生产级,
+co-batching 必须由调度器**强制保证**(把 sibling 钉在同一 batch + 同生同灭 retract),
+而非在 decode 时**断言**。这正是第二轮审查就指出、但当时选择了"fail-loud 兜底"的硬约束——
+事实证明 fail-loud 不是兜底,而是把问题从"静默错误"变成"必崩"。

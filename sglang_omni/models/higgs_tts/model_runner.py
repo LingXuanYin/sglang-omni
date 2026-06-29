@@ -293,34 +293,36 @@ class HiggsTTSModelRunner(ModelRunner):
         an out-of-range scatter index into the captured graph.
         """
         model = self.model
+        rids = [req.request_id for req in requests[:n_real]]
+        # One locked snapshot of membership for the whole step (Bug D): the
+        # decode thread sees a consistent view even if a register/clear races.
+        group_of, weight_of = model.fusion_membership_snapshot(rids)
+
         group = list(range(bs))  # default: every slot its own singleton group
         weight = [1.0] * bs
         seen: dict[str, int] = {}
-        for b, req in enumerate(requests[:n_real]):
-            rid = req.request_id
-            gid = model._fusion_group_of.get(rid)
+        present: dict[str, int] = {}
+        for b, rid in enumerate(rids):
+            gid = group_of.get(rid)
             if gid is None:
                 continue
             if gid not in seen:
                 seen[gid] = b  # first member's row anchors the batch-local id
             group[b] = seen[gid]
-            weight[b] = model._fusion_weight_of.get(rid, 1.0)
+            weight[b] = weight_of.get(rid, 1.0)
+            present[gid] = present.get(gid, 0) + 1
 
         # Fail loud if a fusion group is split across this decode step: every
         # registered member must be present in the batch, else the blend would
         # average an incomplete set of sibling distributions and silently emit
         # un-fused audio. A short count means the upstream engine scheduled the
         # group's rows apart (e.g. a KV-pressure retract dropped some members).
-        present: dict[str, int] = {}
-        for gid in (
-            model._fusion_group_of.get(req.request_id)
-            for req in requests[:n_real]
-        ):
-            if gid is not None:
-                present[gid] = present.get(gid, 0) + 1
+        # The scheduler's group-atomic admission (see OmniScheduler) is what
+        # keeps this from firing in normal operation; it remains as a last-resort
+        # guard converting a silent-wrong-output into an observable failure.
         for gid, n_present in present.items():
-            expected = model._fusion_group_size.get(gid)
-            if expected is not None and n_present != expected:
+            expected = model.expected_fusion_group_size(gid)
+            if expected and n_present != expected:
                 raise RuntimeError(
                     f"voice-fusion group {gid!r} split across a decode step: "
                     f"{n_present}/{expected} sibling rows present in the batch. "
@@ -452,9 +454,15 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             # Voice-fusion followers decode the same frame as their group leader
             # (shared fused distribution + shared seed); only the leader is
-            # emitted as audio. Skip followers so their duplicate codes are
-            # neither appended nor streamed to the vocoder.
+            # emitted as audio. A follower must STILL be marked finished on the
+            # step its synced ``generation_done`` flips (the group barrier flips
+            # all members together) — otherwise the leader retires from the batch
+            # while the follower lingers, the group "splits", and the next-step
+            # completeness check would abort the batch. So bridge its finish but
+            # skip the append + vocoder emit (its codes duplicate the leader's).
             if self.model.is_fusion_follower(sched_req.request_id):
+                data.generation_done = bool(gen_done_after_cpu[b])
+                self._mark_sampler_finished(req, data.generation_done)
                 cb0_per_row.append(0)
                 continue
             codes_N = self._append_output_code(data, codes_BN_cpu[b])
@@ -546,15 +554,22 @@ class HiggsTTSModelRunner(ModelRunner):
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
-            # Fusion followers carry no accumulated codes (decode_codebooks_batch
-            # skips their append); the ``not codes_log`` guard below already drops
-            # them, but check explicitly so intent is local to this loop.
+            # Fusion follower: its decoded frame duplicates the leader's and must
+            # not be emitted, but it MUST still be bridged to a finish state on
+            # the same step its (barrier-synced) pool generation_done flips —
+            # otherwise the follower lingers in the batch after the leader
+            # retires and the next step sees a "split" group (see Bug A). Mark
+            # finished from the pool flag, then skip append/emit.
+            if row is not None and model.is_fusion_follower(rid):
+                gen_done = bool(model._sampler_pool.generation_done[row].item())
+                self._mark_sampler_finished(req, gen_done)
+                cb0_per_row.append(0)
+                continue
             if (
                 req.inflight_middle_chunks > 0
                 or row is None
                 or not codes_log
                 or req.finished()
-                or model.is_fusion_follower(rid)
             ):
                 cb0_per_row.append(0)
                 continue

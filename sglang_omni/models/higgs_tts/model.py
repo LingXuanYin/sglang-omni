@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -239,14 +240,18 @@ class HiggsTTSModel(nn.Module):
         # sibling request id to its shared fusion group id; ``_fusion_weight_of``
         # to its blend weight; ``_fusion_leader`` records which member emits
         # audio. Populated by :meth:`set_fusion_group`.
+        #
+        # These dicts are written by the scheduler's request-build thread
+        # (set_fusion_group) and read every decode step by the GPU-worker thread
+        # (_batch_local_fusion / is_fusion_follower / the runner's CG populate).
+        # ``_fusion_lock`` guards every access so a decode step can never observe
+        # a half-registered group (which would otherwise spuriously trip the
+        # group-completeness check). The lock is held only for cheap dict ops,
+        # never across the GPU forward.
+        self._fusion_lock = threading.Lock()
         self._fusion_group_of: dict[str, str] = {}
         self._fusion_weight_of: dict[str, float] = {}
         self._fusion_leader: dict[str, bool] = {}
-        # Expected member count per fusion group id, set at registration. The
-        # decode reduction checks the per-step batch contains all members; a
-        # short count means the upstream scheduler split the group (e.g. KV
-        # retract) and we fail loud rather than emit silently un-fused audio.
-        self._fusion_group_size: dict[str, int] = {}
 
     @property
     def language_model(self) -> Qwen3ForCausalLM:
@@ -262,38 +267,62 @@ class HiggsTTSModel(nn.Module):
         ``group_id is None`` clears any fusion membership (normal request).
         Sibling rows sharing a ``group_id`` get their per-codebook output
         distributions weighted-averaged before sampling; only the leader's
-        decoded codes are emitted as audio. Idempotent.
+        decoded codes are emitted as audio. Idempotent: re-registering the same
+        ``req_id`` overwrites in place (no double-counting), so a retry that
+        reuses a request id can't inflate the group.
         """
-        if group_id is None:
-            old = self._fusion_group_of.pop(req_id, None)
-            self._fusion_weight_of.pop(req_id, None)
-            self._fusion_leader.pop(req_id, None)
-            if old is not None:
-                # Drop the size entry once every member of the group has cleared.
-                remaining = sum(1 for g in self._fusion_group_of.values() if g == old)
-                if remaining == 0:
-                    self._fusion_group_size.pop(old, None)
-            return
-        self._fusion_group_of[req_id] = group_id
-        self._fusion_weight_of[req_id] = float(weight)
-        self._fusion_leader[req_id] = bool(is_leader)
-        # Track the expected member count so the decode-time reduction can
-        # fail loud if the upstream scheduler ever splits a group across steps
-        # (see fuse-group barrier; a partial group would silently un-fuse).
-        self._fusion_group_size[group_id] = (
-            self._fusion_group_size.get(group_id, 0) + 1
-        )
+        with self._fusion_lock:
+            if group_id is None:
+                self._fusion_group_of.pop(req_id, None)
+                self._fusion_weight_of.pop(req_id, None)
+                self._fusion_leader.pop(req_id, None)
+                return
+            self._fusion_group_of[req_id] = group_id
+            self._fusion_weight_of[req_id] = float(weight)
+            self._fusion_leader[req_id] = bool(is_leader)
+
+    def expected_fusion_group_size(self, group_id: str) -> int:
+        """Number of currently-registered members of ``group_id`` (0 if none).
+
+        Derived live from membership (not a separate counter) so it can never
+        drift out of sync with the actual registry on retries or partial
+        cleanup (Bug F): a reused request id overwrites its own entry rather
+        than incrementing a count.
+        """
+        with self._fusion_lock:
+            return sum(1 for g in self._fusion_group_of.values() if g == group_id)
+
+    def fusion_membership_snapshot(
+        self, req_ids: list[str]
+    ) -> tuple[dict[str, str], dict[str, float]]:
+        """Atomic snapshot of (group_id, weight) for the given req_ids.
+
+        Taken under the lock so a decode step sees a consistent view of every
+        row's membership even if a concurrent register/clear is in flight.
+        Returns ``(group_of, weight_of)`` restricted to req_ids that are fusion
+        members; non-members are absent from both dicts.
+        """
+        with self._fusion_lock:
+            group_of = {
+                r: self._fusion_group_of[r]
+                for r in req_ids
+                if r in self._fusion_group_of
+            }
+            weight_of = {r: self._fusion_weight_of.get(r, 1.0) for r in group_of}
+        return group_of, weight_of
 
     def is_fusion_leader(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member and the group's output leader."""
-        return self._fusion_leader.get(req_id, True)
+        with self._fusion_lock:
+            return self._fusion_leader.get(req_id, True)
 
     def is_fusion_follower(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member that is NOT the leader (its
         decoded codes duplicate the leader's and must not be emitted)."""
-        return req_id in self._fusion_group_of and not self._fusion_leader.get(
-            req_id, True
-        )
+        with self._fusion_lock:
+            return req_id in self._fusion_group_of and not self._fusion_leader.get(
+                req_id, True
+            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -401,8 +430,8 @@ class HiggsTTSModel(nn.Module):
         # set of sibling distributions and silently emit wrong (un-fused) audio;
         # better to fail the request — observable and retryable — than ship that.
         for gid, n_present in present.items():
-            expected = self._fusion_group_size.get(gid)
-            if expected is not None and n_present != expected:
+            expected = self.expected_fusion_group_size(gid)
+            if expected and n_present != expected:
                 raise RuntimeError(
                     f"voice-fusion group {gid!r} split across a decode step: "
                     f"{n_present}/{expected} sibling rows present in the batch. "
@@ -473,11 +502,14 @@ class HiggsTTSModel(nn.Module):
         # ``_gen_params_for_batch`` cannot know fusion membership (it only sees
         # ``sampling_info``, not req_ids), so backfill each row's group id +
         # weight here from the registry keyed by req_id. Non-fusion req_ids are
-        # absent from the maps → fields stay None/1.0 → singleton/identity.
+        # absent from the maps → fields stay None/1.0 → singleton/identity. One
+        # locked snapshot keeps the per-row view consistent with a concurrent
+        # register/clear on the build thread (Bug D).
+        group_of, weight_of = self.fusion_membership_snapshot(list(req_ids))
         for rid, p in zip(req_ids, gen_params):
-            p.fusion_group_id = self._fusion_group_of.get(rid)
+            p.fusion_group_id = group_of.get(rid)
             if p.fusion_group_id is not None:
-                p.fusion_weight = self._fusion_weight_of.get(rid, 1.0)
+                p.fusion_weight = weight_of.get(rid, 1.0)
 
         group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
         if is_fused:
