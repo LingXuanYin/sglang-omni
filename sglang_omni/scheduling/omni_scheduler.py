@@ -2438,6 +2438,16 @@ class OmniScheduler:
         batch.reqs = [req for req in reqs if req.rid not in defer_rids]
         if not batch.reqs:
             batch.batch_is_full = False
+        # The upstream PrefillAdder may already have allocated a req_pool_idx
+        # (and KV cache slots) for a deferred req before we pull it back out —
+        # it was in the batch upstream *chose*, after all. Release those
+        # resources explicitly (the same path ``_release_immediate_request_
+        # resources``/abort uses) before requeuing, so a repeatedly-deferred
+        # group can't leak pool slots across retries. ``_release_request_kv_
+        # cache`` is a no-op when nothing was allocated yet (idx is None), so
+        # this is safe whether or not the upstream adder got that far.
+        for req in deferred_reqs:
+            self._release_request_kv_cache(req)
         # Return deferred siblings to the front of the waiting queue so they are
         # retried next round (ahead of newer work) and the group coalesces fast.
         with self._request_admission_lock:

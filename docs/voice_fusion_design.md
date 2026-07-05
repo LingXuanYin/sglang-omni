@@ -155,8 +155,13 @@ co-batching 必须由调度器**强制保证**(把 sibling 钉在同一 batch + 
 - F:`expected_fusion_group_size` 实时从成员派生(不再单独累加计数),retry 复用 rid 不再泄漏。
 
 **已知待 Linux 实测验证项(本机 Windows 无法跑 sglang 引擎):**
-1. **KV 回收**:`get_next_batch_to_run` 把 deferred siblings 从 `batch.reqs` 移除并退回
-   waiting_queue 时,上游 `PrefillAdder` 已分配的 KV 是否自动回收?需在真实引擎确认无 KV 泄漏。
+1. **KV 回收(已按既有惯用法修复,仍需真实引擎验证)**:`get_next_batch_to_run` 摘除
+   deferred siblings 前,现在会对每个 sibling 调用 `_release_request_kv_cache`(与
+   `abort`/`_release_immediate_request_resources` 同一条路径,`req.req_pool_idx is None`
+   时是 no-op)。这消除了"事后摘除但从不释放"的确定性泄漏,但**没有在真实引擎上跑过"反复
+   触发部分组 defer"的压测**,不能确认 pool 计数在高频 defer 下确实归零、也不能确认在这个
+   调用时机(`_Upstream.get_next_batch_to_run` 返回之后)`release_kv_cache` 需要的其他状态
+   (tree_cache 簿记等)是否齐备。**这仍是阻塞上 mainline 前必须做的真实验证,不是"已解决"。**
 2. **死锁前提**:组原子准入假设 KV 总量 ≥ 一个组的 prefill 占用。若 `max_running_requests`
    或 KV 池太小容不下整组,组会被无限退回 → 死锁。部署须按"1 融合请求 = N 行"给 KV/并发计费。
 3. **prefill→decode 过渡**:全组同批 prefill 后是否同步进入 running_batch 首个 decode step
