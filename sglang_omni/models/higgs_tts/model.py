@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import threading
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -14,6 +13,7 @@ from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from torch import nn
 
 from sglang_omni.models.higgs_tts.fusion import (
+    FusionRegistry,
     fuse_group_generation_done,
     fuse_group_logits,
 )
@@ -236,22 +236,14 @@ class HiggsTTSModel(nn.Module):
         self._cg_fusion_weight = torch.ones(
             pool_size, dtype=torch.float32, device=cg_device
         )
-        # Engine-side fusion bookkeeping. ``_fusion_group_of[req_id]`` maps a
-        # sibling request id to its shared fusion group id; ``_fusion_weight_of``
-        # to its blend weight; ``_fusion_leader`` records which member emits
-        # audio. Populated by :meth:`set_fusion_group`.
-        #
-        # These dicts are written by the scheduler's request-build thread
-        # (set_fusion_group) and read every decode step by the GPU-worker thread
-        # (_batch_local_fusion / is_fusion_follower / the runner's CG populate).
-        # ``_fusion_lock`` guards every access so a decode step can never observe
-        # a half-registered group (which would otherwise spuriously trip the
-        # group-completeness check). The lock is held only for cheap dict ops,
-        # never across the GPU forward.
-        self._fusion_lock = threading.Lock()
-        self._fusion_group_of: dict[str, str] = {}
-        self._fusion_weight_of: dict[str, float] = {}
-        self._fusion_leader: dict[str, bool] = {}
+        # Engine-side fusion bookkeeping: which in-flight requests belong to
+        # which voice-fusion group, at what blend weight, and who the group's
+        # audio-emitting leader is. Written by the scheduler's request-build
+        # thread (set_fusion_group) and read every decode step by the
+        # GPU-worker thread (_batch_local_fusion / is_fusion_follower / the
+        # runner's CG populate). See ``FusionRegistry`` for the thread-safety
+        # contract this delegates to.
+        self._fusion_registry = FusionRegistry()
 
     @property
     def language_model(self) -> Qwen3ForCausalLM:
@@ -271,58 +263,40 @@ class HiggsTTSModel(nn.Module):
         ``req_id`` overwrites in place (no double-counting), so a retry that
         reuses a request id can't inflate the group.
         """
-        with self._fusion_lock:
-            if group_id is None:
-                self._fusion_group_of.pop(req_id, None)
-                self._fusion_weight_of.pop(req_id, None)
-                self._fusion_leader.pop(req_id, None)
-                return
-            self._fusion_group_of[req_id] = group_id
-            self._fusion_weight_of[req_id] = float(weight)
-            self._fusion_leader[req_id] = bool(is_leader)
+        self._fusion_registry.set(req_id, group_id, weight, is_leader=is_leader)
+
+    def has_any_fusion(self) -> bool:
+        """Lock-free, best-effort "is any fusion request registered right now".
+
+        For the overwhelmingly common non-fusion server, this lets the decode
+        hot path skip the fusion bookkeeping (buffer population, per-row
+        follower checks) entirely without ever taking the registry lock. See
+        ``FusionRegistry.has_any`` for the staleness tradeoff this makes.
+        """
+        return self._fusion_registry.has_any()
 
     def expected_fusion_group_size(self, group_id: str) -> int:
-        """Number of currently-registered members of ``group_id`` (0 if none).
-
-        Derived live from membership (not a separate counter) so it can never
-        drift out of sync with the actual registry on retries or partial
-        cleanup (Bug F): a reused request id overwrites its own entry rather
-        than incrementing a count.
-        """
-        with self._fusion_lock:
-            return sum(1 for g in self._fusion_group_of.values() if g == group_id)
+        """Number of currently-registered members of ``group_id`` (0 if none)."""
+        return self._fusion_registry.expected_size(group_id)
 
     def fusion_membership_snapshot(
         self, req_ids: list[str]
     ) -> tuple[dict[str, str], dict[str, float]]:
         """Atomic snapshot of (group_id, weight) for the given req_ids.
 
-        Taken under the lock so a decode step sees a consistent view of every
-        row's membership even if a concurrent register/clear is in flight.
         Returns ``(group_of, weight_of)`` restricted to req_ids that are fusion
         members; non-members are absent from both dicts.
         """
-        with self._fusion_lock:
-            group_of = {
-                r: self._fusion_group_of[r]
-                for r in req_ids
-                if r in self._fusion_group_of
-            }
-            weight_of = {r: self._fusion_weight_of.get(r, 1.0) for r in group_of}
-        return group_of, weight_of
+        return self._fusion_registry.snapshot(req_ids)
 
     def is_fusion_leader(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member and the group's output leader."""
-        with self._fusion_lock:
-            return self._fusion_leader.get(req_id, True)
+        return self._fusion_registry.is_leader(req_id)
 
     def is_fusion_follower(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member that is NOT the leader (its
         decoded codes duplicate the leader's and must not be emitted)."""
-        with self._fusion_lock:
-            return req_id in self._fusion_group_of and not self._fusion_leader.get(
-                req_id, True
-            )
+        return self._fusion_registry.is_follower(req_id)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
@@ -561,8 +535,11 @@ class HiggsTTSModel(nn.Module):
             if was_done_cpu[b]:
                 continue
             # Fusion followers' codes duplicate the leader's; don't accumulate
-            # them (only the leader is decoded to audio).
-            if self.is_fusion_follower(req_ids[b]):
+            # them (only the leader is decoded to audio). ``is_fused`` (this
+            # batch's own fan-out check, already computed above) gates the
+            # lock-guarded per-row lookup — no cost when this batch has no
+            # fusion rows at all.
+            if is_fused and self.is_fusion_follower(req_ids[b]):
                 continue
             self._output_codes.setdefault(req_ids[b], []).append(codes_BN[b])
 

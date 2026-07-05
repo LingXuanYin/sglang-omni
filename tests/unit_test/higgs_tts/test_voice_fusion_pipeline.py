@@ -8,13 +8,22 @@ torch venv. The pure-tensor blend math is covered separately by
 ``test_voice_fusion.py`` (no sglang import), which runs anywhere.
 """
 
+# ruff: noqa: E402 -- imports below the importorskip guards are intentional:
+# they must not run at all when sglang/torch aren't installed.
+
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("sglang")
 
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+from sglang_omni.models.higgs_tts.fusion import FusionRegistry
+from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import (
     build_fusion_sibling_requests,
@@ -27,11 +36,17 @@ from sglang_omni.models.higgs_tts.stages import _fusion_ref_entries
 # --------------------------------------------------------------------------- #
 def test_detect_requires_two_weighted_refs():
     # < 2 refs → not fusion
-    assert _fusion_ref_entries({"references": [{"audio_path": "a.wav", "weight": 1.0}]}) is None
+    assert (
+        _fusion_ref_entries({"references": [{"audio_path": "a.wav", "weight": 1.0}]})
+        is None
+    )
     # 2 refs but no weight → legacy single-ref path, not fusion
-    assert _fusion_ref_entries(
-        {"references": [{"audio_path": "a.wav"}, {"audio_path": "b.wav"}]}
-    ) is None
+    assert (
+        _fusion_ref_entries(
+            {"references": [{"audio_path": "a.wav"}, {"audio_path": "b.wav"}]}
+        )
+        is None
+    )
 
 
 def test_detect_two_weighted_refs():
@@ -151,3 +166,110 @@ def test_fanout_weights_preserved():
 def test_fanout_rejects_single_ref():
     with pytest.raises(ValueError, match=">= 2"):
         build_fusion_sibling_requests(_fusion_state(1), request_id="rid-u")
+
+
+# --------------------------------------------------------------------------- #
+# HiggsTTSModelRunner._populate_fusion_buffers — the decode-time
+# group-completeness guard (Linus-review BLOCKING-3: a group split mid-decode
+# by a KV-pressure retract must isolate just that group's present rows rather
+# than abort the whole batch). Constructed the same way as
+# test_async_decode_runner.py: bypass the heavy __init__ and stub only what
+# this method touches, backed by a real ``FusionRegistry`` so the registry
+# side of the interaction is exercised for real, not re-mocked.
+# --------------------------------------------------------------------------- #
+def _build_populate_buffers_runner(bs: int):
+    registry = FusionRegistry()
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._fusion_buffers_dirty = False
+    runner.model = SimpleNamespace(
+        has_any_fusion=registry.has_any,
+        fusion_membership_snapshot=registry.snapshot,
+        expected_fusion_group_size=registry.expected_size,
+        _cg_fusion_group=torch.arange(bs, dtype=torch.long),
+        _cg_fusion_weight=torch.ones(bs, dtype=torch.float32),
+    )
+    return runner, registry
+
+
+def _fake_requests(n: int):
+    """``n`` fake sched_req-like objects with default ids r0..r{n-1}; override
+    ``.request_id`` on the returned objects for custom ids."""
+    reqs = [SimpleNamespace(finished_reason=None) for _ in range(n)]
+    datas = [SimpleNamespace(req=reqs[i]) for i in range(n)]
+    requests = [SimpleNamespace(request_id=f"r{i}", data=datas[i]) for i in range(n)]
+    return requests, reqs
+
+
+def test_populate_buffers_no_fusion_registered_is_a_no_op():
+    """Zero fusion traffic ever registered: early-exits before touching the
+    registry at all (the MAJOR-4 hot-path guarantee)."""
+    runner, _registry = _build_populate_buffers_runner(3)
+    requests, reqs = _fake_requests(3)
+    runner._populate_fusion_buffers(requests, bs=3, n_real=3)
+    assert torch.equal(runner.model._cg_fusion_group, torch.arange(3))
+    assert torch.equal(runner.model._cg_fusion_weight, torch.ones(3))
+    assert all(r.finished_reason is None for r in reqs)
+    assert runner._fusion_buffers_dirty is False
+
+
+def test_populate_buffers_intact_group_blends():
+    """Both members of a 2-row group present → batch-local group id anchors
+    on the first member's row, weights carried through, no abort."""
+    runner, registry = _build_populate_buffers_runner(3)
+    requests, reqs = _fake_requests(3)
+    registry.set("r0", "gid-a", 0.6, is_leader=True)
+    registry.set("r1", "gid-a", 0.4, is_leader=False)
+    runner._populate_fusion_buffers(requests, bs=3, n_real=3)
+    assert runner.model._cg_fusion_group.tolist() == [0, 0, 2]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx([0.6, 0.4, 1.0])
+    assert all(r.finished_reason is None for r in reqs)
+    assert runner._fusion_buffers_dirty is True
+
+
+def test_populate_buffers_split_group_isolates_present_row_and_aborts():
+    """A group expecting 2 members but only 1 present this step (the sibling
+    was retracted) must: demote the present row to a standalone singleton (no
+    blend), abort its request, and leave an unrelated row in the same batch
+    untouched."""
+    runner, registry = _build_populate_buffers_runner(3)
+    requests, reqs = _fake_requests(2)
+    requests[1].request_id = "other"
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("sib1", "gid-a", 0.5, is_leader=False)  # absent from this batch
+    runner._populate_fusion_buffers(requests, bs=3, n_real=2)
+    assert runner.model._cg_fusion_group.tolist() == [0, 1, 2]  # r0 demoted to own slot
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx([1.0, 1.0, 1.0])
+    assert isinstance(reqs[0].finished_reason, FINISH_ABORT)
+    assert reqs[1].finished_reason is None  # unrelated row untouched
+
+
+def test_populate_buffers_never_overwrites_an_already_finished_request():
+    """A row already finished for another reason keeps that reason — the
+    split-group abort must not clobber a pre-existing finish."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, reqs = _fake_requests(1)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("sib1", "gid-a", 0.5, is_leader=False)
+    sentinel = object()
+    reqs[0].finished_reason = sentinel
+    runner._populate_fusion_buffers(requests, bs=2, n_real=1)
+    assert reqs[0].finished_reason is sentinel
+
+
+def test_populate_buffers_dirty_flag_resets_after_fusion_clears():
+    """Once every fusion member is cleared, the next call's scan finds
+    nothing to group — buffers reset to all-singleton and the dirty flag
+    drops, so the call after that takes the zero-cost early-exit again."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, _reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    runner._populate_fusion_buffers(requests, bs=2, n_real=2)
+    assert runner._fusion_buffers_dirty is True
+
+    registry.set("r0", None, 1.0, is_leader=True)
+    registry.set("r1", None, 1.0, is_leader=True)
+    runner._populate_fusion_buffers(requests, bs=2, n_real=2)
+    assert runner.model._cg_fusion_group.tolist() == [0, 1]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx([1.0, 1.0])
+    assert runner._fusion_buffers_dirty is False

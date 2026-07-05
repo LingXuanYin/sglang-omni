@@ -42,11 +42,113 @@ grouped rows get temperature folded away.
 
 from __future__ import annotations
 
+import threading
+
 import torch
 
 # Floor added before ``log`` so a zeroed fused-prob row can't produce ``-inf``
 # that poisons the downstream softmax. ~1e-30 is well below any real codec prob.
 _LOG_FLOOR = 1e-30
+
+
+class FusionRegistry:
+    """Thread-safe registry of which in-flight requests belong to which
+    voice-fusion group, at what blend weight, and whether they are the
+    group's audio-emitting leader.
+
+    Written by the scheduler's request-build thread (:meth:`set`) and read
+    every decode step by the GPU-worker thread (:meth:`is_follower`,
+    :meth:`expected_size`, ...). ``_lock`` guards every access so a decode
+    step can never observe a half-registered group (which would otherwise
+    spuriously trip a group-completeness check). The lock is held only for
+    cheap dict ops, never across a GPU forward.
+
+    Pure Python (no torch/sglang dependency) so it is unit-testable standalone
+    — see ``test_voice_fusion.py``.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._group_of: dict[str, str] = {}
+        self._weight_of: dict[str, float] = {}
+        self._leader: dict[str, bool] = {}
+        # Cheap, lock-free "is any fusion request live right now" signal for
+        # the hot (non-fusion) path: a server with zero fusion traffic must
+        # not pay a per-decode-step lock acquisition + dict-comprehension tax
+        # just to learn that, yes, it's still zero. Maintained under
+        # ``_lock`` (write side, cheap int increment/decrement) but read
+        # without it — a reader can observe a value that's one register/clear
+        # stale, which only means an all-singleton step occasionally still
+        # takes the (harmless, correct) fusion-aware path, never the reverse.
+        self._active_count = 0
+
+    def set(
+        self, req_id: str, group_id: str | None, weight: float, *, is_leader: bool
+    ) -> None:
+        """Register ``req_id`` as a member of voice-fusion group ``group_id``.
+
+        ``group_id is None`` clears any fusion membership (normal request).
+        Idempotent: re-registering the same ``req_id`` overwrites in place (no
+        double-counting), so a retry that reuses a request id can't inflate
+        the group.
+        """
+        with self._lock:
+            if group_id is None:
+                if self._group_of.pop(req_id, None) is not None:
+                    self._active_count -= 1
+                self._weight_of.pop(req_id, None)
+                self._leader.pop(req_id, None)
+                return
+            if req_id not in self._group_of:
+                self._active_count += 1
+            self._group_of[req_id] = group_id
+            self._weight_of[req_id] = float(weight)
+            self._leader[req_id] = bool(is_leader)
+
+    def has_any(self) -> bool:
+        """Lock-free, best-effort "is any fusion request registered right now".
+
+        For the overwhelmingly common non-fusion server, this lets the decode
+        hot path skip the fusion bookkeeping (buffer population, per-row
+        follower checks) entirely without ever taking the lock. See
+        ``_active_count``'s docstring for the staleness tradeoff this makes.
+        """
+        return self._active_count > 0
+
+    def expected_size(self, group_id: str) -> int:
+        """Number of currently-registered members of ``group_id`` (0 if none).
+
+        Derived live from membership (not a separate counter) so it can never
+        drift out of sync with the actual registry on retries or partial
+        cleanup: a reused request id overwrites its own entry rather than
+        incrementing a count.
+        """
+        with self._lock:
+            return sum(1 for g in self._group_of.values() if g == group_id)
+
+    def snapshot(self, req_ids: list[str]) -> tuple[dict[str, str], dict[str, float]]:
+        """Atomic snapshot of (group_id, weight) for the given req_ids.
+
+        Taken under the lock so a decode step sees a consistent view of every
+        row's membership even if a concurrent register/clear is in flight.
+        Returns ``(group_of, weight_of)`` restricted to req_ids that are
+        fusion members; non-members are absent from both dicts.
+        """
+        with self._lock:
+            group_of = {r: self._group_of[r] for r in req_ids if r in self._group_of}
+            weight_of = {r: self._weight_of.get(r, 1.0) for r in group_of}
+        return group_of, weight_of
+
+    def is_leader(self, req_id: str) -> bool:
+        """True iff ``req_id`` is a fusion member and the group's output leader."""
+        with self._lock:
+            return self._leader.get(req_id, True)
+
+    def is_follower(self, req_id: str) -> bool:
+        """True iff ``req_id`` is a fusion member that is NOT the leader (its
+        decoded codes duplicate the leader's and must not be emitted)."""
+        with self._lock:
+            return req_id in self._group_of and not self._leader.get(req_id, True)
 
 
 def fuse_group_logits(
@@ -145,7 +247,7 @@ def fuse_group_generation_done(
     generation_done_B: torch.Tensor,
     group_id_B: torch.Tensor,
 ) -> torch.Tensor:
-    """"Any sibling done ⇒ all done" group barrier.
+    """ "Any sibling done ⇒ all done" group barrier.
 
     Returns a ``[B]`` bool where a row is done iff *any* member of its fusion
     group is done. For singleton groups this is an identity. Keeping group

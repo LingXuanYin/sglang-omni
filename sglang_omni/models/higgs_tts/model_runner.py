@@ -64,6 +64,14 @@ class HiggsTTSModelRunner(ModelRunner):
         # composition is unchanged since the previous decode step.
         self._syncfree_launch: bool = _syncfree_launch_enabled()
         self._cg_launch_key: tuple | None = None
+        # True iff the model's ``_cg_fusion_group``/``_cg_fusion_weight``
+        # buffers currently hold any non-default (non-singleton) values from a
+        # past decode step. Lets ``_populate_fusion_buffers`` skip its dict
+        # scan + list build + host->device copy entirely once traffic goes
+        # back to all-singleton, instead of redoing (harmless but wasteful)
+        # identity writes forever after the first fusion request of a
+        # server's lifetime.
+        self._fusion_buffers_dirty = False
 
     def _next_logprob_host_staging(self, device_buf: torch.Tensor) -> torch.Tensor:
         return self._pinned_pingpong(
@@ -302,6 +310,15 @@ class HiggsTTSModelRunner(ModelRunner):
         of this decode batch.
         """
         model = self.model
+        if not model.has_any_fusion() and not self._fusion_buffers_dirty:
+            # Hot path: no fusion request has ever been registered (or the
+            # last one that was has fully cleared and its dirty writes were
+            # already reset to identity below). Skip the dict scan, list
+            # build, and host->device copies below entirely — the buffers
+            # already hold their singleton-default values from either
+            # __init__ or the previous call's reset.
+            return
+
         rids = [req.request_id for req in requests[:n_real]]
         # One locked snapshot of membership for the whole step (Bug D): the
         # decode thread sees a consistent view even if a register/clear races.
@@ -360,6 +377,13 @@ class HiggsTTSModelRunner(ModelRunner):
         model._cg_fusion_weight[:bs] = torch.tensor(
             weight, dtype=torch.float32, device=model._cg_fusion_weight.device
         )
+        # Record whether the buffer just written can still contain non-default
+        # (grouped) entries. If no fusion request is registered any more, this
+        # call's scan found nothing to group (every rid was absent from the
+        # registry snapshot), so ``group``/``weight`` above were left at their
+        # all-singleton defaults — the buffer write was a no-op clean reset,
+        # and the next call is safe to skip via the early-return above.
+        self._fusion_buffers_dirty = model.has_any_fusion()
 
     @staticmethod
     def _extract_decode_sampling_params(requests):
@@ -457,6 +481,10 @@ class HiggsTTSModelRunner(ModelRunner):
         was_done_cpu = combined_cpu[:, num_codebooks].bool().tolist()
         gen_done_after_cpu = combined_cpu[:, num_codebooks + 1].bool().tolist()
         cb0_per_row: list[int] = []
+        # Read once, outside the per-row loop: on a server with zero fusion
+        # traffic this is the only fusion-related work this hot loop does —
+        # no per-row ``is_fusion_follower`` (lock-guarded dict lookup) call.
+        any_fusion = model.has_any_fusion()
         for b, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
@@ -477,15 +505,10 @@ class HiggsTTSModelRunner(ModelRunner):
                 continue
             # Voice-fusion followers decode the same frame as their group leader
             # (shared fused distribution + shared seed); only the leader is
-            # emitted as audio. A follower must STILL be marked finished on the
-            # step its synced ``generation_done`` flips (the group barrier flips
-            # all members together) — otherwise the leader retires from the batch
-            # while the follower lingers, the group "splits", and the next-step
-            # completeness check would abort the batch. So bridge its finish but
-            # skip the append + vocoder emit (its codes duplicate the leader's).
-            if self.model.is_fusion_follower(sched_req.request_id):
-                data.generation_done = bool(gen_done_after_cpu[b])
-                self._mark_sampler_finished(req, data.generation_done)
+            # emitted as audio. See ``_finish_fusion_follower`` for why they
+            # still need bridging to a finish state here.
+            if any_fusion and self.model.is_fusion_follower(sched_req.request_id):
+                self._finish_fusion_follower(data, req, bool(gen_done_after_cpu[b]))
                 cb0_per_row.append(0)
                 continue
             codes_N = self._append_output_code(data, codes_BN_cpu[b])
@@ -571,21 +594,18 @@ class HiggsTTSModelRunner(ModelRunner):
         if self._should_capture_rollout_logprobs(requests):
             logprobs_BN = self._prefill_step_logprobs(result, requests, forward_batch)
         cb0_per_row: list[int] = []
+        any_fusion = model.has_any_fusion()
         for b, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
             rid = sched_req.request_id
             row = model._rid_to_row.get(rid)
             codes_log = model._output_codes.get(rid)
-            # Fusion follower: its decoded frame duplicates the leader's and must
-            # not be emitted, but it MUST still be bridged to a finish state on
-            # the same step its (barrier-synced) pool generation_done flips —
-            # otherwise the follower lingers in the batch after the leader
-            # retires and the next step sees a "split" group (see Bug A). Mark
-            # finished from the pool flag, then skip append/emit.
-            if row is not None and model.is_fusion_follower(rid):
+            # Fusion follower: see ``_finish_fusion_follower`` for why it's
+            # bridged to a finish state here despite never being emitted.
+            if row is not None and any_fusion and model.is_fusion_follower(rid):
                 gen_done = bool(model._sampler_pool.generation_done[row].item())
-                self._mark_sampler_finished(req, gen_done)
+                self._finish_fusion_follower(data, req, gen_done)
                 cb0_per_row.append(0)
                 continue
             if (
@@ -743,6 +763,23 @@ class HiggsTTSModelRunner(ModelRunner):
         except AttributeError:
             output_count = len(data.output_codes)
         return max_new_tokens > 0 and output_count >= max_new_tokens
+
+    def _finish_fusion_follower(
+        self, data: Any, req: Any, generation_done: bool
+    ) -> None:
+        """Bridge a voice-fusion follower row to a finish state without
+        emitting its (duplicate) codes.
+
+        A follower decodes the same frame as its group leader (shared fused
+        distribution + shared seed), so its codes must never be appended or
+        emitted to the vocoder. But it MUST still be marked finished on the
+        step its (barrier-synced) ``generation_done`` flips — the group
+        barrier flips all members together, so if the follower isn't bridged
+        here it lingers in the batch after the leader retires, the group
+        "splits", and the next step's completeness check aborts the batch.
+        """
+        data.generation_done = generation_done
+        self._mark_sampler_finished(req, generation_done)
 
     def _queue_or_emit_code_chunk(
         self, sched_req: Any, codes_N: torch.Tensor, *, force: bool = False
