@@ -513,10 +513,18 @@ class HiggsTTSModel(nn.Module):
 
         group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
         if is_fused:
-            logits_BNV = fuse_group_logits(
+            logits_BNV, is_grouped_B = fuse_group_logits(
                 logits_BNV, group_B, weight_B, temperature_B=temperature
             )
-            temperature = torch.ones_like(temperature)
+            # Grouped rows already had temperature folded into the blend, so
+            # they must sample at 1 (dividing again would double-apply it).
+            # Singleton rows (this batch may mix a fusion group with ordinary
+            # requests) keep their REAL temperature — folding every row to 1
+            # here would silently defeat those rows' greedy short-circuit in
+            # ``batched_step`` (see fusion.py's caller-contract docstring).
+            temperature = torch.where(
+                is_grouped_B, torch.ones_like(temperature), temperature
+            )
 
         was_done = self._sampler_pool.generation_done[row_indices].clone()
 
@@ -576,10 +584,13 @@ class HiggsTTSModel(nn.Module):
         # (group = own slot, weight = 1), making this a numerical no-op for
         # non-fusion batches. Returns log-probs that feed the sampler as logits;
         # the shared seed (set equal across siblings by the runner) then draws
-        # the same frame for every group member.
+        # the same frame for every group member. Always called unconditionally
+        # (no Python ``if`` on tensor values, per the CUDA-Graph capture
+        # constraint) — the per-row ``is_grouped_B`` mask it returns is what
+        # keeps this branchless while still being correct per row.
         fusion_group_B = self._cg_fusion_group[:batch_size]
         fusion_weight_B = self._cg_fusion_weight[:batch_size]
-        logits_BNV = fuse_group_logits(
+        logits_BNV, is_grouped_B = fuse_group_logits(
             logits_BNV,
             fusion_group_B,
             fusion_weight_B,
@@ -595,9 +606,18 @@ class HiggsTTSModel(nn.Module):
 
         self._cg_was_done[:batch_size] = generation_done_B
 
-        # ``fuse_group_logits`` already applied temperature; pass temperature=1
-        # so the sampler doesn't divide the blended log-probs a second time.
-        sampler_temperature = torch.ones_like(temperature)
+        # Grouped rows already had temperature folded into the blend (sample at
+        # 1 so the sampler doesn't divide it again); singleton rows — the
+        # entire non-fusion batch, by far the common case — MUST keep their
+        # real temperature so ``batched_step_direct``'s greedy short-circuit
+        # (``temperature <= _GREEDY_TEMP_THRESHOLD``) still fires for
+        # ``temperature=0`` requests. Folding every row to 1 unconditionally
+        # was the bug: it silently turned deterministic argmax decoding into a
+        # multinomial draw over a near-one-hot distribution for EVERY ordinary
+        # request, fusion or not, and burned RNG state doing it.
+        sampler_temperature = torch.where(
+            is_grouped_B, torch.ones_like(temperature), temperature
+        )
 
         (
             codes_BN,

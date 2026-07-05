@@ -12,14 +12,32 @@ This module holds the two pure, ``sgl_kernel``-free tensor ops that implement
 the blend, so they are unit-testable without the full sglang engine:
 
 - :func:`fuse_group_logits` — weighted probability average across group members,
-  returned as log-probs ready to feed the standard sampler.
+  returned as log-probs ready to feed the standard sampler, plus a per-row
+  ``is_grouped`` mask the caller MUST use to keep singleton rows sampling at
+  their real (unfolded) temperature — see the "greedy" warning below.
 - :func:`fuse_group_generation_done` — "any sibling done ⇒ all done" barrier so
   group members terminate on the same step.
 
 Both are CUDA-Graph friendly: fixed-shape ``scatter_add_`` / advanced-index ops,
 no host-side control flow. They are identity no-ops for the default case where
-every row is its own singleton group (``group_id[i] == i``, ``weight == 1``),
-so non-fusion decoding is numerically unchanged (argmax/multinomial-invariant).
+every row is its own singleton group (``group_id[i] == i``, ``weight == 1``).
+
+Caller contract — do not fold temperature into the sampler call unconditionally:
+``fuse_group_logits`` pre-applies ``temperature_B`` for grouped rows so the
+blend happens in the same temperature-scaled space the sampler will use, and
+the caller then samples the returned logits at ``temperature=1`` for those
+rows. But the sampler's greedy short-circuit (:func:`sampler._sample_independent`
+and its batched counterpart) is keyed on the *temperature it receives*, not on
+the logits — it decides ``temperature <= _GREEDY_TEMP_THRESHOLD`` before ever
+looking at the logits. If the caller passes ``temperature=1`` for EVERY row
+(grouped or not, as a blanket simplification), a plain non-fusion request with
+``temperature=0`` silently loses its argmax short-circuit: it becomes a
+``multinomial`` draw over a near-one-hot distribution instead of a
+deterministic ``argmax``, which both breaks determinism and burns global RNG
+state that a truly-greedy row was never supposed to touch. The returned
+``is_grouped`` mask is exactly what the caller needs to avoid this:
+singleton rows must keep sampling at their real ``temperature_B``, and only
+grouped rows get temperature folded away.
 """
 
 from __future__ import annotations
@@ -37,7 +55,7 @@ def fuse_group_logits(
     weight_B: torch.Tensor,
     *,
     temperature_B: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Blend per-codebook output distributions within each fusion group.
 
     Args:
@@ -55,9 +73,17 @@ def fuse_group_logits(
             use. ``None`` blends raw-logit softmax (temperature applied later).
 
     Returns:
-        ``[B, V]``-per-codebook log-probabilities, shape ``[B, N, V]``, where
-        every row carries its group's blended distribution. Feed these to the
-        existing sampler exactly as if they were logits.
+        ``(logits_out, is_grouped_B)``:
+
+        - ``logits_out``: ``[B, N, V]``, where every row carries its group's
+          blended distribution. Feed these to the existing sampler exactly as
+          if they were logits.
+        - ``is_grouped_B``: ``[B]`` bool, true for rows in a real (size > 1)
+          group. The caller MUST sample grouped rows at ``temperature=1`` (the
+          blend already applied ``temperature_B``) but sample singleton rows at
+          their **real** ``temperature_B`` — folding every row to 1
+          unconditionally defeats the sampler's greedy short-circuit for
+          ordinary (non-fusion) requests. See the module docstring.
 
     The blend is ``log(Σ_g w_i · softmax(logits_i))`` over members ``i`` of each
     group ``g``, with group weights renormalized to sum to 1. Because group
@@ -110,8 +136,9 @@ def fuse_group_logits(
     # Rows in a real (size > 1) group get the blended log-probs; singleton rows
     # keep their exact (temperature-scaled) logits so non-fusion decoding is
     # bit-identical to baseline. Per-row select — no host branch.
-    is_grouped = (group_count.index_select(0, gid) > 1.5).view(B, 1, 1)
-    return torch.where(is_grouped, blended_logits, logits)
+    is_grouped_B = group_count.index_select(0, gid) > 1.5
+    logits_out = torch.where(is_grouped_B.view(B, 1, 1), blended_logits, logits)
+    return logits_out, is_grouped_B
 
 
 def fuse_group_generation_done(
