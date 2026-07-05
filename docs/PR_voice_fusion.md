@@ -18,8 +18,10 @@ API (OpenAI-compatible `/v1/audio/speech`), backward compatible:
 }
 ```
 
-`>= 2` references each carrying a `weight` ⇒ fusion request. Anything else keeps the exact
-legacy single-voice behavior. Weights are ratios (need not sum to 1). `N > 2` supported.
+`>= 2` references, at least one carrying a `weight` ⇒ fusion request (the weight is what marks
+the intent to blend rather than the legacy "first ref wins" behavior — refs that omit it default
+to weight `1.0`). Anything else keeps the exact legacy single-voice behavior. Weights are ratios
+(need not sum to 1). `N > 2` supported.
 
 ## How it works
 

@@ -1191,16 +1191,25 @@ class OmniScheduler:
         req = req_data.req
         self._normalize_req_token_arrays(req)
         req_id = req.rid
+        # A fusion sibling's own rid is a synthetic ``{request_id}#fuseN`` the
+        # client never sees (only the leader's ``payload.request_id`` is what
+        # it's actually listening for) — report admission failures against
+        # that, not the sibling's internal rid, or the error message goes to
+        # a routing key nobody is subscribed to and the client just hangs.
+        # ``self.abort(req_id)`` still targets the sibling's real rid, which
+        # correctly cascades to the rest of the group via
+        # ``_fusion_group_members``.
+        client_facing_id = payload.request_id
         if req_data.enforce_request_limits:
             error_msg = self._prepare_request_limits(req_data)
             if error_msg:
-                self._emit_request_error(req_id, ValueError(error_msg))
+                self._emit_request_error(client_facing_id, ValueError(error_msg))
                 self.abort(req_id)
                 return
         kv_error = self._request_kv_capacity_error(req)
         if kv_error is not None:
             logger.warning(f"Rejecting request {req_id} before scheduling: {kv_error}")
-            self._emit_request_error(req_id, ValueError(kv_error))
+            self._emit_request_error(client_facing_id, ValueError(kv_error))
             self.abort(req_id)
             return
         self._initialize_request_stream_state(req_data, payload)
@@ -1667,7 +1676,7 @@ class OmniScheduler:
             ):
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
-                self._fusion_group_members.pop(rid, None)
+                self._cascade_abort_split_fusion_group(rid, req)
                 if self._abort_callback is not None:
                     self._abort_callback(rid)
                 continue
@@ -1729,10 +1738,11 @@ class OmniScheduler:
 
             self._first_emit_done.discard(rid)
             self._prefill_start_done.discard(rid)
-            # Fusion leader finished: drop the group membership registry entry so
-            # it can't leak (followers were already released above). No-op for
-            # ordinary requests, which never registered a group.
-            self._fusion_group_members.pop(rid, None)
+            # Fusion leader finished: drop the group membership registry entry
+            # (and cascade-abort any sibling left behind by a split — see
+            # ``_cascade_abort_split_fusion_group``). No-op for ordinary
+            # requests, which never registered a group.
+            self._cascade_abort_split_fusion_group(rid, req)
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
@@ -1740,6 +1750,48 @@ class OmniScheduler:
                     data=result,
                 )
             )
+
+    def _cascade_abort_split_fusion_group(self, rid: str, req: Any) -> None:
+        """Drop ``rid``'s fusion-group membership entry; if it finished via an
+        explicit abort while other members are still registered, abort them
+        too so they don't become zombies.
+
+        A fusion group finishing normally always does so together: the shared
+        done-barrier flips every member's ``generation_done`` on the same
+        decode step, so every member shows up in the same ``stream_output``
+        call with an ordinary ``FINISH_MATCHED_TOKEN`` — no other member is
+        still registered by the time this runs for any of them.
+        ``FINISH_ABORT`` is different: it's what
+        ``HiggsTTSModelRunner._populate_fusion_buffers`` sets on a group's
+        *present* rows when a KV-pressure retract splits the group mid-decode
+        (see BLOCKING-3). The *absent* (retracted) sibling is untouched by
+        that isolation and, left alone, would eventually either re-prefill
+        and decode by itself as a silently un-fused single-reference request,
+        or — if something else still references the frozen group set — sit
+        in ``waiting_queue`` forever. Cascading through ``abort()`` (which
+        already knows how to pull a request out of ``waiting_queue`` as well
+        as a running batch) avoids both.
+        """
+        group = self._fusion_group_members.pop(rid, None)
+        if group is None or not isinstance(req.finished_reason, FINISH_ABORT):
+            return
+        # Pop every other member's entry ourselves, before calling abort() on
+        # any of them: abort() has its own group-cascade keyed off this same
+        # dict, and if a member's entry were still present when we call
+        # abort(member_id), that cascade would recurse back into aborting
+        # `rid` a second time — `rid` already went through the normal finish
+        # path above (built its result, emitted to the outbox), not abort(),
+        # so a second, generic abort() pass over it would redundantly re-run
+        # resource release it already went through.
+        others = [m for m in group if m != rid]
+        for member_id in others:
+            self._fusion_group_members.pop(member_id, None)
+        for member_id in others:
+            self.abort(member_id)
+
+    def send_to_tokenizer(self):
+        """No-op — results are routed through the stage outbox."""
+        return None
 
     def _on_stream_chunk(self, request_id: str, chunk: Any) -> None:
         if request_id in self._completed_request_ids:
@@ -1830,9 +1882,7 @@ class OmniScheduler:
                 self._fusion_group_members.pop(member_id, None)
             for member_id in group:
                 if member_id != request_id:
-                    self.abort(
-                        member_id, defer_running_cleanup=defer_running_cleanup
-                    )
+                    self.abort(member_id, defer_running_cleanup=defer_running_cleanup)
 
         with self._request_admission_lock:
             if request_id not in self._aborted_request_ids:
@@ -2393,21 +2443,35 @@ class OmniScheduler:
         )
 
     def get_next_batch_to_run(self):
-        """Upstream batch selection + voice-fusion group-atomic prefill admission.
+        """Upstream batch selection, plus voice-fusion split-group visibility.
 
-        Delegates to the upstream SGLang scheduler, then enforces that a fusion
-        group's sibling rows are prefilled together: if the chosen *prefill*
-        batch contains only some members of a fusion group, the present members
-        are deferred back to the waiting queue so the whole group enters on a
-        later step as one unit. This is what keeps the decode-time group-
-        completeness guard (see HiggsTTSModel) from ever firing in normal
-        operation — siblings reach the running batch together and then, kept in
-        lock-step by the shared seed + done-barrier, retire together.
+        An earlier version of this override tried to enforce group-atomic
+        prefill admission here: if a chosen prefill batch contained only some
+        members of a fusion group, it trimmed ``batch.reqs`` down to the
+        present members and requeued the rest. That is unsound and was
+        removed. By the time upstream's ``get_next_batch_to_run`` returns a
+        prefill batch, ``ScheduleBatch.prepare_for_extend`` has already
+        flattened every req's tokens/KV slots/positions into batch-wide
+        tensors (``input_ids``, ``seq_lens``, ``out_cache_loc``, ...) sized to
+        the FULL original ``batch.reqs``. Trimming ``batch.reqs`` afterward
+        desyncs those tensors from the now-shorter req list and corrupts the
+        batch for *every* request in it, fusion or not — there is no
+        supported way to shrink an already-prepared extend batch (upstream's
+        own ``filter_batch`` is a decode-batch tool; it never touches extend
+        tensors).
 
-        Decode batches are passed through untouched (membership only needs to be
-        established once, at prefill; the done-barrier handles co-retirement).
-        Non-fusion batches are likewise untouched: ``_fusion_group_members`` is
-        empty, so the scan is a cheap no-op on the hot path.
+        Correctness for a split group is instead enforced entirely at decode
+        time: ``HiggsTTSModelRunner._populate_fusion_buffers`` isolates a
+        group's present rows (demotes them to singletons, aborts them)
+        instead of blending an incomplete set, and ``stream_output``'s
+        cascade-abort kills the rest of the group when one member finishes via
+        that explicit abort, so a sibling stranded on the other side of a
+        split never lingers in ``waiting_queue`` forever.
+
+        This method stays read-only: it only logs when a fusion group lands
+        partially in a prefill batch, for visibility into how often that
+        happens. Non-fusion batches are untouched: ``_fusion_group_members``
+        is empty, so the scan is a cheap no-op on the hot path.
         """
         batch = _Upstream.get_next_batch_to_run(self)
         if batch is None or not self._fusion_group_members:
@@ -2416,7 +2480,6 @@ class OmniScheduler:
         if not reqs or self._batch_is_decode(batch):
             return batch
 
-        # Prefill batch: find fusion groups that are only partially present.
         present_by_group: dict[frozenset, set[str]] = {}
         for req in reqs:
             members = self._fusion_group_members.get(req.rid)
@@ -2424,41 +2487,18 @@ class OmniScheduler:
                 continue
             present_by_group.setdefault(frozenset(members), set()).add(req.rid)
 
-        defer_rids: set[str] = set()
         for members, present in present_by_group.items():
             if present != set(members):
-                # Partial group in this prefill batch → defer the present
-                # members; the whole group will be admitted together once the
-                # engine can prefill all of them in one batch.
-                defer_rids |= present
-        if not defer_rids:
-            return batch
-
-        deferred_reqs = [req for req in reqs if req.rid in defer_rids]
-        batch.reqs = [req for req in reqs if req.rid not in defer_rids]
-        if not batch.reqs:
-            batch.batch_is_full = False
-        # The upstream PrefillAdder may already have allocated a req_pool_idx
-        # (and KV cache slots) for a deferred req before we pull it back out —
-        # it was in the batch upstream *chose*, after all. Release those
-        # resources explicitly (the same path ``_release_immediate_request_
-        # resources``/abort uses) before requeuing, so a repeatedly-deferred
-        # group can't leak pool slots across retries. ``_release_request_kv_
-        # cache`` is a no-op when nothing was allocated yet (idx is None), so
-        # this is safe whether or not the upstream adder got that far.
-        for req in deferred_reqs:
-            self._release_request_kv_cache(req)
-        # Return deferred siblings to the front of the waiting queue so they are
-        # retried next round (ahead of newer work) and the group coalesces fast.
-        with self._request_admission_lock:
-            self.waiting_queue[0:0] = deferred_reqs
-        logger.debug(
-            "Deferred %d fusion sibling(s) to keep group prefill atomic: %s",
-            len(deferred_reqs),
-            sorted(defer_rids),
-        )
-        if not batch.reqs:
-            return None
+                logger.debug(
+                    "voice-fusion group landed partially in a prefill batch: "
+                    "%d/%d sibling(s) present (%s). The rest will join in a "
+                    "later batch; if they never do, the decode-time "
+                    "group-completeness guard aborts this group instead of "
+                    "blending an incomplete set.",
+                    len(present),
+                    len(members),
+                    sorted(present),
+                )
         return batch
 
     @staticmethod

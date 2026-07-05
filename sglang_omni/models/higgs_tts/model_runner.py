@@ -364,10 +364,23 @@ class HiggsTTSModelRunner(ModelRunner):
                 group[b] = b
                 weight[b] = 1.0
                 req = requests[b].data.req
-                # Matches the only other FINISH_ABORT call site in this repo
-                # (OmniScheduler._mark_running_request_aborted) — no-arg
-                # construction; the "why" goes to the log above, not here,
-                # since this repo has never exercised any other signature.
+                # Sets ``finished_reason`` directly rather than upstream's
+                # ``to_finish`` handshake (schedule_batch.py: "if we want to
+                # abort ... set to_finish instead of directly setting
+                # finished_reason ... the req will get filtered and never
+                # respond") because that handshake is for upstream's own
+                # generic token-loop finish check (``Req.check_finished``),
+                # which Higgs TTS's decode path never calls at all — every
+                # other finish signal here, success included
+                # (``_mark_sampler_finished``, right below), already sets
+                # ``finished_reason`` directly at this exact point in the
+                # per-step collect loop. This is the one already-proven-
+                # working precedent to match, not the abort-only one-arg-
+                # construction call site in ``OmniScheduler``. FINISH_ABORT()
+                # itself is the same no-arg construction used there; the
+                # "why" for this specific abort goes to the log above, not a
+                # message argument, since this repo has never exercised any
+                # other FINISH_ABORT signature.
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
 

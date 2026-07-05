@@ -169,17 +169,23 @@ def fuse_group_logits(
             not affect argmax / multinomial sampling).
         weight_B: ``[B]`` float blend weight per row. Weights need not be
             normalized; only their within-group ratio matters.
-        temperature_B: optional ``[B]`` float. When given, probabilities are
-            taken at ``softmax(logits / temperature)`` before blending so the
-            blend happens in the same temperature-scaled space the sampler will
-            use. ``None`` blends raw-logit softmax (temperature applied later).
+        temperature_B: optional ``[B]`` float. When given, the *blend* is
+            computed at ``softmax(logits / temperature)`` so grouped rows fuse
+            in the same temperature-scaled space the sampler will use.
+            ``None`` blends raw-logit softmax (temperature applied later by
+            the caller for every row, grouped or not).
 
     Returns:
         ``(logits_out, is_grouped_B)``:
 
-        - ``logits_out``: ``[B, N, V]``, where every row carries its group's
-          blended distribution. Feed these to the existing sampler exactly as
-          if they were logits.
+        - ``logits_out``: ``[B, N, V]``. Grouped rows carry the blended
+          log-distribution (temperature already folded in — sample these at
+          ``temperature=1``). Singleton rows carry their **raw, untouched**
+          ``logits_BNV`` — the caller must apply their real ``temperature_B``
+          when sampling them, exactly as it would with fusion disabled
+          entirely. Do NOT apply temperature to singleton rows a second time:
+          this function does not pre-divide them, precisely so the caller's
+          one real division is the only one that happens.
         - ``is_grouped_B``: ``[B]`` bool, true for rows in a real (size > 1)
           group. The caller MUST sample grouped rows at ``temperature=1`` (the
           blend already applied ``temperature_B``) but sample singleton rows at
@@ -187,25 +193,29 @@ def fuse_group_logits(
           unconditionally defeats the sampler's greedy short-circuit for
           ordinary (non-fusion) requests. See the module docstring.
 
-    The blend is ``log(Σ_g w_i · softmax(logits_i))`` over members ``i`` of each
-    group ``g``, with group weights renormalized to sum to 1. Because group
-    membership is expressed purely through ``scatter_add_`` + advanced indexing,
-    the op is shape-static and safe inside a captured CUDA graph.
+    The blend is ``log(Σ_g w_i · softmax(logits_i / T))`` over members ``i`` of
+    each group ``g``, with group weights renormalized to sum to 1. Because
+    group membership is expressed purely through ``scatter_add_`` + advanced
+    indexing, the op is shape-static and safe inside a captured CUDA graph.
 
     Singleton-group rows (the entire non-fusion batch) are returned as
-    ``logits / temperature`` **unchanged** — bit-identical to what the sampler
-    would have received without fusion — rather than routed through
+    ``logits_BNV`` **unchanged** — bit-identical to what the sampler would
+    have received without fusion — rather than routed through
     ``log(softmax(...))``, whose ``exp``/``log`` round-trip and ``_LOG_FLOOR``
-    would perturb the distribution tail. The singleton-vs-blended choice is a
-    per-row ``torch.where`` (tensor op, no host branch), so it stays
-    CUDA-Graph-safe in a mixed fusion/non-fusion batch.
+    would perturb the distribution tail, and rather than pre-divided by
+    temperature, which the caller already does downstream (dividing twice
+    would silently sharpen/dull every ordinary request's sampling — this was
+    a real bug caught in review, not a hypothetical). The singleton-vs-blended
+    choice is a per-row ``torch.where`` (tensor op, no host branch), so it
+    stays CUDA-Graph-safe in a mixed fusion/non-fusion batch.
     """
     if logits_BNV.ndim != 3:
         raise ValueError(f"logits_BNV must be [B, N, V], got {tuple(logits_BNV.shape)}")
     B, N, V = logits_BNV.shape
     device = logits_BNV.device
 
-    logits = logits_BNV.float()
+    raw_logits = logits_BNV.float()
+    logits = raw_logits
     if temperature_B is not None:
         safe_temp = temperature_B.to(device).clamp_min(1e-5).view(B, 1, 1)
         logits = logits / safe_temp
@@ -235,11 +245,13 @@ def fuse_group_logits(
     fused_BNV = fused.index_select(0, gid)
     blended_logits = (fused_BNV + _LOG_FLOOR).log()
 
-    # Rows in a real (size > 1) group get the blended log-probs; singleton rows
-    # keep their exact (temperature-scaled) logits so non-fusion decoding is
-    # bit-identical to baseline. Per-row select — no host branch.
+    # Rows in a real (size > 1) group get the blended log-probs (temperature
+    # already folded in); singleton rows get their exact RAW logits back —
+    # the caller applies the real per-row temperature exactly once, downstream
+    # — so non-fusion decoding is bit-identical to baseline. Per-row select —
+    # no host branch.
     is_grouped_B = group_count.index_select(0, gid) > 1.5
-    logits_out = torch.where(is_grouped_B.view(B, 1, 1), blended_logits, logits)
+    logits_out = torch.where(is_grouped_B.view(B, 1, 1), blended_logits, raw_logits)
     return logits_out, is_grouped_B
 
 

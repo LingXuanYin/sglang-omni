@@ -35,32 +35,39 @@ def test_singleton_is_sampling_identity():
     )
 
 
-def test_singleton_is_byte_identical_to_scaled_logits():
-    """Bug-C guard: a singleton row returns logits/T *exactly* (byte-identical),
-    so a mixed batch's non-fusion rows are unchanged vs. the no-fusion baseline.
+def test_singleton_is_byte_identical_to_raw_logits_regardless_of_temperature():
+    """A singleton row returns the RAW logits *exactly* (byte-identical), no
+    matter what ``temperature_B`` is passed — never pre-divided.
 
-    The sampler consumes the returned tensor as logits at temperature 1, i.e.
-    ``softmax(out / 1)``. For a singleton the contract is ``out == logits / T``
-    bit-for-bit, not merely sample-equivalent.
+    This is a regression guard for a real bug caught in review: the caller
+    (``model.py``) applies the row's real temperature exactly once, itself,
+    downstream, using the ``is_grouped_B`` mask this function returns. If this
+    function also divided singleton rows by temperature before returning them,
+    every ordinary (non-fusion) request would get sampled at ``T²`` instead of
+    ``T`` — silently sharper or duller than requested, no crash, no test
+    failure unless this exact contract is pinned down.
     """
     torch.manual_seed(7)
     B, N, V = 3, 8, 1026
     logits = torch.randn(B, N, V)
     gid, w = _singleton_groups(B)
-    # temperature == 1: out must equal the raw logits exactly.
+    # temperature == 1: out must equal the raw logits (division by 1 is moot
+    # either way, so this alone would NOT catch the T² bug).
     out1, is_grouped1 = fuse_group_logits(logits, gid, w, temperature_B=torch.ones(B))
     assert not is_grouped1.any()
     assert torch.equal(out1, logits.float())
-    # arbitrary per-row temperature: out must equal logits / T exactly.
+    # arbitrary per-row temperature != 1: out must STILL equal the raw logits,
+    # not logits / T. This is the case the T² bug would actually break.
     temp = torch.tensor([0.7, 1.0, 1.5])
     out2, is_grouped2 = fuse_group_logits(logits, gid, w, temperature_B=temp)
     assert not is_grouped2.any()
-    assert torch.equal(out2, logits.float() / temp.view(B, 1, 1))
+    assert torch.equal(out2, logits.float())
 
 
-def test_mixed_batch_singleton_rows_byte_identical():
-    """In a batch mixing a fused group with singletons, the singleton rows are
-    byte-identical to logits/T while the fused rows blend (Bug-C contract)."""
+def test_mixed_batch_singleton_rows_byte_identical_to_raw_logits():
+    """In a batch mixing a fused group with singletons, the singleton rows
+    stay byte-identical to the RAW logits (not logits/T) while the fused rows
+    blend — same T² regression guard as above, in a mixed batch."""
     torch.manual_seed(8)
     N, V = 8, 1026
     logits = torch.randn(4, N, V)
@@ -69,9 +76,9 @@ def test_mixed_batch_singleton_rows_byte_identical():
     temp = torch.tensor([1.0, 1.0, 0.8, 1.3])
     out, is_grouped = fuse_group_logits(logits, gid, w, temperature_B=temp)
     assert is_grouped.tolist() == [True, True, False, False]
-    # singleton rows: exact logits/T
-    assert torch.equal(out[2], logits[2].float() / 0.8)
-    assert torch.equal(out[3], logits[3].float() / 1.3)
+    # singleton rows: exact raw logits, untouched by temperature
+    assert torch.equal(out[2], logits[2].float())
+    assert torch.equal(out[3], logits[3].float())
     # fused rows: blended (not equal to either raw row)
     assert not torch.equal(out[0], logits[0].float())
 
@@ -239,6 +246,37 @@ def test_singleton_greedy_sampling_matches_baseline_not_the_blocking1_bug():
     # baseline exactly and touching no RNG at all (deterministic argmax).
     correct = _correct_caller_sample(logits)
     assert torch.equal(correct, baseline)
+
+
+def test_singleton_nongreedy_sampling_is_not_scaled_by_temperature_twice():
+    """A plain (non-fusion) request at an ORDINARY temperature (neither ~0 nor
+    exactly 1) must be sampled at its real T, not T². This is the regression
+    the greedy test above cannot catch: argmax is scale-invariant, so a caller
+    that fed a pre-divided ``logits/T`` back into a second ``/T`` division
+    would still pick the same argmax — the greedy test passes either way.
+    Softmax is not scale-invariant, so this test exercises the actual caller
+    contract (``fuse_group_logits`` then ``torch.where(is_grouped, 1, T)``
+    then divide-by-T once, exactly as ``model.py``'s CG/eager paths do) end
+    to end, and compares the resulting *distribution* against the no-fusion
+    baseline.
+    """
+    torch.manual_seed(13)
+    B, V = 5, 1026
+    logits = torch.randn(B, V)
+    temp = torch.tensor([0.7, 1.3, 0.9, 1.1, 0.5])  # never 1, never ~0
+
+    gid = torch.arange(B, dtype=torch.long)
+    w = torch.ones(B)
+    blended, is_grouped = fuse_group_logits(
+        logits.unsqueeze(1), gid, w, temperature_B=temp
+    )
+    assert not is_grouped.any()
+    sampler_temp = torch.where(is_grouped, torch.ones_like(temp), temp)
+    # The real caller's one and only division by temperature.
+    actual_probs = (blended.squeeze(1) / sampler_temp.view(B, 1)).softmax(dim=-1)
+
+    baseline_probs = (logits / temp.view(B, 1)).softmax(dim=-1)
+    torch.testing.assert_close(actual_probs, baseline_probs, atol=1e-5, rtol=1e-4)
 
 
 # --------------------------------------------------------------------------- #
