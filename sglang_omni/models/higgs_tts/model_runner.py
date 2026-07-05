@@ -15,7 +15,7 @@ import os
 from typing import Any
 
 import torch
-from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.prefill_inputs import (
@@ -291,6 +291,15 @@ class HiggsTTSModelRunner(ModelRunner):
         :func:`fusion.fuse_group_logits` an identity no-op. Resetting every slot
         each step prevents a stale group id from a prior (larger) batch leaking
         an out-of-range scatter index into the captured graph.
+
+        A fusion group split across this decode step (e.g. a KV-pressure
+        retract dropped some members — the scheduler's group-atomic admission
+        keeps this from happening in normal operation, but it is not a hard
+        guarantee) is handled by isolating just that group's *present* rows:
+        they're demoted to singletons (skip the blend entirely, rather than
+        average an incomplete — and therefore wrong — set of distributions)
+        and their requests are marked aborted so only they fail, not the rest
+        of this decode batch.
         """
         model = self.model
         rids = [req.request_id for req in requests[:n_real]]
@@ -302,6 +311,7 @@ class HiggsTTSModelRunner(ModelRunner):
         weight = [1.0] * bs
         seen: dict[str, int] = {}
         present: dict[str, int] = {}
+        rows_by_group: dict[str, list[int]] = {}
         for b, rid in enumerate(rids):
             gid = group_of.get(rid)
             if gid is None:
@@ -311,25 +321,38 @@ class HiggsTTSModelRunner(ModelRunner):
             group[b] = seen[gid]
             weight[b] = weight_of.get(rid, 1.0)
             present[gid] = present.get(gid, 0) + 1
+            rows_by_group.setdefault(gid, []).append(b)
 
-        # Fail loud if a fusion group is split across this decode step: every
-        # registered member must be present in the batch, else the blend would
-        # average an incomplete set of sibling distributions and silently emit
-        # un-fused audio. A short count means the upstream engine scheduled the
-        # group's rows apart (e.g. a KV-pressure retract dropped some members).
-        # The scheduler's group-atomic admission (see OmniScheduler) is what
-        # keeps this from firing in normal operation; it remains as a last-resort
-        # guard converting a silent-wrong-output into an observable failure.
         for gid, n_present in present.items():
             expected = model.expected_fusion_group_size(gid)
-            if expected and n_present != expected:
-                raise RuntimeError(
-                    f"voice-fusion group {gid!r} split across a decode step: "
-                    f"{n_present}/{expected} sibling rows present in the batch. "
-                    f"The serving engine scheduled the group's rows apart "
-                    f"(likely a KV-pressure retract); raise max_running_requests "
-                    f"or reduce concurrency so fusion siblings stay co-batched."
-                )
+            if not expected or n_present == expected:
+                continue
+            # Split group: isolate the blast radius to this group's present
+            # rows only. Demote them to independent singletons for this step
+            # (no blend — averaging a partial group would silently produce
+            # wrong audio) and abort their requests so the rest of the batch
+            # decodes unaffected.
+            logger.warning(
+                "voice-fusion group %r split across a decode step: "
+                "%d/%d sibling rows present in the batch. The serving engine "
+                "scheduled the group's rows apart (likely a KV-pressure "
+                "retract); aborting this group's requests. Raise "
+                "max_running_requests or reduce concurrency so fusion "
+                "siblings stay co-batched.",
+                gid,
+                n_present,
+                expected,
+            )
+            for b in rows_by_group[gid]:
+                group[b] = b
+                weight[b] = 1.0
+                req = requests[b].data.req
+                # Matches the only other FINISH_ABORT call site in this repo
+                # (OmniScheduler._mark_running_request_aborted) — no-arg
+                # construction; the "why" goes to the log above, not here,
+                # since this repo has never exercised any other signature.
+                if req.finished_reason is None:
+                    req.finished_reason = FINISH_ABORT()
 
         model._cg_fusion_group[:bs] = torch.tensor(
             group, dtype=torch.long, device=model._cg_fusion_group.device

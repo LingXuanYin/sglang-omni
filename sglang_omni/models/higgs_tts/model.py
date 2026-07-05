@@ -425,19 +425,28 @@ class HiggsTTSModel(nn.Module):
             weight[b] = p.fusion_weight
             present[gid] = present.get(gid, 0) + 1
 
-        # Fail loud if the upstream scheduler split a group across decode steps
-        # (e.g. KV-pressure retract). A partial group would blend an incomplete
-        # set of sibling distributions and silently emit wrong (un-fused) audio;
-        # better to fail the request — observable and retryable — than ship that.
+        # This method only ever runs on the PREFILL path (see the ``is_decode``
+        # branch in ``forward`` — the CG decode path calls
+        # ``decode_codebooks_batch_cg``/``_populate_fusion_buffers`` in
+        # model_runner.py instead, which is where retract-induced splits are
+        # actually isolated per-group rather than raised). Retraction
+        # (``OmniScheduler._retract_running_requests``) only ever acts on
+        # ``running_batch`` — i.e. decode-stage requests — so a split group
+        # reaching prefill would mean the scheduler's group-atomic admission
+        # (``OmniScheduler.get_next_batch_to_run``) failed to hold, which
+        # should not happen in normal operation. This raise is a last-resort
+        # assertion for that theoretical gap, not a path this repo has
+        # observed firing; it does not need the same per-group isolation as
+        # the decode path because this signature has no ``Req`` handle to mark
+        # aborted (only ``HiggsGenParams``, no scheduler object).
         for gid, n_present in present.items():
             expected = self.expected_fusion_group_size(gid)
             if expected and n_present != expected:
                 raise RuntimeError(
-                    f"voice-fusion group {gid!r} split across a decode step: "
-                    f"{n_present}/{expected} sibling rows present in the batch. "
-                    f"The serving engine scheduled the group's rows apart "
-                    f"(likely a KV-pressure retract); raise max_running_requests "
-                    f"or reduce concurrency so fusion siblings stay co-batched."
+                    f"voice-fusion group {gid!r} split across a prefill batch "
+                    f"(should be unreachable — group-atomic admission is "
+                    f"supposed to hold at prefill): "
+                    f"{n_present}/{expected} sibling rows present in the batch."
                 )
 
         group_B = torch.tensor(group, dtype=torch.long, device=device)

@@ -139,10 +139,17 @@ co-batching 必须由调度器**强制保证**(把 sibling 钉在同一 batch + 
   fusion 组只有部分成员在 batch 内,把这部分**整体退回 waiting_queue 队首**,使全组下一轮
   一起 prefill。decode batch 与非融合 batch 零开销透传。
 
-**第二层 — decode 时 fail-loud 兜底(极端 KV 压力):**
-- `fuse_group_logits` 前的组完整性检查(model.py `_batch_local_fusion` / runner
-  `_populate_fusion_buffers`):若某组在本 step 缺员(被上游 KV-retract 拆散),抛
-  RuntimeError 而非静默产出未融合音频。宁可可观测失败、可重试。
+**第二层 — decode 时组完整性检查(极端 KV 压力,2026-07 修正为按组隔离,不再整批炸):**
+- decode CG 路径(`model_runner.py` `_populate_fusion_buffers`,真正会遇到 retract 的路径,
+  因为 `OmniScheduler._retract_running_requests` 只作用于 `running_batch`/decode 阶段):
+  若某组在本 step 缺员,**只隔离该组的在场行**——降级为独立单例(不参与融合,避免用不完整
+  分布产出错误音频)、把它们的 `req.finished_reason` 设为 `FINISH_ABORT()`(复用
+  `OmniScheduler._mark_running_request_aborted` 唯一已验证过的构造方式,无参数)。
+  同批其它未受损的行(含其它融合组、普通请求)不受影响,继续正常解码。
+- prefill 路径(`model.py` `_batch_local_fusion`)仍保留整体 `RuntimeError`:这条路径的方法
+  签名只有 `HiggsGenParams`,没有 `Req` 句柄可单独标记 abort;而且 retract 不作用于 prefill
+  阶段,理论上组原子准入(第一层)生效后这里应该永远不会触发,是一个"不该发生"的断言,
+  不是常态防御路径,因此保留 fail-loud 语义、只是改了措辞说明其"应不可达"的性质。
 
 **bug 修复(第三轮):**
 - A:follower 现在**先**经 `_mark_sampler_finished` 标记完成(与 leader 同步退出),**再**跳过音频
