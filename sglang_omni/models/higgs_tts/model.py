@@ -298,6 +298,15 @@ class HiggsTTSModel(nn.Module):
         decoded codes duplicate the leader's and must not be emitted)."""
         return self._fusion_registry.is_follower(req_id)
 
+    def mark_fusion_group_poisoned(self, group_id: str) -> None:
+        """Flag ``group_id`` as having sampled an unblended frame while split
+        at prefill — the decode-side completeness check must abort it the
+        next time it reaches decode even if it looks complete by then."""
+        self._fusion_registry.mark_poisoned(group_id)
+
+    def is_fusion_group_poisoned(self, group_id: str) -> bool:
+        return self._fusion_registry.is_poisoned(group_id)
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.backbone.get_input_embeddings()
 
@@ -412,28 +421,38 @@ class HiggsTTSModel(nn.Module):
         # rows to independent singletons for this one step (no blend — a
         # partial-group average would be silently wrong) and log, instead of
         # raising and taking down the whole batch (which would abort every
-        # OTHER request co-batched with it here too). This method has no
-        # ``Req`` handle (only ``HiggsGenParams``) so it can't mark these
-        # rows aborted itself; the decode-side ``_populate_fusion_buffers``
-        # re-checks the same registry every step and WILL abort them on the
-        # very next one, since the split persists until the scheduler
-        # resolves it. Known gap (see design doc): this one step's sampled
-        # codes for the isolated rows are still real output — an unblended,
-        # wrong frame can be produced/streamed before the next step's abort
-        # catches up.
+        # OTHER request co-batched with it here too).
+        #
+        # This method has no ``Req`` handle (only ``HiggsGenParams``) so it
+        # can't mark these rows aborted itself — but it CAN mark the group
+        # poisoned (``mark_fusion_group_poisoned``). That matters because a
+        # split at prefill can "heal": if this group's other member(s)
+        # happen to prefill on their OWN, separately, before ever sharing a
+        # decode step with this one, each side already sampled its own
+        # unblended first frame here — by the time they finally share a
+        # decode step, presence count alone would look complete and
+        # `_populate_fusion_buffers` would resume fusing as if nothing had
+        # happened, silently delivering a corrupt (permanently desynced from
+        # frame 1) result as a success, no error, ever. The poisoned flag
+        # makes `_populate_fusion_buffers` abort this group the next time it
+        # reaches decode regardless of whether presence looks complete by
+        # then. Known, still-real gap (see design doc): the isolated row(s)'
+        # sampled codes for THIS step are still real output — an unblended
+        # frame can be produced/streamed before that abort happens.
         for gid, n_present in present.items():
             expected = self.expected_fusion_group_size(gid)
             if expected and n_present != expected:
                 logger.warning(
                     "voice-fusion group %r split across a prefill batch: "
                     "%d/%d sibling rows present. Isolating (no blend) for "
-                    "this step; the decode-side group-completeness guard "
-                    "will abort these rows on the next step since the split "
-                    "persists.",
+                    "this step and poisoning the group; the decode-side "
+                    "group-completeness guard will abort it the next time "
+                    "it reaches decode, healed or not.",
                     gid,
                     n_present,
                     expected,
                 )
+                self.mark_fusion_group_poisoned(gid)
                 for b, p in enumerate(gen_params):
                     if p.fusion_group_id == gid:
                         group[b] = b

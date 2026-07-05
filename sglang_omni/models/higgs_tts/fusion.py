@@ -72,6 +72,16 @@ class FusionRegistry:
         self._group_of: dict[str, str] = {}
         self._weight_of: dict[str, float] = {}
         self._leader: dict[str, bool] = {}
+        # group_ids that were ever caught split at prefill (see mark_poisoned)
+        # and must be aborted the next time they reach decode, even if by
+        # then every member happens to be present again ("healed"). A group
+        # that split at prefill sampled at least one unblended frame per
+        # present member before the split was noticed (fuse_group_logits has
+        # no Req handle at that layer, so it can isolate but not abort) — its
+        # KV contexts have already permanently diverged from what a real
+        # fused decode would have produced, so "looks complete now" must not
+        # be treated as "safe to resume fusing."
+        self._poisoned: set[str] = set()
         # Cheap, lock-free "is any fusion request live right now" signal for
         # the hot (non-fusion) path: a server with zero fusion traffic must
         # not pay a per-decode-step lock acquisition + dict-comprehension tax
@@ -94,16 +104,33 @@ class FusionRegistry:
         """
         with self._lock:
             if group_id is None:
-                if self._group_of.pop(req_id, None) is not None:
+                old_gid = self._group_of.pop(req_id, None)
+                if old_gid is not None:
                     self._active_count -= 1
                 self._weight_of.pop(req_id, None)
                 self._leader.pop(req_id, None)
+                if old_gid is not None and old_gid not in self._group_of.values():
+                    # Last member of this group just cleared — drop its
+                    # poisoned marker too, or it would leak forever (group
+                    # ids are never reused once every member has released).
+                    self._poisoned.discard(old_gid)
                 return
             if req_id not in self._group_of:
                 self._active_count += 1
             self._group_of[req_id] = group_id
             self._weight_of[req_id] = float(weight)
             self._leader[req_id] = bool(is_leader)
+
+    def mark_poisoned(self, group_id: str) -> None:
+        """Flag ``group_id`` as having sampled at least one unblended frame
+        while split — it must be aborted the next time it reaches decode,
+        even if it looks complete by then (see ``_poisoned``'s docstring)."""
+        with self._lock:
+            self._poisoned.add(group_id)
+
+    def is_poisoned(self, group_id: str) -> bool:
+        with self._lock:
+            return group_id in self._poisoned
 
     def has_any(self) -> bool:
         """Lock-free, best-effort "is any fusion request registered right now".

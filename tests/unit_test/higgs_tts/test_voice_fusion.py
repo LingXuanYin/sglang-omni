@@ -381,3 +381,40 @@ def test_registry_snapshot_empty_for_all_non_members():
     group_of, weight_of = reg.snapshot(["a", "b"])
     assert group_of == {}
     assert weight_of == {}
+
+
+def test_registry_poisoned_group_starts_unpoisoned():
+    reg = FusionRegistry()
+    assert reg.is_poisoned("g0") is False
+
+
+def test_registry_mark_poisoned_is_visible():
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 1.0, is_leader=True)
+    reg.set("r1", "g0", 1.0, is_leader=False)
+    reg.mark_poisoned("g0")
+    assert reg.is_poisoned("g0") is True
+    # A different group is unaffected.
+    assert reg.is_poisoned("g1") is False
+
+
+def test_registry_poisoned_flag_survives_partial_clear():
+    """A group poisoned while split (some members not yet registered/already
+    cleared) must stay poisoned as long as ANY member is still registered —
+    clearing one member must not erase the poison for the survivors."""
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 1.0, is_leader=True)
+    reg.set("r1", "g0", 1.0, is_leader=False)
+    reg.mark_poisoned("g0")
+    reg.set("r0", None, 1.0, is_leader=True)  # r0 clears (e.g. aborted)
+    assert reg.is_poisoned("g0") is True  # r1 still registered
+
+
+def test_registry_poisoned_flag_clears_when_last_member_clears():
+    """Once every member of a poisoned group has cleared, the poison marker
+    must not leak forever — group ids are never reused once fully released."""
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 1.0, is_leader=True)
+    reg.mark_poisoned("g0")
+    reg.set("r0", None, 1.0, is_leader=True)
+    assert reg.is_poisoned("g0") is False

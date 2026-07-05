@@ -15,12 +15,14 @@
 |---|---|
 | 归约算法 | `fusion.py::fuse_group_logits` / `fuse_group_generation_done`(纯 torch,无 sglang 依赖,可独立单测) |
 | 归约钩子 | `model.py` `decode_codebooks_batch` / `decode_codebooks_batch_cg`,在 `batched_step` 前替换 logits |
-| 融合注册表 | `fusion.py::FusionRegistry`(线程安全,build 线程写、GPU worker 线程读);`model.py` 的 `set_fusion_group`/`has_any_fusion`/`is_fusion_follower` 等是对它的薄委托 |
+| 融合注册表 | `fusion.py::FusionRegistry`(线程安全,build 线程写、GPU worker 线程读);`model.py` 的 `set_fusion_group`/`has_any_fusion`/`is_fusion_follower`/`mark_fusion_group_poisoned` 等是对它的薄委托 |
 | 请求拆分 | `request_builders.py::build_fusion_sibling_requests`:1 融合 payload → N 条 `HiggsSGLangRequestData`,共享 `fusion_group_id` + 一个具体 seed,leader=第一个 sibling |
 | 组落批可见性(非强制) | `omni_scheduler.py::OmniScheduler.get_next_batch_to_run`(override):只读扫描,某融合组只有部分成员落在同一 prefill batch 时打日志;不改动 batch(见下文"为什么不强制原子准入") |
-| 组完整性兜底 | `model_runner.py::_populate_fusion_buffers`(decode CG 路径,真正会遇到"组被拆散"的地方,无论是 KV retract 还是 sibling 还没轮到) |
-| 组级联清理 | `omni_scheduler.py::OmniScheduler._cascade_abort_split_fusion_group`(在 `stream_output` 里触发):一个融合成员以 `FINISH_ABORT` 结束时,把组里还注册着的其它成员一起 abort,防止缺席的 sibling 变成永久卡在 `waiting_queue` 里的僵尸请求 |
+| prefill 侧隔离 + 中毒标记 | `model.py::_batch_local_fusion`:prefill 完成后触发首个解码 token 那一步若发现组缺员,隔离在场行(不参与融合)并把该组标记为 `FusionRegistry._poisoned`——因为这里没有 `Req` 句柄,没法自己 abort,而组之后可能"自愈"(所有成员后来都凑齐了),中毒标记是让下面的完整性检查即便凑齐也照样 abort 的唯一办法 |
+| 组完整性兜底 | `model_runner.py::_populate_fusion_buffers`(decode CG 路径,真正会遇到"组被拆散"的地方,无论是 KV retract、sibling 还没轮到,还是曾经中毒但现在看起来凑齐的组) |
+| 组级联清理 | `omni_scheduler.py::OmniScheduler._cascade_abort_split_fusion_group`(在 `stream_output` 里触发):一个融合成员以 `FINISH_ABORT` 结束时,把组里还注册着的其它成员一起 abort(并向每个被级联的成员发一条 client 可见的 error,leader 也不例外),防止缺席的 sibling 变成永久卡在 `waiting_queue` 里的僵尸请求 |
 | 输出去重 | `model_runner.py::_finish_fusion_follower`:follower 的解码帧与 leader 重复,不 append/发音频,但仍要在同一步被标记 finished,否则组会"拆分" |
+| 异步 lookahead 规避 | `model_runner.py::HiggsTTSModelRunner.lookahead_eligible`:只要有任何融合请求注册,强制走同步解码路径,避免这个仓库自建的 one-step-lookahead 把 launch 阶段设置的 FINISH_ABORT 误判成"上一步的过期行"而丢弃 |
 
 ## 核心算法
 `fuse_group_logits`(见 `fusion.py` 完整 docstring)对同组 N 行做加权 softmax 归约再转回
@@ -88,11 +90,24 @@ prefill 路径(`model.py::_batch_local_fusion`,prefill 完成后触发首个解�
 但原子准入已经不存在,sibling 的 prefill 落在不同批次是正常情况,再对整批硬 raise 会把这批
 里所有无关请求一起炸掉——正是 BLOCKING-3 已经在 decode 侧修掉的那种"殃及无关请求"模式,不该
 在 prefill 侧重新引入。现在的做法是隔离而非 raise:把这批里在场的成员降级为独立单例(不
-参与融合)、打日志,让本步照常跑完。**已知缺口**:这一步已经采样出的 codes 是真实输出——
-`_batch_local_fusion` 只有 `HiggsGenParams`、没有 `Req` 句柄,没法自己把这些行标记为
-abort;只能依赖下一个 decode step 的 `_populate_fusion_buffers`(它有 `Req` 句柄)重新
-检测到同样的缺员并真正 abort。也就是说,在组被 abort 之前,**这一步未融合、错误的一帧
-codes 可能已经产出甚至被流式发出**。这不是"已解决",是一个已知的、尚未补上的正确性缺口。
+参与融合)、打日志、并把这个 `group_id` 标记为 **poisoned**(`FusionRegistry.mark_poisoned`)。
+
+**为什么需要"中毒"标记,而不只是隔离**:一个组在 prefill 侧被拆散后,可能会"自愈"——比如
+sibling A 这一步单独 prefill(被隔离,采了一帧未融合的 codes),sibling B 下一步也单独
+prefill(同样被隔离),再下一步两个都进了同一个 decode batch,这时候单看"在场人数是否等于
+预期人数"会发现 2/2、完全正常,`_populate_fusion_buffers` 会误以为可以放心恢复融合——但
+A 和 B 的 KV 上下文在各自被隔离的那一步已经各自采样了不同的、未融合的第一帧,从那一刻起就
+永久错位了,绝不是"看起来凑齐了就可以继续"。中毒标记解决了这个问题:`_populate_fusion_
+buffers` 现在即使发现人数凑齐,只要这个组曾经中毒,也会照样隔离+abort,不会被"看起来正常"
+骗过去。
+
+**仍然存在、这次没有补上的缺口**:`_batch_local_fusion` 只有 `HiggsGenParams`、没有
+`Req` 句柄,没法自己把在场行标记为 abort——它能做的只是隔离+中毒,把"真正 abort"这件事
+留给下一个碰到这个组的 decode step。也就是说,从"组被拆散、隔离生效"到"下一个 decode step
+检测到中毒并真正 abort"之间,**这一步(以及自愈过程中每一次单独被隔离的那一步)已经采样出
+的、未融合的一帧 codes 是真实输出,可能已经产出甚至被流式发出**。中毒标记保证了"组最终一定
+会被 abort、不会被自愈骗过去悄悄产出成功结果",但不能追溯撤回已经发生的那一帧输出。这不是
+"已解决",是一个已知的、尚未补上的正确性缺口。
 
 **这样做的代价(诚实说明,不是"已解决")**:没有了 prefill 侧的强制原子准入,在调度压力大、
 sibling 的 prefill 没能挤进同一 tick 的情况下,融合请求可能会比"总是原子准入"的设计更频繁地

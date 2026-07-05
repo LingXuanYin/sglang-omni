@@ -321,13 +321,17 @@ class HiggsTTSModelRunner(ModelRunner):
         an out-of-range scatter index into the captured graph.
 
         A fusion group split across this decode step (e.g. a KV-pressure
-        retract dropped some members — the scheduler's group-atomic admission
-        keeps this from happening in normal operation, but it is not a hard
-        guarantee) is handled by isolating just that group's *present* rows:
-        they're demoted to singletons (skip the blend entirely, rather than
-        average an incomplete — and therefore wrong — set of distributions)
-        and their requests are marked aborted so only they fail, not the rest
-        of this decode batch.
+        retract dropped some members, or they just haven't all reached decode
+        yet) is handled by isolating just that group's *present* rows: they're
+        demoted to singletons (skip the blend entirely, rather than average an
+        incomplete — and therefore wrong — set of distributions) and their
+        requests are marked aborted so only they fail, not the rest of this
+        decode batch. A group ``HiggsTTSModel._batch_local_fusion`` (the
+        prefill-side counterpart) previously caught split and poisoned is
+        aborted here too even if presence now looks complete — a prefill-time
+        split already sampled an unblended frame per isolated row before
+        anyone could stop it, so "looks complete now" does not mean "safe to
+        resume fusing" (see ``fusion.py::FusionRegistry._poisoned``).
         """
         model = self.model
         if not model.has_any_fusion() and not self._fusion_buffers_dirty:
@@ -362,24 +366,42 @@ class HiggsTTSModelRunner(ModelRunner):
 
         for gid, n_present in present.items():
             expected = model.expected_fusion_group_size(gid)
-            if not expected or n_present == expected:
+            if not expected:
                 continue
-            # Split group: isolate the blast radius to this group's present
-            # rows only. Demote them to independent singletons for this step
-            # (no blend — averaging a partial group would silently produce
+            poisoned = model.is_fusion_group_poisoned(gid)
+            if n_present == expected and not poisoned:
+                continue
+            # Split group, or a group that "healed" (looks complete now) but
+            # was poisoned by an earlier prefill-time split: isolate the
+            # blast radius to this group's present rows only. Demote them to
+            # independent singletons for this step (no blend — averaging an
+            # incomplete or already-corrupted group would silently produce
             # wrong audio) and abort their requests so the rest of the batch
             # decodes unaffected.
-            logger.warning(
-                "voice-fusion group %r split across a decode step: "
-                "%d/%d sibling rows present in the batch. The serving engine "
-                "scheduled the group's rows apart (likely a KV-pressure "
-                "retract); aborting this group's requests. Raise "
-                "max_running_requests or reduce concurrency so fusion "
-                "siblings stay co-batched.",
-                gid,
-                n_present,
-                expected,
-            )
+            if poisoned and n_present == expected:
+                logger.warning(
+                    "voice-fusion group %r reached decode with all %d "
+                    "sibling rows present, but was poisoned by an earlier "
+                    "prefill-time split — it already sampled an unblended "
+                    "frame before that split was caught, so its KV contexts "
+                    "are permanently desynced. Aborting rather than "
+                    "resuming fused decode on a group that can never be "
+                    "correct again.",
+                    gid,
+                    expected,
+                )
+            else:
+                logger.warning(
+                    "voice-fusion group %r split across a decode step: "
+                    "%d/%d sibling rows present in the batch. The serving "
+                    "engine scheduled the group's rows apart (likely a "
+                    "KV-pressure retract); aborting this group's requests. "
+                    "Raise max_running_requests or reduce concurrency so "
+                    "fusion siblings stay co-batched.",
+                    gid,
+                    n_present,
+                    expected,
+                )
             for b in rows_by_group[gid]:
                 group[b] = b
                 weight[b] = 1.0

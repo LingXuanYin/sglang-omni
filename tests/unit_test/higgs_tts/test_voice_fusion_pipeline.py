@@ -185,6 +185,7 @@ def _build_populate_buffers_runner(bs: int):
         has_any_fusion=registry.has_any,
         fusion_membership_snapshot=registry.snapshot,
         expected_fusion_group_size=registry.expected_size,
+        is_fusion_group_poisoned=registry.is_poisoned,
         _cg_fusion_group=torch.arange(bs, dtype=torch.long),
         _cg_fusion_weight=torch.ones(bs, dtype=torch.float32),
     )
@@ -241,6 +242,38 @@ def test_populate_buffers_split_group_isolates_present_row_and_aborts():
     assert runner.model._cg_fusion_weight.tolist() == pytest.approx([1.0, 1.0, 1.0])
     assert isinstance(reqs[0].finished_reason, FINISH_ABORT)
     assert reqs[1].finished_reason is None  # unrelated row untouched
+
+
+def test_populate_buffers_poisoned_group_aborted_even_once_healed():
+    """A group poisoned by an earlier prefill-time split (model.py::
+    _batch_local_fusion) must be aborted the first time it reaches decode
+    with ALL members present — looking complete is not enough once poisoned,
+    because it already sampled an unblended frame per member before the
+    split was caught, permanently desyncing their KV contexts."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    registry.mark_poisoned("gid-a")
+    runner._populate_fusion_buffers(requests, bs=2, n_real=2)
+    # Both present, counts match (2/2) - an unpoisoned group would blend.
+    # A poisoned one must still be isolated + aborted despite looking intact.
+    assert runner.model._cg_fusion_group.tolist() == [0, 1]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx([1.0, 1.0])
+    assert isinstance(reqs[0].finished_reason, FINISH_ABORT)
+    assert isinstance(reqs[1].finished_reason, FINISH_ABORT)
+
+
+def test_populate_buffers_unpoisoned_intact_group_still_blends():
+    """Sanity check for the test above: an otherwise-identical intact group
+    that was NEVER poisoned must blend normally, not get aborted."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    runner._populate_fusion_buffers(requests, bs=2, n_real=2)
+    assert runner.model._cg_fusion_group.tolist() == [0, 0]
+    assert all(r.finished_reason is None for r in reqs)
 
 
 def test_populate_buffers_never_overwrites_an_already_finished_request():
