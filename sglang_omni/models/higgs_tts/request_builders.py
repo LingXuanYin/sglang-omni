@@ -226,7 +226,8 @@ def build_fusion_sibling_requests(
 
     Returns the leader req_data with the followers attached as
     ``fusion_siblings`` (a builder->scheduler side-channel; the scheduler
-    enqueues the whole group atomically).
+    enqueues all of them adjacently in one call — not a guarantee they get
+    admitted to the same batch, see the design doc's co-batching section).
     """
     refs = state.fusion_refs or []
     if len(refs) < 2:
@@ -408,7 +409,8 @@ def make_higgs_scheduler_adapters(
 
         # Voice fusion: >= 2 references → fan out into N sibling rows that share
         # a fusion group id + one concrete seed. The leader carries the followers
-        # as ``fusion_siblings``; the scheduler enqueues the group atomically.
+        # as ``fusion_siblings``; the scheduler enqueues the siblings adjacently
+        # (not a guarantee they land in the same batch — see design doc).
         if state.fusion_refs and len(state.fusion_refs) >= 2:
             leader = build_fusion_sibling_requests(state, request_id=payload.request_id)
             followers = leader.fusion_siblings or []

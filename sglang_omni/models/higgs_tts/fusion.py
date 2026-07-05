@@ -8,8 +8,8 @@ are blended by weight **before** sampling. All siblings then sample the *same*
 multi-codebook frame (shared seed), so their ``N`` KV contexts evolve in
 lock-step and decode the same audio; only the group *leader* row is emitted.
 
-This module holds the two pure, ``sgl_kernel``-free tensor ops that implement
-the blend, so they are unit-testable without the full sglang engine:
+This module holds the pure, ``sgl_kernel``-free pieces of the mechanism — no
+torch/sglang engine dependency, so they are unit-testable standalone:
 
 - :func:`fuse_group_logits` — weighted probability average across group members,
   returned as log-probs ready to feed the standard sampler, plus a per-row
@@ -17,6 +17,9 @@ the blend, so they are unit-testable without the full sglang engine:
   their real (unfolded) temperature — see the "greedy" warning below.
 - :func:`fuse_group_generation_done` — "any sibling done ⇒ all done" barrier so
   group members terminate on the same step.
+- :class:`FusionRegistry` — thread-safe bookkeeping of which requests belong to
+  which fusion group, at what weight, who the leader is, and which groups were
+  caught split at prefill and must be aborted even if they later look complete.
 
 Both are CUDA-Graph friendly: fixed-shape ``scatter_add_`` / advanced-index ops,
 no host-side control flow. They are identity no-ops for the default case where
@@ -303,4 +306,4 @@ def fuse_group_generation_done(
     return group_any.index_select(0, gid) > 0
 
 
-__all__ = ["fuse_group_logits", "fuse_group_generation_done"]
+__all__ = ["FusionRegistry", "fuse_group_logits", "fuse_group_generation_done"]
