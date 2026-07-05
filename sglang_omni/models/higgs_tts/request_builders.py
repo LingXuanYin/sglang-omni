@@ -230,9 +230,7 @@ def build_fusion_sibling_requests(
     """
     refs = state.fusion_refs or []
     if len(refs) < 2:
-        raise ValueError(
-            f"voice fusion needs >= 2 references, got {len(refs)}"
-        )
+        raise ValueError(f"voice fusion needs >= 2 references, got {len(refs)}")
     weights = _coerce_fusion_weights(refs)
 
     # One shared concrete seed for the whole group. If the user pinned a seed we
@@ -242,11 +240,14 @@ def build_fusion_sibling_requests(
     if state.seed is not None:
         shared_seed = int(state.seed)
     else:
-        shared_seed = int.from_bytes(
-            hashlib.blake2b(request_id.encode(), digest_size=8).digest(),
-            "little",
-            signed=False,
-        ) & 0x7FFF_FFFF_FFFF_FFFF
+        shared_seed = (
+            int.from_bytes(
+                hashlib.blake2b(request_id.encode(), digest_size=8).digest(),
+                "little",
+                signed=False,
+            )
+            & 0x7FFF_FFFF_FFFF_FFFF
+        )
 
     siblings: list[HiggsSGLangRequestData] = []
     for i, (ref, weight) in enumerate(zip(refs, weights)):
@@ -409,9 +410,7 @@ def make_higgs_scheduler_adapters(
         # a fusion group id + one concrete seed. The leader carries the followers
         # as ``fusion_siblings``; the scheduler enqueues the group atomically.
         if state.fusion_refs and len(state.fusion_refs) >= 2:
-            leader = build_fusion_sibling_requests(
-                state, request_id=payload.request_id
-            )
+            leader = build_fusion_sibling_requests(state, request_id=payload.request_id)
             followers = leader.fusion_siblings or []
             _register_fusion_group([leader, *followers])
             # Only the leader is finalized with the stage payload + stream

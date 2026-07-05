@@ -83,8 +83,16 @@ batch 的工具,从不touch extend 张量——没有支持的方式能在 `prep
    注册着的成员一起 `abort()` 掉。`abort()` 本身既能从 `waiting_queue` 摘除、也能处理正在
    跑的行,是这个仓库里唯一验证过、安全处理"请求可能在队列也可能在运行"两种状态的通用清理路径。
 
-prefill 路径(`model.py::_batch_local_fusion`)保留整体 `RuntimeError`:这条路径只有
-`HiggsGenParams`、没有 `Req` 句柄可单独标记 abort。
+prefill 路径(`model.py::_batch_local_fusion`,prefill 完成后触发首个解码 token 的那一步)
+**不再**保留整体 `RuntimeError`。移除组原子准入之前,这里的 raise 被认为"理论上不可达";
+但原子准入已经不存在,sibling 的 prefill 落在不同批次是正常情况,再对整批硬 raise 会把这批
+里所有无关请求一起炸掉——正是 BLOCKING-3 已经在 decode 侧修掉的那种"殃及无关请求"模式,不该
+在 prefill 侧重新引入。现在的做法是隔离而非 raise:把这批里在场的成员降级为独立单例(不
+参与融合)、打日志,让本步照常跑完。**已知缺口**:这一步已经采样出的 codes 是真实输出——
+`_batch_local_fusion` 只有 `HiggsGenParams`、没有 `Req` 句柄,没法自己把这些行标记为
+abort;只能依赖下一个 decode step 的 `_populate_fusion_buffers`(它有 `Req` 句柄)重新
+检测到同样的缺员并真正 abort。也就是说,在组被 abort 之前,**这一步未融合、错误的一帧
+codes 可能已经产出甚至被流式发出**。这不是"已解决",是一个已知的、尚未补上的正确性缺口。
 
 **这样做的代价(诚实说明,不是"已解决")**:没有了 prefill 侧的强制原子准入,在调度压力大、
 sibling 的 prefill 没能挤进同一 tick 的情况下,融合请求可能会比"总是原子准入"的设计更频繁地
@@ -131,6 +139,29 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
   已上传语音),每次都会重新过一遍 codec 编码,已上传的具名语音也无法参与融合。作为 v1 范围
   可以接受,但这是一个尚未文档化过的能力缺口。
 
+## 已修复的两个"隔离/级联"自身的 bug(第二轮对抗审查抓到,均已修正)
+第一版的 decode 侧隔离 + 级联 abort(上一节)在实现细节上曾有两处自己的问题,均已修正:
+
+1. **`_populate_fusion_buffers` 的 dirty-flag 越界**:早期实现只把"清空"写到 `[:bs]`(当前
+   这一步的 batch size),但 `_cg_fusion_group`/`_cg_fusion_weight` 是固定 `pool_size` 的
+   buffer,不随每步 batch size 变化。若一步 bs=4(含一个融合组占 2,3 号槽位)之后,组结束、
+   batch 缩到 bs=2,只清了 `[:2]`,槽位 2,3 仍留着旧组的 `group=[2,2]`/`weight=[0.6,0.4]`;
+   若 dirty flag 此时被错误地设为 False,后续 batch 再长回 bs=4、两个全新无关请求恰好落在
+   槽位 2,3,`has_any_fusion()` 早退检查会让这两个不相关的请求被静默按旧组"融合"在一起。
+   修法:dirty→clean 的那次转换改成清空整个 buffer(`[:pool_size]`),而不是只清 `[:bs]`,
+   一次性、简单、正确,不需要额外的高水位状态。回归测试:
+   `test_populate_buffers_clean_reset_scrubs_stale_slots_beyond_a_shrunk_batch`
+   (`test_voice_fusion_pipeline.py`)。
+2. **级联 abort 对"同批已完成但还没被下一次 filter_batch 清理"的成员会误伤**:一个组的多个
+   在场成员如果*同时*被 `_populate_fusion_buffers` 隔离+标记 FINISH_ABORT,它们会在同一次
+   `stream_output` 调用里各自轮到自己的处理——但第一个被处理的成员触发的级联,如果不加区分地
+   对"组里其它还注册着的成员"调用 `abort()`,会把同批里*也*刚完成、还没被下一轮 `filter_batch`
+   清理出 `running_batch.reqs` 的成员也 `abort()` 掉——而 `abort()` 对"已完成但还在批里"的
+   请求走的是立即从 `running_batch.reqs` 摘除这条路径,和 BLOCKING-2 里禁止的"prepare_for_
+   extend 之后摘 reqs"是同一类张量/reqs 错位。修法:`stream_output` 先收集本轮所有"本次调用
+   即将完成"的 rid 集合,级联只对*不在*这个集合里的成员(即真正缺席、下一轮才可能自己冒出来
+   的那个 sibling)调用 `abort()`——同批一起完成的成员各自走自己的正常处理,不需要被级联。
+
 ## 仍需真实引擎验证的项(本机 Windows 无 sglang,无法跑真实引擎)
 1. **decode 侧隔离 + 级联 abort 的端到端行为**:`_populate_fusion_buffers` 的隔离逻辑和
    `_cascade_abort_split_fusion_group` 的级联逻辑都各自过了单测(`test_voice_fusion_pipeline.py`
@@ -149,10 +180,24 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
    存在的 fp32 softmax 开销,不是真正的零成本。
 5. **`FINISH_ABORT` 直接赋值 `finished_reason` 而非走 `to_finish` 的时机是否安全**:上游
    `Req.to_finish` 字段的注释明确写着"如果想在事件循环中途 abort 一个请求,应该设置
-   `to_finish` 而不是直接设置 `finished_reason`,否则请求会被过滤掉、再也不会响应"。Higgs
+   `to_finish` 而不是直接设置 `finished_reason`,否则请求会被过滤掉、再也不会响应"。
+   **更正**(第二轮审查抓到第一版这里的错误理解):upstream 的 `process_batch_result_decode`
+   确实每个 decode step 都会调用 `req.check_finished()`,不是"Higgs 完全不走这条路"。Higgs
    TTS 的整条完成信号链路(包括早已验证工作的正常完成路径 `_mark_sampler_finished`)在这个
    相同的代码层级都是直接设置 `finished_reason`,从未使用 `to_finish`——`_populate_fusion_
-   buffers`(BLOCKING-3)、`_cascade_abort_split_fusion_group` 都是照抄这个已经在正常完成路径
-   上验证过的既有约定,而不是新造一种写法。逻辑上应该是安全的(时机上早于上游任何会检查
-   `finished_reason` 的处理),但这个"为什么 Higgs 的写法能绕开上游注释里的警告"从未在真实
-   引擎上专门针对 abort 路径验证过。
+   buffers`(BLOCKING-3)、`_cascade_abort_split_fusion_group` 都是照抄这个既有约定,而不是
+   新造一种写法。但"Higgs 这套直接赋值的写法为什么能绕开上游注释里的警告、和 `check_finished()`
+   的实际交互到底是不是安全的",仍然是一个没有在真实引擎上专门针对 abort 路径验证过的开放问题,
+   不是已经证明安全。
+6. **异步 lookahead 与 fusion 的交互(已按最保守方式规避,未实测)**:这个仓库自建的
+   one-step-lookahead 解码(`enable_async_decode`,`OmniScheduler._resolve_and_process`)
+   会在 launch 阶段(`_populate_fusion_buffers` 设置 FINISH_ABORT 发生的地方)之后、resolve
+   阶段之前有一个时间窗口;`_resolve_and_process` 用"resolve 前先快照 `req.finished()`"的
+   方式区分"上一步就已结束的过期行"和"这一步 resolve 过程中才结束的行",但 launch 阶段设置的
+   FINISH_ABORT 发生在这个快照*之前*,会被误判成"上一步的过期行"而被整行摘出批次、永远不会
+   走到 `stream_output`,级联 abort 也就永远不会触发——这正是级联机制想避免的"僵尸 sibling"。
+   修法:`HiggsTTSModelRunner.lookahead_eligible` 现在在有任何融合流量时返回 `False`
+   (`model.has_any_fusion()`),让融合相关的 batch 强制走同步路径,整个 launch/resolve 分离
+   带来的时间窗口根本不存在。这个修法本身只在本机做了静态代码走查(确认
+   `lookahead_eligible` 返回值确实能让 `_event_loop_async_decode` 完整跳过 launch/resolve
+   分离,直接同步跑),没有在真实开启 `enable_async_decode` 的引擎上实测过。

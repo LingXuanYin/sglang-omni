@@ -1625,6 +1625,19 @@ class OmniScheduler:
         to the detokenizer via ZMQ.  We capture finished requests here
         and put them in the outbox so Stage can route them downstream.
         """
+        # Every request in this batch that is finishing THIS call handles
+        # itself via its own loop iteration below — including every present
+        # row of a split fusion group, which HiggsTTSModelRunner isolates and
+        # marks FINISH_ABORT *together*, in the same decode step. Collected
+        # once so ``_cascade_abort_split_fusion_group`` can tell "genuinely
+        # absent sibling" (needs a cascaded abort) apart from "co-isolated
+        # sibling that's about to process itself two lines down" (calling
+        # abort() on one of THOSE would hit OmniScheduler.abort()'s
+        # already-finished-but-still-batched branch, which removes it from
+        # running_batch.reqs out of step with that batch's tensors — the same
+        # class of desync BLOCKING-2 already ruled out for the prefill side).
+        finishing_rids = {req.rid for req in reqs if req.finished()}
+
         for req in reqs:
             if skip_req is not None and req is skip_req:
                 continue
@@ -1676,7 +1689,7 @@ class OmniScheduler:
             ):
                 self._first_emit_done.discard(rid)
                 self._prefill_start_done.discard(rid)
-                self._cascade_abort_split_fusion_group(rid, req)
+                self._cascade_abort_split_fusion_group(rid, req, finishing_rids)
                 if self._abort_callback is not None:
                     self._abort_callback(rid)
                 continue
@@ -1742,7 +1755,7 @@ class OmniScheduler:
             # (and cascade-abort any sibling left behind by a split — see
             # ``_cascade_abort_split_fusion_group``). No-op for ordinary
             # requests, which never registered a group.
-            self._cascade_abort_split_fusion_group(rid, req)
+            self._cascade_abort_split_fusion_group(rid, req, finishing_rids)
             self.outbox.put(
                 OutgoingMessage(
                     request_id=rid,
@@ -1751,10 +1764,13 @@ class OmniScheduler:
                 )
             )
 
-    def _cascade_abort_split_fusion_group(self, rid: str, req: Any) -> None:
+    def _cascade_abort_split_fusion_group(
+        self, rid: str, req: Any, finishing_rids: set[str]
+    ) -> None:
         """Drop ``rid``'s fusion-group membership entry; if it finished via an
-        explicit abort while other members are still registered, abort them
-        too so they don't become zombies.
+        explicit abort while other members are still registered *and not
+        already finishing this same call*, abort them too so they don't
+        become zombies.
 
         A fusion group finishing normally always does so together: the shared
         done-barrier flips every member's ``generation_done`` on the same
@@ -1764,13 +1780,39 @@ class OmniScheduler:
         ``FINISH_ABORT`` is different: it's what
         ``HiggsTTSModelRunner._populate_fusion_buffers`` sets on a group's
         *present* rows when a KV-pressure retract splits the group mid-decode
-        (see BLOCKING-3). The *absent* (retracted) sibling is untouched by
-        that isolation and, left alone, would eventually either re-prefill
-        and decode by itself as a silently un-fused single-reference request,
-        or — if something else still references the frozen group set — sit
-        in ``waiting_queue`` forever. Cascading through ``abort()`` (which
-        already knows how to pull a request out of ``waiting_queue`` as well
-        as a running batch) avoids both.
+        (see BLOCKING-3). All present rows of a split group get FINISH_ABORT
+        *together*, in the same step — those are in ``finishing_rids`` and
+        will each handle themselves via their own loop iteration in
+        ``stream_output``, so cascading into them here would be redundant at
+        best. What's NOT self-handling is the *absent* (retracted, or not yet
+        co-batched) sibling: untouched by that isolation, left alone it would
+        eventually either re-prefill and decode by itself as a silently
+        un-fused single-reference request, or — if something else still
+        references the frozen group set — sit in ``waiting_queue`` forever.
+        Cascading through ``abort()`` (which already knows how to pull a
+        request out of ``waiting_queue`` as well as a running batch) avoids
+        both — but ONLY for members outside ``finishing_rids``: calling
+        ``abort()`` on an already-finished-but-not-yet-``filter_batch``-ed
+        member would take its "not found running, not found live" branch,
+        which removes it from ``running_batch.reqs`` immediately, out of step
+        with that batch's still-full-length tensors until the next
+        ``filter_batch`` — the same class of reqs/tensor desync BLOCKING-2
+        already ruled out on the prefill side.
+
+        ``abort()`` itself never emits anything client-visible — its
+        ``_abort_callback`` here is just ``model.reset_request`` (engine-side
+        sampler-row cleanup), and the ``Req``'s own event loop position is
+        gone the moment ``abort()`` returns. If the member being cascaded is
+        the group's *leader* — the one rid the client is actually listening
+        for (followers are always the synthetic ``{leader_rid}#fuseN``,
+        never client-visible) — silently aborting it means the client just
+        hangs forever with no result and no error. Emitting an error against
+        every cascaded member's own rid, unconditionally, is cheap and
+        correct either way: a follower's rid is a routing key nobody
+        subscribed to (a harmless no-op, exactly like the leader's own error
+        emission a batch failure already sends to every row's rid — see
+        ``_handle_batch_failure``), while the leader's happens to be the
+        client-facing id and actually reaches them.
         """
         group = self._fusion_group_members.pop(rid, None)
         if group is None or not isinstance(req.finished_reason, FINISH_ABORT):
@@ -1787,6 +1829,15 @@ class OmniScheduler:
         for member_id in others:
             self._fusion_group_members.pop(member_id, None)
         for member_id in others:
+            if member_id in finishing_rids:
+                continue
+            self._emit_request_error(
+                member_id,
+                ValueError(
+                    "voice-fusion group aborted: a sibling was split from "
+                    "this group mid-decode and could not rejoin it"
+                ),
+            )
             self.abort(member_id)
 
     def send_to_tokenizer(self):

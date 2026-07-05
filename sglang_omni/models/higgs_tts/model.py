@@ -402,26 +402,42 @@ class HiggsTTSModel(nn.Module):
         # This method only ever runs on the PREFILL path (see the ``is_decode``
         # branch in ``forward`` — the CG decode path calls
         # ``decode_codebooks_batch_cg``/``_populate_fusion_buffers`` in
-        # model_runner.py instead, which is where retract-induced splits are
-        # actually isolated per-group rather than raised). Retraction
-        # (``OmniScheduler._retract_running_requests``) only ever acts on
-        # ``running_batch`` — i.e. decode-stage requests — so a split group
-        # reaching prefill would mean the scheduler's group-atomic admission
-        # (``OmniScheduler.get_next_batch_to_run``) failed to hold, which
-        # should not happen in normal operation. This raise is a last-resort
-        # assertion for that theoretical gap, not a path this repo has
-        # observed firing; it does not need the same per-group isolation as
-        # the decode path because this signature has no ``Req`` handle to mark
-        # aborted (only ``HiggsGenParams``, no scheduler object).
+        # model_runner.py instead). There is no scheduler-side group-atomic
+        # prefill admission any more (removed — it required mutating an
+        # already-``prepare_for_extend``-processed ``ScheduleBatch``, which
+        # corrupts it; see ``OmniScheduler.get_next_batch_to_run``), so a
+        # sibling's prefill landing in a batch without the rest of its group
+        # is now a NORMAL occurrence under load, not a should-be-unreachable
+        # assertion. Isolate rather than raise: demote the group's present
+        # rows to independent singletons for this one step (no blend — a
+        # partial-group average would be silently wrong) and log, instead of
+        # raising and taking down the whole batch (which would abort every
+        # OTHER request co-batched with it here too). This method has no
+        # ``Req`` handle (only ``HiggsGenParams``) so it can't mark these
+        # rows aborted itself; the decode-side ``_populate_fusion_buffers``
+        # re-checks the same registry every step and WILL abort them on the
+        # very next one, since the split persists until the scheduler
+        # resolves it. Known gap (see design doc): this one step's sampled
+        # codes for the isolated rows are still real output — an unblended,
+        # wrong frame can be produced/streamed before the next step's abort
+        # catches up.
         for gid, n_present in present.items():
             expected = self.expected_fusion_group_size(gid)
             if expected and n_present != expected:
-                raise RuntimeError(
-                    f"voice-fusion group {gid!r} split across a prefill batch "
-                    f"(should be unreachable — group-atomic admission is "
-                    f"supposed to hold at prefill): "
-                    f"{n_present}/{expected} sibling rows present in the batch."
+                logger.warning(
+                    "voice-fusion group %r split across a prefill batch: "
+                    "%d/%d sibling rows present. Isolating (no blend) for "
+                    "this step; the decode-side group-completeness guard "
+                    "will abort these rows on the next step since the split "
+                    "persists.",
+                    gid,
+                    n_present,
+                    expected,
                 )
+                for b, p in enumerate(gen_params):
+                    if p.fusion_group_id == gid:
+                        group[b] = b
+                        weight[b] = 1.0
 
         group_B = torch.tensor(group, dtype=torch.long, device=device)
         weight_B = torch.tensor(weight, dtype=torch.float32, device=device)

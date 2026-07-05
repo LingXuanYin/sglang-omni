@@ -273,3 +273,51 @@ def test_populate_buffers_dirty_flag_resets_after_fusion_clears():
     assert runner.model._cg_fusion_group.tolist() == [0, 1]
     assert runner.model._cg_fusion_weight.tolist() == pytest.approx([1.0, 1.0])
     assert runner._fusion_buffers_dirty is False
+
+
+def test_populate_buffers_clean_reset_scrubs_stale_slots_beyond_a_shrunk_batch():
+    """Regression guard: a dirty-to-clean transition at a SMALLER bs than the
+    fusion step that dirtied the buffer must not leave stale non-identity
+    values at slots >= the smaller bs — those buffers are fixed pool_size and
+    never resized per step, so a later batch growing back into those slots
+    with brand-new, unrelated traffic would otherwise silently reuse the
+    finished group's leftover group/weight values and get blended together.
+    """
+    runner, registry = _build_populate_buffers_runner(4)  # pool_size=4
+
+    # Step 1, bs=4: a real fusion group at slots 2,3; slots 0,1 ordinary.
+    requests4, _reqs4 = _fake_requests(4)
+    registry.set("r2", "gid-a", 0.6, is_leader=True)
+    registry.set("r3", "gid-a", 0.4, is_leader=False)
+    runner._populate_fusion_buffers(requests4, bs=4, n_real=4)
+    assert runner.model._cg_fusion_group.tolist() == [0, 1, 2, 2]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx(
+        [1.0, 1.0, 0.6, 0.4]
+    )
+    assert runner._fusion_buffers_dirty is True
+
+    # Step 2, bs=2: the fusion group finished and the batch shrank down to
+    # just the two ordinary rows — a normal, common sequence of events, not
+    # an edge case. This is the dirty-to-clean transition.
+    registry.set("r2", None, 1.0, is_leader=True)
+    registry.set("r3", None, 1.0, is_leader=True)
+    requests2, _reqs2 = _fake_requests(2)
+    runner._populate_fusion_buffers(requests2, bs=2, n_real=2)
+    assert runner._fusion_buffers_dirty is False
+    # The bug: without a full-buffer reset, slots 2,3 would still read
+    # [2, 2] / [0.6, 0.4] here, left over from step 1's write to [:4].
+    assert runner.model._cg_fusion_group.tolist() == [0, 1, 2, 3]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx(
+        [1.0, 1.0, 1.0, 1.0]
+    )
+
+    # Step 3, bs=4 again: traffic grows back with brand-new, unrelated
+    # requests reoccupying slots 2,3 - no fusion registered at all this time.
+    # has_any_fusion() and _fusion_buffers_dirty are both False, so this call
+    # takes the early-return and trusts the buffer as-is.
+    requests4b, _reqs4b = _fake_requests(4)
+    runner._populate_fusion_buffers(requests4b, bs=4, n_real=4)
+    assert runner.model._cg_fusion_group.tolist() == [0, 1, 2, 3]
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx(
+        [1.0, 1.0, 1.0, 1.0]
+    )

@@ -89,6 +89,26 @@ class HiggsTTSModelRunner(ModelRunner):
         """Flush a partial streaming-code window before terminal output."""
         self._flush_code_chunks(request_id, req_data, force=True)
 
+    def lookahead_eligible(self, batch: Any) -> bool:
+        """Route to sync whenever any voice-fusion request is registered.
+
+        ``_populate_fusion_buffers``'s split-group detection sets
+        ``FINISH_ABORT`` during the populate/launch phase — i.e. at launch of
+        step S+1, before step S has even been resolved. Under async-decode
+        lookahead the scheduler launches S+1 before resolving S, and upstream
+        ``process_batch_result_decode`` skips any row that's already
+        ``req.finished()`` by the time it runs (treating it as a stale
+        one-step overrun): the just-aborted row's KV is never released and it
+        never reaches ``stream_output``, so
+        ``OmniScheduler._cascade_abort_split_fusion_group`` never fires — the
+        exact zombie-sibling failure mode that mechanism exists to prevent.
+        Sync-only for fusion traffic sidesteps the whole class of problem:
+        this only disables the async optimization while fusion requests are
+        live, not correctness.
+        """
+        del batch
+        return not self.model.has_any_fusion()
+
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         for req in requests:
@@ -368,19 +388,22 @@ class HiggsTTSModelRunner(ModelRunner):
                 # ``to_finish`` handshake (schedule_batch.py: "if we want to
                 # abort ... set to_finish instead of directly setting
                 # finished_reason ... the req will get filtered and never
-                # respond") because that handshake is for upstream's own
-                # generic token-loop finish check (``Req.check_finished``),
-                # which Higgs TTS's decode path never calls at all — every
-                # other finish signal here, success included
-                # (``_mark_sampler_finished``, right below), already sets
-                # ``finished_reason`` directly at this exact point in the
-                # per-step collect loop. This is the one already-proven-
-                # working precedent to match, not the abort-only one-arg-
-                # construction call site in ``OmniScheduler``. FINISH_ABORT()
-                # itself is the same no-arg construction used there; the
-                # "why" for this specific abort goes to the log above, not a
-                # message argument, since this repo has never exercised any
-                # other FINISH_ABORT signature.
+                # respond"). Upstream DOES call ``req.check_finished()`` every
+                # decode step (``process_batch_result_decode``) — that
+                # handshake is real, not dead code here. This matches
+                # ``_mark_sampler_finished`` (right below), the
+                # already-working precedent for Higgs TTS's normal EOC
+                # completion, which also sets ``finished_reason`` directly at
+                # this same point in the per-step collect loop — not the
+                # abort-only one-arg-construction call site in
+                # ``OmniScheduler``. FINISH_ABORT() itself is the same
+                # no-arg construction used there; the "why" for this specific
+                # abort goes to the log above, not a message argument, since
+                # this repo has never exercised any other FINISH_ABORT
+                # signature. Whether setting ``finished_reason`` directly at
+                # this exact point is safe against upstream's warning is
+                # still an open, real-engine-only verification item — see
+                # the design doc.
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
 
@@ -391,12 +414,31 @@ class HiggsTTSModelRunner(ModelRunner):
             weight, dtype=torch.float32, device=model._cg_fusion_weight.device
         )
         # Record whether the buffer just written can still contain non-default
-        # (grouped) entries. If no fusion request is registered any more, this
-        # call's scan found nothing to group (every rid was absent from the
-        # registry snapshot), so ``group``/``weight`` above were left at their
-        # all-singleton defaults — the buffer write was a no-op clean reset,
-        # and the next call is safe to skip via the early-return above.
-        self._fusion_buffers_dirty = model.has_any_fusion()
+        # (grouped) entries, so the next call is safe to skip via the
+        # early-return above once this goes False.
+        still_dirty = model.has_any_fusion()
+        if not still_dirty:
+            # Clean transition. The write above only covers [:bs] of THIS
+            # step, but an earlier, larger dirty step could have left
+            # non-identity group/weight values at slots >= bs that this call
+            # never reaches (these buffers are fixed pool_size, not resized
+            # per step). If bs shrinks back to non-fusion traffic before this
+            # transition and later grows again while a smaller step's
+            # dirty=False write left those slots stale, a future batch could
+            # silently reuse rows [bs, prior_bs) and get blended together as
+            # if they were still that finished group — two unrelated ordinary
+            # requests corrupted into each other's distributions. Reset the
+            # WHOLE buffer here, once, rather than tracking a high-water mark:
+            # this only runs on the rare dirty-to-clean transition (the
+            # early-return above already skips every call after), and the
+            # cost is one bounded, pool_size-sized write — negligible next to
+            # the dict scan this path already routes around.
+            pool_size = model._cg_fusion_group.shape[0]
+            model._cg_fusion_group[:] = torch.arange(
+                pool_size, dtype=torch.long, device=model._cg_fusion_group.device
+            )
+            model._cg_fusion_weight[:] = 1.0
+        self._fusion_buffers_dirty = still_dirty
 
     @staticmethod
     def _extract_decode_sampling_params(requests):

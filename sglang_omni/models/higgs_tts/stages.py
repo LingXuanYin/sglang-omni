@@ -155,8 +155,12 @@ def _fusion_ref_entries(inputs: dict) -> list[dict] | None:
         codes = r.get("reference_codes")
         if codes is not None:
             entries.append(
-                {"audio": None, "codes": codes, "weight": weight,
-                 "reference_text": reference_text}
+                {
+                    "audio": None,
+                    "codes": codes,
+                    "weight": weight,
+                    "reference_text": reference_text,
+                }
             )
             continue
         if "bytes" in r or "base64" in r or "data" in r:
@@ -169,8 +173,12 @@ def _fusion_ref_entries(inputs: dict) -> list[dict] | None:
                 f"or reference_codes"
             )
         entries.append(
-            {"audio": audio, "codes": codes, "weight": weight,
-             "reference_text": reference_text}
+            {
+                "audio": audio,
+                "codes": codes,
+                "weight": weight,
+                "reference_text": reference_text,
+            }
         )
     return entries
 
