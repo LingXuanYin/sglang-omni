@@ -983,6 +983,7 @@ def test_higgs_model_runner_marks_sampler_finish() -> None:
     runner._outbox = None
     runner._vocoder_target = "vocoder"
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         _rid_to_row={"req": 0},
         _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
@@ -1019,6 +1020,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
     runner._outbox = queue.Queue()
     runner._vocoder_target = "vocoder"
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         _rid_to_row={"req": 0},
         _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
@@ -1307,6 +1309,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
     runner._outbox = None
     runner._vocoder_target = "vocoder"
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         _cg_row_indices=torch.tensor([0]),
         _cg_active_delay_count=torch.tensor([8], dtype=torch.int32),
         _cg_active_eoc_countdown=torch.tensor([0], dtype=torch.int32),
@@ -1361,6 +1364,7 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     runner._outbox = None
     runner._vocoder_target = "vocoder"
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         _cg_row_indices=torch.arange(n),
         _cg_active_delay_count=torch.zeros(n, dtype=torch.int32),
         _cg_active_eoc_countdown=torch.zeros(n, dtype=torch.int32),
@@ -1435,6 +1439,7 @@ def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> N
     logits = torch.randn(n, k, vocab)
 
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         modality_head=SimpleNamespace(
             generate=lambda hidden: logits[: hidden.shape[0]]
         ),
@@ -1494,6 +1499,7 @@ def test_higgs_model_runner_skips_already_finished_eager_request() -> None:
     runner._outbox = None
     runner._vocoder_target = "vocoder"
     runner.model = SimpleNamespace(
+        has_any_fusion=lambda: False,
         _rid_to_row={"req": 0},
         _output_codes={"req": [torch.tensor([EOC_ID, 1, 2])]},
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
