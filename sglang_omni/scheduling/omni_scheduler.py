@@ -504,6 +504,15 @@ class OmniScheduler:
         # group so a follower's sampler slot can't leak when the leader is
         # aborted. Empty for all non-fusion requests.
         self._fusion_group_members: dict[str, set[str]] = {}
+        # Voice-fusion prefill-admission gate: consecutive-tick count of a
+        # complete group being withheld for budget/slot reasons (NOT for
+        # being incomplete -- an incomplete group always eventually either
+        # completes or gets cascade-aborted by the existing decode-time
+        # backstop, so it never needs a give-up path of its own). Without
+        # this, a group whose estimated cost this gate keeps judging
+        # unaffordable would be withheld forever with no error ever reaching
+        # the client -- see ``_reorder_queue_for_atomic_fusion_admission``.
+        self._fusion_group_withhold_ticks: dict[frozenset, int] = {}
 
     def bind_model_runner(self, model_runner: Any) -> None:
         """Attach a custom runner and its SGLang execution-contract bridge.
@@ -2494,37 +2503,57 @@ class OmniScheduler:
         )
 
     def get_next_batch_to_run(self):
-        """Upstream batch selection, plus voice-fusion split-group visibility.
+        """Upstream batch selection, gated for group-atomic fusion admission.
 
         An earlier version of this override tried to enforce group-atomic
-        prefill admission here: if a chosen prefill batch contained only some
-        members of a fusion group, it trimmed ``batch.reqs`` down to the
-        present members and requeued the rest. That is unsound and was
-        removed. By the time upstream's ``get_next_batch_to_run`` returns a
-        prefill batch, ``ScheduleBatch.prepare_for_extend`` has already
-        flattened every req's tokens/KV slots/positions into batch-wide
-        tensors (``input_ids``, ``seq_lens``, ``out_cache_loc``, ...) sized to
-        the FULL original ``batch.reqs``. Trimming ``batch.reqs`` afterward
+        prefill admission *after* upstream had already chosen a batch: if it
+        contained only some members of a fusion group, it trimmed
+        ``batch.reqs`` down to the present members and requeued the rest.
+        That is unsound and was removed. By the time upstream's
+        ``get_next_batch_to_run`` returns a prefill batch,
+        ``ScheduleBatch.prepare_for_extend`` has already flattened every
+        req's tokens/KV slots/positions into batch-wide tensors
+        (``input_ids``, ``seq_lens``, ``out_cache_loc``, ...) sized to the
+        FULL original ``batch.reqs``. Trimming ``batch.reqs`` afterward
         desyncs those tensors from the now-shorter req list and corrupts the
         batch for *every* request in it, fusion or not — there is no
         supported way to shrink an already-prepared extend batch (upstream's
         own ``filter_batch`` is a decode-batch tool; it never touches extend
         tensors).
 
-        Correctness for a split group is instead enforced entirely at decode
-        time: ``HiggsTTSModelRunner._populate_fusion_buffers`` isolates a
-        group's present rows (demotes them to singletons, aborts them)
-        instead of blending an incomplete set, and ``stream_output``'s
-        cascade-abort kills the rest of the group when one member finishes via
-        that explicit abort, so a sibling stranded on the other side of a
-        split never lingers in ``waiting_queue`` forever.
+        Atomic admission is instead enforced *before* upstream ever runs, by
+        gating its input: ``self.waiting_queue`` is a plain Python list upstream
+        reads from (via ``PrefillAdder.add_one_req`` in a simple
+        first-fit-then-stop loop) — reordering or filtering that list is
+        just list surgery, with no tensors involved yet, so it carries none
+        of the risk above. See ``_reorder_queue_for_atomic_fusion_admission``
+        for the actual gate: incomplete groups are withheld entirely, and
+        complete-and-affordable groups are moved to the front (each group's
+        members kept contiguous, ahead of every ordinary request) so no
+        unrelated request can consume the prefill budget in between two
+        members of the same group. This is a conservative, best-effort gate,
+        not a hard proof — see that method's docstring for exactly what it
+        does and does not guarantee (it also gates on the running-request
+        slot budget and the chunked-prefill/input-token budgets, not just
+        the KV-token one, and gives up on a group that never fits after
+        enough consecutive ticks rather than withholding it forever). The
+        decode-time backstop (``HiggsTTSModelRunner._populate_fusion_buffers``
+        isolating a split group's present rows, ``stream_output``'s
+        cascade-abort cleaning up the rest) stays in place unchanged as
+        defense in depth for whatever this gate doesn't catch — e.g. a
+        KV-pressure retract splitting an already-admitted, already-decoding
+        group, which this prefill-time gate cannot see or prevent.
 
-        This method stays read-only: it only logs when a fusion group lands
-        partially in a prefill batch, for visibility into how often that
-        happens. Non-fusion batches are untouched: ``_fusion_group_members``
-        is empty, so the scan is a cheap no-op on the hot path.
+        Non-fusion traffic is untouched: ``_fusion_group_members`` is empty,
+        so ``_reorder_queue_for_atomic_fusion_admission`` is a cheap no-op on
+        the hot path.
         """
-        batch = _Upstream.get_next_batch_to_run(self)
+        withheld = self._reorder_queue_for_atomic_fusion_admission()
+        try:
+            batch = _Upstream.get_next_batch_to_run(self)
+        finally:
+            self._restore_queue_after_atomic_fusion_admission(withheld)
+
         if batch is None or not self._fusion_group_members:
             return batch
         reqs = getattr(batch, "reqs", None)
@@ -2541,16 +2570,335 @@ class OmniScheduler:
         for members, present in present_by_group.items():
             if present != set(members):
                 logger.debug(
-                    "voice-fusion group landed partially in a prefill batch: "
-                    "%d/%d sibling(s) present (%s). The rest will join in a "
-                    "later batch; if they never do, the decode-time "
-                    "group-completeness guard aborts this group instead of "
-                    "blending an incomplete set.",
+                    "voice-fusion group landed partially in a prefill batch "
+                    "despite the admission gate: %d/%d sibling(s) present "
+                    "(%s). The rest will join in a later batch; if they "
+                    "never do, the decode-time group-completeness guard "
+                    "aborts this group instead of blending an incomplete "
+                    "set.",
                     len(present),
                     len(members),
                     sorted(present),
                 )
         return batch
+
+    def _estimate_available_prefill_tokens(self) -> int:
+        """Conservative (pessimistic) estimate of how many fresh prefill
+        tokens the KV pool can absorb right now, mirroring the dominant term
+        of upstream ``PrefillAdder.rem_total_tokens``/``budget_state`` —
+        available + evictable KV, minus a reservation for already-in-flight
+        requests' future decode tokens, further capped by the chunked-prefill
+        and whole-pass input-token budgets — without reproducing SWA/dllm/
+        priority-preemption nuances, which this Higgs TTS deployment does not
+        use. Chunked prefill, unlike those, IS in use here (``engine_builder.py``
+        sets ``chunked_prefill_size=8192``) and is folded in below.
+
+        Reserves the FULL (undiscounted) ``max_new_tokens`` for every
+        already-in-flight request, where the real adder discounts running
+        requests' reservation by ``new_token_ratio`` (<= 1.0). That makes
+        this term always estimate *at or below* the real adder's number for
+        the same requests: under-reserving only ever holds a fusion group
+        back an extra tick (cheap), never lets one through that the real
+        adder would not have admitted.
+
+        "Already-in-flight" (``_prefill_in_flight_reqs``) is deliberately
+        wider than ``self.running_batch``: upstream's own
+        ``get_new_batch_prefill`` folds the previous tick's batch(es) into
+        ``running_batch`` *inside the same call this gate runs before* — at
+        the instant this method runs, a just-prefilled batch may still be
+        sitting in ``self.cur_batch``/``self.last_batch`` and not yet
+        reflected in ``self.running_batch.reqs``. Reserving only against
+        ``running_batch`` would then overestimate free capacity for exactly
+        one tick after a burst of prefills — folding in ``cur_batch``/
+        ``last_batch`` (deduped by rid) closes that window. The same
+        widened set is used for the running-request-slot estimate in
+        ``_reorder_queue_for_atomic_fusion_admission`` for the identical
+        reason: ``get_num_allocatable_reqs(running_bs)`` is upstream's own
+        second, independent stop condition, and it has the exact same
+        stale-``running_batch`` window if computed from
+        ``len(self.running_batch.reqs)`` alone.
+        """
+        try:
+            available = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+        except Exception:
+            logger.exception(
+                "voice-fusion atomic admission: failed to read KV pool "
+                "availability, treating this tick as having no free budget"
+            )
+            return 0
+
+        reserved_for_running = sum(
+            int(getattr(req.sampling_params, "max_new_tokens", 0) or 0)
+            for req in self._prefill_in_flight_reqs()
+        )
+        available = max(0, available - reserved_for_running)
+
+        for cap in (self.chunked_prefill_size, self.max_prefill_tokens):
+            if cap is not None:
+                available = min(available, int(cap))
+
+        return available
+
+    def _prefill_in_flight_reqs(self) -> list[Any]:
+        """Every request already holding (or about to hold, once upstream
+        folds pending batches in this same tick) a running-batch slot:
+        ``self.running_batch.reqs`` plus any not-yet-merged
+        ``self.cur_batch``/``self.last_batch`` reqs, deduped by rid. See
+        ``_estimate_available_prefill_tokens``'s docstring for why this must
+        be wider than ``running_batch`` alone.
+        """
+        in_flight = list(self.running_batch.reqs)
+        seen_rids = {req.rid for req in in_flight}
+        for batch in (self.cur_batch, self.last_batch):
+            for req in getattr(batch, "reqs", None) or []:
+                if req.rid not in seen_rids:
+                    in_flight.append(req)
+                    seen_rids.add(req.rid)
+        return in_flight
+
+    def _fusion_group_prefill_cost(self, members: list[Any]) -> int:
+        """Conservative per-request prefill cost, matching the terms
+        ``PrefillAdder.add_one_req`` uses for its primary budget gate:
+        ``req.extend_input_len`` at admission time, approximated here as
+        ``len(origin_input_ids)`` (the full built prompt length) rather than
+        the real, possibly-smaller ``extend_input_len`` a radix-cache prefix
+        hit could produce. This is deliberately the pessimistic direction —
+        if sglang's own KV radix cache does shave real cost below this
+        estimate for some sibling, this method simply overestimates that
+        one's cost, which only makes the gate MORE likely to withhold
+        (never lets an under-estimated group through). Summed across every
+        member of the group plus one ``page_size`` of alignment slack per
+        member (same reservation ``add_one_req`` itself adds).
+        """
+        return sum(
+            len(req.origin_input_ids)
+            + int(getattr(req.sampling_params, "max_new_tokens", 0) or 0)
+            + self.page_size
+            for req in members
+        )
+
+    # A complete group that keeps failing this gate's budget/slot checks is
+    # withheld again every tick with no other mechanism to ever resolve it
+    # (unlike an INCOMPLETE group, which always eventually either completes
+    # or gets cascade-aborted by the existing decode-time backstop once any
+    # member finishes elsewhere — see ``_fusion_group_withhold_ticks``'s
+    # docstring). Past this many consecutive ticks, give up rather than
+    # withhold forever with the client never getting a response.
+    _MAX_FUSION_WITHHOLD_TICKS = 200
+
+    def _reorder_queue_for_atomic_fusion_admission(self) -> list:
+        """Gate + reorder ``self.waiting_queue`` in place for this tick's
+        admission pass; returns the withheld reqs (already removed from
+        ``self.waiting_queue``) so ``_restore_queue_after_atomic_fusion_admission``
+        can put them back once upstream is done with the queue. Takes
+        ``self._request_admission_lock`` for the whole read-modify-write of
+        ``self.waiting_queue`` — the same lock ``abort()`` already takes
+        around its own mutation of that list — since ``abort()`` can run
+        concurrently on another thread (aborts arrive off the Stage's own
+        event loop, not this scheduler's tick thread).
+
+        - A fusion group not fully present in ``self.waiting_queue`` right
+          now (some sibling hasn't been built yet, or is off running/
+          decoding, or was retracted and hasn't rejoined) is withheld in
+          full: admitting the present subset to prefill is exactly the
+          partial-admission defect this gate exists to prevent. This case
+          has no give-up counter — it always eventually resolves on its own.
+        - If a chunked-prefill request is currently in flight
+          (``self.chunked_req is not None``), it already owns an unknown
+          share of this tick's chunk/input-token budget that this gate has
+          no way to read back out; every fusion group is withheld this tick
+          rather than estimate against a partially-spent, unobservable
+          budget.
+        - A fully-present group that either exceeds this tick's allocatable
+          running-request slots (``get_num_allocatable_reqs``, computed from
+          the same widened ``_prefill_in_flight_reqs`` count the token
+          estimate uses, not raw ``len(self.running_batch.reqs)`` — the slot
+          cap has the identical stale-``running_batch`` window the token
+          estimate closes, see ``_estimate_available_prefill_tokens``) or
+          whose conservative combined cost (see
+          ``_fusion_group_prefill_cost``) does not fit this tick's
+          conservative free budget (see ``_estimate_available_prefill_tokens``)
+          is withheld, to be retried next tick rather than risk a partial
+          admission this one.
+        - A fully-present group that fits both is moved to the front of the
+          queue, ahead of every ordinary request, with its members kept
+          contiguous. Upstream's admission loop is a simple "iterate in
+          queue order, stop at the first request that doesn't fit" pass (see
+          ``PrefillAdder.add_one_req`` / the ``break`` in
+          ``Scheduler._get_new_batch_prefill_raw``) — placing every
+          admittable group ahead of ordinary traffic means no unrelated
+          request can consume budget in between two members of the same
+          group, which is the actual, order-dependent way a "there was
+          enough total budget" estimate could still be undermined.
+        - Ordinary (non-fusion) requests keep their original relative order,
+          appended after every admitted group.
+
+        Multiple admittable groups this tick each reserve their estimated
+        cost/slots against a shared running budget in the order encountered,
+        so the total reserved across all of them never exceeds the tick's
+        estimated free capacity either.
+
+        A group that has failed the budget/slot check for
+        ``_MAX_FUSION_WITHHOLD_TICKS`` consecutive ticks is given up on: it
+        is aborted with a client-visible error instead of being withheld
+        again, and is excluded from the returned (to-be-restored) list.
+        """
+        if not self._fusion_group_members:
+            return []
+
+        with self._request_admission_lock:
+            present_by_group: dict[frozenset, list] = {}
+            ordinary: list = []
+            for req in self.waiting_queue:
+                members = self._fusion_group_members.get(req.rid)
+                if members is None:
+                    ordinary.append(req)
+                    continue
+                present_by_group.setdefault(frozenset(members), []).append(req)
+
+            if not present_by_group:
+                return []
+
+            chunked_req_in_flight = self.chunked_req is not None
+            available = (
+                0 if chunked_req_in_flight else self._estimate_available_prefill_tokens()
+            )
+            allocatable_slots = (
+                0
+                if chunked_req_in_flight
+                else self.get_num_allocatable_reqs(len(self._prefill_in_flight_reqs()))
+            )
+
+            admit_groups: list = []
+            withheld: list = []
+            held_groups: list = []  # complete-but-withheld: charged a tick
+            for members, present in present_by_group.items():
+                if len(present) < len(members):
+                    withheld.extend(present)
+                    continue
+                if chunked_req_in_flight:
+                    logger.debug(
+                        "voice-fusion group %s withheld: a chunked-prefill "
+                        "request is in flight, already spending an unknown "
+                        "share of this tick's budget.",
+                        sorted(members),
+                    )
+                    withheld.extend(present)
+                    held_groups.append(members)
+                    continue
+                if len(present) > allocatable_slots:
+                    logger.debug(
+                        "voice-fusion group %s (%d members) exceeds this "
+                        "tick's allocatable running-request slots (%d) -- "
+                        "withholding rather than risk a partial admission.",
+                        sorted(members),
+                        len(members),
+                        allocatable_slots,
+                    )
+                    withheld.extend(present)
+                    held_groups.append(members)
+                    continue
+                cost = self._fusion_group_prefill_cost(present)
+                if cost < available:
+                    admit_groups.append(present)
+                    available -= cost
+                    allocatable_slots -= len(present)
+                else:
+                    logger.debug(
+                        "voice-fusion group %s is complete (%d members) but "
+                        "its estimated prefill cost %d exceeds this tick's "
+                        "estimated free budget %d -- withholding the whole "
+                        "group rather than risk a partial admission.",
+                        sorted(members),
+                        len(members),
+                        cost,
+                        available,
+                    )
+                    withheld.extend(present)
+                    held_groups.append(members)
+
+            given_up_rids = self._advance_withhold_ticks_and_give_up(held_groups)
+            if given_up_rids:
+                withheld = [req for req in withheld if req.rid not in given_up_rids]
+
+            if not admit_groups and not withheld:
+                return []
+
+            self.waiting_queue = [
+                req for group in admit_groups for req in group
+            ] + ordinary
+            return withheld
+
+    def _advance_withhold_ticks_and_give_up(
+        self, held_groups: list[frozenset]
+    ) -> set[str]:
+        """Bump the consecutive-withhold counter for every complete-but-held
+        group this tick (``held_groups``); drop the counter for any
+        previously-tracked group not held this time (it was admitted, or
+        became incomplete again, or was already given up on). Past
+        ``_MAX_FUSION_WITHHOLD_TICKS`` consecutive ticks, give up: emit a
+        client-visible error against every rid in the group (cheap and
+        correct for all of them — a follower's synthetic rid is a routing
+        key nobody subscribed to, exactly like ``_cascade_abort_split_fusion_group``'s
+        cascade errors) and ``abort()`` the group (calling it on any single
+        member cascades to the rest via ``_fusion_group_members``). Returns
+        the set of rids given up on this call, so the caller excludes them
+        from what it restores to ``self.waiting_queue``.
+        """
+        held_set = set(held_groups)
+        for gid in list(self._fusion_group_withhold_ticks):
+            if gid not in held_set:
+                self._fusion_group_withhold_ticks.pop(gid, None)
+
+        given_up: set[str] = set()
+        for members in held_groups:
+            ticks = self._fusion_group_withhold_ticks.get(members, 0) + 1
+            if ticks < self._MAX_FUSION_WITHHOLD_TICKS:
+                self._fusion_group_withhold_ticks[members] = ticks
+                continue
+            self._fusion_group_withhold_ticks.pop(members, None)
+            logger.warning(
+                "voice-fusion group %s withheld for %d consecutive ticks "
+                "without ever fitting the admission budget -- giving up and "
+                "aborting it with a client-visible error instead of "
+                "withholding indefinitely.",
+                sorted(members),
+                ticks,
+            )
+            error = RuntimeError(
+                "voice-fusion group could not be admitted to prefill after "
+                f"{ticks} scheduler ticks -- the server is too busy for this "
+                "many simultaneous reference voices right now; try again or "
+                "with fewer references"
+            )
+            for rid in members:
+                self._emit_request_error(rid, error)
+                given_up.add(rid)
+            self.abort(next(iter(members)))
+        return given_up
+
+    def _restore_queue_after_atomic_fusion_admission(self, withheld: list) -> None:
+        """Put back reqs withheld by ``_reorder_queue_for_atomic_fusion_admission``
+        once upstream is done reading ``self.waiting_queue``. Takes the same
+        lock that method (and ``abort()``) use, and drops any req that was
+        aborted *during the window it was withheld* (e.g. a client cancel, or
+        this gate's own give-up path, arriving on another thread while this
+        req sat outside ``self.waiting_queue`` and so was invisible to
+        ``abort()``'s own queue-filter) — otherwise it would be silently
+        resurrected as an ordinary (no-longer-grouped) request and admitted
+        later despite having already been torn down.
+        """
+        if not withheld:
+            return
+        with self._request_admission_lock:
+            survivors = [
+                req for req in withheld if req.rid not in self._aborted_request_ids
+            ]
+            if survivors:
+                self.waiting_queue = survivors + self.waiting_queue
 
     @staticmethod
     def _batch_is_decode(batch: ScheduleBatch) -> bool:

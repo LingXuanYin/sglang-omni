@@ -17,7 +17,7 @@
 | 归约钩子 | `model.py` `decode_codebooks_batch` / `decode_codebooks_batch_cg`,在 `batched_step` 前替换 logits |
 | 融合注册表 | `fusion.py::FusionRegistry`(线程安全,build 线程写、GPU worker 线程读);`model.py` 的 `set_fusion_group`/`has_any_fusion`/`is_fusion_follower`/`mark_fusion_group_poisoned` 等是对它的薄委托 |
 | 请求拆分 | `request_builders.py::build_fusion_sibling_requests`:1 融合 payload → N 条 `HiggsSGLangRequestData`,共享 `fusion_group_id` + 一个具体 seed,leader=第一个 sibling |
-| 组落批可见性(非强制) | `omni_scheduler.py::OmniScheduler.get_next_batch_to_run`(override):只读扫描,某融合组只有部分成员落在同一 prefill batch 时打日志;不改动 batch(见下文"为什么不强制原子准入") |
+| prefill 侧原子准入(尽力,非硬保证) | `omni_scheduler.py::OmniScheduler.get_next_batch_to_run`(override):在调用上游选批之前,先对 `self.waiting_queue`(一个纯 Python list,尚未流入 `ScheduleBatch.prepare_for_extend`)做门控——缺员的组整组暂扣,凑齐且预算内的组整组挪到队首、成员相邻,排在普通请求前面;调用完再把暂扣的请求放回队首。只动 list,不碰张量(见下文"Co-batching") |
 | prefill 侧隔离 + 中毒标记 | `model.py::_batch_local_fusion`:prefill 完成后触发首个解码 token 那一步若发现组缺员,隔离在场行(不参与融合)并把该组标记为 `FusionRegistry._poisoned`——因为这里没有 `Req` 句柄,没法自己 abort,而组之后可能"自愈"(所有成员后来都凑齐了),中毒标记是让下面的完整性检查即便凑齐也照样 abort 的唯一办法 |
 | 组完整性兜底 | `model_runner.py::_populate_fusion_buffers`(decode CG 路径,真正会遇到"组被拆散"的地方,无论是 KV retract、sibling 还没轮到,还是曾经中毒但现在看起来凑齐的组) |
 | 组级联清理 | `omni_scheduler.py::OmniScheduler._cascade_abort_split_fusion_group`(在 `stream_output` 里触发):一个融合成员以 `FINISH_ABORT` 结束时,把组里还注册着的其它成员一起 abort(并向每个被级联的成员发一条 client 可见的 error,leader 也不例外),防止缺席的 sibling 变成永久卡在 `waiting_queue` 里的僵尸请求 |
@@ -45,28 +45,109 @@ log 空间喂给标准 sampler;单行组(非融合请求)原样返回**未经任
 `fuse_group_generation_done` 做"组内任一成员 done ⇒ 全部 done"的屏障,让共享 seed 的
 sibling 行在同一步终止,不会有的先跑完、有的还在解码的错位。
 
-## Co-batching:decode 时隔离 + 级联 abort(没有强制的 prefill 原子准入)
+## Co-batching:prefill 侧原子准入门控 + decode 侧隔离/级联 abort 兜底
 
 "同批锁步"这件事,理想情况下希望调度器保证 N 个 sibling 总是一起进 prefill、一起进
-decode。这里**曾经**试图在 `OmniScheduler.get_next_batch_to_run` 里强制这一点:上游选完
-prefill batch 后,若某融合组只有部分成员在这批里,就把这些成员从 `batch.reqs` 里摘出
-退回 `waiting_queue`。**这个机制已经被移除,因为它是错的**:上游 `get_new_batch_prefill`
-返回 batch 之前,已经调用过 `ScheduleBatch.prepare_for_extend()`,把整批请求的
-`input_ids`/`seq_lens`/`out_cache_loc` 等张量按*原始*(未摘除前的)`reqs` 顺序拍平好了。
-事后再摘 `batch.reqs` 会让这些张量与摘除后的 `reqs` 列表长度对不上,搞坏的不只是被摘除的
-sibling,是**这一整批**请求(含无关的普通请求)。上游自己的 `filter_batch` 是只用于 decode
-batch 的工具,从不touch extend 张量——没有支持的方式能在 `prepare_for_extend` 之后收缩一个
-已经组装好的 prefill batch。
+decode。这里**曾经**试图在 `OmniScheduler.get_next_batch_to_run` 里、在上游已经选完
+batch **之后**强制这一点:若某融合组只有部分成员在这批里,就把这些成员从 `batch.reqs`
+里摘出退回 `waiting_queue`。**这个机制已经被移除,因为它是错的**:上游
+`get_new_batch_prefill` 返回 batch 之前,已经调用过 `ScheduleBatch.prepare_for_extend()`,
+把整批请求的 `input_ids`/`seq_lens`/`out_cache_loc` 等张量按*原始*(未摘除前的)`reqs`
+顺序拍平好了。事后再摘 `batch.reqs` 会让这些张量与摘除后的 `reqs` 列表长度对不上,搞坏的
+不只是被摘除的 sibling,是**这一整批**请求(含无关的普通请求)。上游自己的 `filter_batch`
+是只用于 decode batch 的工具,从不 touch extend 张量——没有支持的方式能在
+`prepare_for_extend` 之后收缩一个已经组装好的 prefill batch。
 
-现在的做法只剩一层,且是只读、绝不碰 `ScheduleBatch` 内部张量的:
+现在的原子准入改为在上游选批**之前**做门控,而不是事后修剪结果——`self.waiting_queue`
+在这一步还只是一个纯 Python list,尚未流入 `ScheduleBatch`/`prepare_for_extend`,对它做
+过滤和重排不涉及任何张量,不会有上面那种腐化风险:
 
-**Prefill 侧(纯观测,不强制)**:`get_next_batch_to_run` 仍然扫描本批里的融合组成员,
-若发现某组只有部分成员在场,只打一条 debug 日志,不做任何 batch 改动。sibling 们是否恰好
-一起被 upstream 的 PrefillAdder 选中,完全取决于它们在 `waiting_queue` 里是否相邻、以及
-当前 tick 的 token/KV 预算——多数情况下会一起进(`_enqueue_built_request` 把它们相邻插入
-队列),但没有硬保证。
+**Prefill 侧(门控,尽力而为,非硬证明)**:`get_next_batch_to_run` 在调用
+`_Upstream.get_next_batch_to_run` 之前,先跑
+`_reorder_queue_for_atomic_fusion_admission`(整个方法持有 `self._request_admission_lock`——
+和 `abort()` 自己改 `self.waiting_queue` 用的是同一把锁,因为 abort 可能从另一个线程——Stage
+自己的事件循环,不是这个调度器的 tick 线程——并发跑进来;这把锁是 `threading.RLock()`,可重入,
+所以下面第 5 步里 give-up 路径调用 `self.abort()`——它自己也会 `with self._request_admission_lock`
+——不会自锁死):
 
-**Decode 侧(真正的正确性防线)**:
+1. 扫描 `self.waiting_queue`,按 `_fusion_group_members` 把请求分成"某融合组的成员"和
+   "普通请求"。
+2. 一个融合组若**不是**全部成员当前都在 `waiting_queue` 里(有的还没 build 完、有的在别处
+   跑着、有的刚被 retract 还没归队),这一组当前在场的成员**整组暂扣**——不放进这次要交给
+   upstream 的队列;这正是"部分成员被送进 prefill"这件事本身,不该发生。这种"缺员"不计入下面
+   第 5 步的放弃计数——它总会自己收敛(build 迟早完成,或者 decode 侧兜底迟早把它级联 abort
+   掉),不需要一个放弃机制。
+3. 若这一刻有一个 chunked prefill 请求正在处理中(`self.chunked_req is not None`),这个 tick
+   **所有**融合组一律暂扣——chunked 请求已经吃掉了这个 tick 一部分 chunk/input token 预算,
+   而这个数字从外面读不到,与其按一个已经被吃掉一部分、读不出真实剩余值的预算去估算,不如整体
+   保守跳过这个 tick。
+4. 一个全员在场、且没有 chunked 请求在跑的组,先按请求数(而不是 token 数)上限检查——
+   upstream 的准入循环不仅在 token 预算耗尽时停止,一旦
+   `len(adder.can_run_list) >= get_num_allocatable_reqs(running_bs)`(通常由
+   `max_running_requests` 决定)也会整体停止,这和 token 预算是两个独立的维度,只查 token
+   预算不够;超过请求数上限的组直接暂扣。这里的 `running_bs` 和下面 token 预算用的是**同一份**
+   `_prefill_in_flight_reqs()`(见下)算出来的在途请求数,而不是单独去读
+   `len(self.running_batch.reqs)`——原因和 token 预算完全一样:upstream 把上一个 tick 的
+   batch 折进 `running_batch`这件事,发生在这个门控运行之后、真正的准入循环开始之前,门控这一刻
+   看到的 `running_batch` 可能还没算上刚结束的那一批,如果只用它算请求数上限,会在 prefill 爆发
+   后的那一个 tick 里把这个上限算大,放行一个实际会被请求数上限拦腰截断的组。
+   再用 `_estimate_available_prefill_tokens`(镜像 `PrefillAdder.rem_total_tokens`/
+   `budget_state` 的主项:可用 KV + 可驱逐 tree cache,减去 `_prefill_in_flight_reqs()`——
+   `self.running_batch.reqs` 并上尚未被 upstream 折入的 `self.cur_batch`/`self.last_batch`
+   (按 rid 去重)——预留的 `max_new_tokens` 上界,再用 `chunked_prefill_size`/
+   `max_prefill_tokens` 分别封顶)和
+   `_fusion_group_prefill_cost`(镜像 `add_one_req` 的主项:
+   `len(origin_input_ids) + max_new_tokens + page_size`,`origin_input_ids` 是刻意偏保守的
+   `extend_input_len` 近似值——如果 sglang 自己的 radix KV cache 真的给某个 sibling 命中了
+   前缀、让它的真实 `extend_input_len` 比这个估计小,这只会让这一项的估算偏大,方向仍然安全,
+   只会让门控更容易判断"装不下"而不是更容易误判"装得下")判断这一 tick 估计的空闲预算是否装
+   得下整组;装得下就把这一组整体挪到 `waiting_queue` 最前面、成员紧邻排列、排在所有普通请求
+   之前(多组都装得下时,按扫描到的顺序依次从同一份预算/名额里扣,像多个背包物品顺序装箱一样,
+   不会让后一组的估计撞车);装不下就和"缺员"的组一样被整组暂扣,等下一个 tick(可能因为已运行
+   请求推进了 decode 释放出更多 KV,或者 chunked 请求跑完了)再试一次——这种"预算/名额不够"的
+   暂扣**会**计入第 5 步的放弃计数。
+5. 一个组因为预算/名额不够被连续暂扣满 `_MAX_FUSION_WITHHOLD_TICKS`(200)个 tick 仍然没有
+   被放行,就不再无限期暂扣下去——`_advance_withhold_ticks_and_give_up` 直接放弃它:对组里每个
+   rid 都发一条 client 可见的 error(和 `_cascade_abort_split_fusion_group` 一样,对 follower
+   的合成 rid 发也无妨,反正没人订阅那个 routing key),然后 `abort()` 掉组里任意一个成员(会
+   级联清掉整组)。给出的 rid 集合会从这次暂扣列表里剔除,不会在下面第 6 步被放回队列。没有这个
+   放弃路径,一个门控自己估算"永远装不下"的组会被无限期暂扣,客户端连一个最终的 abort/error 都
+   等不到——这本身就是这个门控自己新引入的一种活性倒退,必须堵上。
+6. 暂扣的(未被放弃的)请求在 upstream 调用返回后(`finally` 块里、同样持锁)立即放回
+   `waiting_queue` 最前面。**放回之前会先剔除掉这段时间内被 `_aborted_request_ids` 标记过的
+   rid**:一个正处于暂扣状态的请求本来就不在 `self.waiting_queue` 里,如果这时候另一个线程对
+   它(或组里任意成员)调用了 `abort()`——不管是客户端主动 cancel,还是第 5 步自己的放弃路径——
+   `abort()` 自己那份"从 `waiting_queue` 里摘除"的清理逻辑根本找不到它(它已经不在队列里了),
+   但它确实已经被标记为 aborted、组注册表也被清掉了;如果放回时不做这个检查,这个已经被判了死刑
+   的请求会被原样复活成一个不再属于任何融合组的普通请求,之后被正常 admit、解码,把已经废弃的
+   请求当成正常任务跑到底。
+
+**为什么"整组挪到队首"是必要的,不只是"全部在场"就够**:upstream 的准入循环
+(`Scheduler._get_new_batch_prefill_raw` 内的 `for req in self.waiting_queue: ...
+if res != CONTINUE: break`)是按队列顺序逐个尝试、一旦遇到装不下的请求就整体停止——不是
+"跳过装不下的、继续找后面能装的"。如果一组的成员虽然都在场,但中间被普通请求隔开,某个插在
+中间的无关请求恰好把预算耗尽,组内排在它后面的成员这一 tick 就轮不到,组照样被拆散,即使
+"预算总量看起来够整组用"这个判断本身没错。把每个装得下的组整体挪到队首、成员相邻,能保证没有
+无关请求能插进同一组的两个成员之间抢预算,这是让"总预算够"这个估计真正转化为"这组一定一起被
+尝试"的关键一步,不能省略。这个前提依赖部署用的是默认的 FCFS 调度策略(`calc_priority` 对 FCFS
+是纯 no-op,不会在门控之后再打乱队列顺序)——如果哪天切到 `lpm`/`lof`/`random` 之类会重排
+`waiting_queue` 的策略,这里的"整组相邻"假设会被 upstream 自己的重排破坏,目前代码和文档都没有
+去强制固定/校验 `schedule_policy`,这是一个隐式依赖,没有做防御性检查。
+
+**这个门控是保守估计,不是精确复刻,也不是数学证明**:`_estimate_available_prefill_tokens`
+故意只镜像 `PrefillAdder` 预算核算里"可用 KV/tree cache 减去在途请求预留、再按
+chunked-prefill/整段 input token 上限封顶"这几项主项,不管 SWA/dllm/优先级抢占这些 Higgs TTS
+用不到的分支,也不去精确复刻 `new_token_ratio` 折算——chunked prefill 本身**确实在用**
+(`engine_builder.py` 设了 `chunked_prefill_size=8192`),不是"用不到",已经作为一个独立维度
+折进了预算封顶里,而不是被忽略。本机没有真实引擎能拿来验证一份"精确复刻"是否真的处处一致,与其
+做一个自信但可能在某个分支上算错、从而**放行本不该放行的组**的精确版本,不如做一个"宁可低估、
+多等一个 tick"的保守版本——低估的唯一后果是这一 tick 白等,从不会让一个真的装不下的组被误判成
+装得下。即便如此,这仍然是概率性的缓解,不是形式化证明"绝不会拆分":一个真实引擎里我们没建模到
+的预算维度(比如 KV 压力下 retract 造成的组重新入队后的实际扣费、`page_size > 1` 时的对齐开销)
+理论上仍可能让这里估计"装得下"的组被 upstream 实际只收了一部分——这也是下面 decode 侧兜底继续
+保留、而不是被这个新门控取代的原因。
+
+**Decode 侧(仍然保留,作为兜底,不是主防线,但仍是唯一的"正确性下限")**:
 1. `HiggsTTSModelRunner._populate_fusion_buffers`(decode CG 路径,`OmniScheduler.
    _retract_running_requests` 只作用于 running batch,所以只有这条路径会真的遇到"组被
    retract 拆散",或"sibling 还没轮到进 decode"两种情况)——若某组在本 step 缺员,只隔离该
@@ -109,11 +190,23 @@ buffers` 现在即使发现人数凑齐,只要这个组曾经中毒,也会照样
 会被 abort、不会被自愈骗过去悄悄产出成功结果",但不能追溯撤回已经发生的那一帧输出。这不是
 "已解决",是一个已知的、尚未补上的正确性缺口。
 
-**这样做的代价(诚实说明,不是"已解决")**:没有了 prefill 侧的强制原子准入,在调度压力大、
-sibling 的 prefill 没能挤进同一 tick 的情况下,融合请求可能会比"总是原子准入"的设计更频繁地
-被 decode 侧检测到"缺员"从而直接 abort,而不是透明地多等一两个 tick 再重试。客户端需要能
-处理"融合请求返回一个 abort/error 而不是音频"的情况(并可自行重试),这是一个真实的可靠性
-权衡,不是缺陷——但也不应该被包装成"两层原子保证都齐了"。
+**加了 prefill 侧门控之后,decode 侧兜底还会被触发到的场景(诚实说明,不是"已解决")**:
+1. **KV 压力下的中途 retract**:门控只在 prefill 准入这一刻起作用——一个组已经全员准入、
+   开始 co-batched decode 之后,如果调度器因为 KV 压力对 running batch 做 retract(选中了
+   组里的某个成员退回 `waiting_queue`),这件事发生在 prefill 门控完全看不到的地方(运行中
+   的请求,不在 `waiting_queue` 里),门控没有能力阻止,也不该去阻止(那是 upstream 自己的
+   retract 淘汰逻辑,不是这个仓库拥有的代码路径)。这仍然要靠 decode 侧隔离+级联 abort 兜底。
+2. **保守估计仍然可能偏乐观的边界情况**:`_estimate_available_prefill_tokens` /
+   `_fusion_group_prefill_cost` 是主项(含 token 预算、chunked-prefill/input-token 上限、
+   `max_running_requests` 请求数上限)的保守复刻,不是精确复刻(见上一段),真实引擎里没建模
+   到的更细维度(比如 `prefill_max_requests`、context-parallel/LoRA 相关的额外分支、
+   `page_size > 1` 时的对齐开销、KV 压力下 retract 拆散后重新入队的组的真实扣费)理论上仍可能
+   让门控放行一个实际装不下的组。
+
+以上任何一种情况发生时,融合请求会被 decode 侧检测到"缺员"从而直接 abort,而不是透明地多等
+一两个 tick 再重试——客户端仍然需要能处理"融合请求返回一个 abort/error 而不是音频"的情况
+(并可自行重试)。门控把这类情况的发生频率从"调度压力下的常态"压到"边界情况",但不是把它
+归零,也不应该被包装成"两层原子保证都齐了"。
 
 ## 为什么 ramp(delay/EOC 状态机)不会因参考长度不同而错位——以及一个尚未补上的口子
 一个容易误判的点:N 个 sibling 的参考音色时长可能不同,直觉上会担心各自的
@@ -143,8 +236,13 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
 也不需要——上面两点已经是完整的正确性论证。）
 
 ## 已知限制
-- 没有 prefill 侧的强制原子准入(见上文),融合请求在高并发/高 KV 压力下可能比预期更容易被
-  decode 侧检测为"缺员"而直接 abort;客户端需要能处理这种情况并重试。
+- prefill 侧原子准入门控(见上文)是保守估计 + 尽力而为,不是形式化证明;已运行请求中途被
+  KV 压力 retract 拆散一个正在 co-batch decode 的组,门控看不到也管不了,仍然只能靠 decode
+  侧隔离+级联 abort 兜底;客户端仍需要能处理"融合请求返回 abort 而不是音频"的情况并自行重试。
+- 门控本身可能因为估算持续偏保守而反复暂扣同一个组;`_advance_withhold_ticks_and_give_up`
+  在连续暂扣满 `_MAX_FUSION_WITHHOLD_TICKS`(200)个 tick 后放弃并对客户端报错,避免无限期
+  暂扣、客户端连最终结果都等不到——但这个阈值本身是拍的一个数字,没有基于真实引擎下"正常情况
+  最多需要暂扣几个 tick"的实测数据来标定。
 - 单个 sibling 的 prompt 总长度(参考音频 + 目标文本 + 特殊 token)没有显式校验是否超出
   `chunked_prefill_size`,只靠 `_MAX_REF_AUDIO_SEC` 留的固定余量隐式兜底(见上一节)。
 - sampler pool 容量 = `max_running_requests + 1`;一个融合请求占 N 行,部署需按
@@ -183,9 +281,13 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
    里 mock 了 `HiggsTTSModelRunner`/`FusionRegistry` 直接调用真实方法),但两者串起来的真实
    端到端行为(KV 压力下真的触发 retract → 隔离 → 级联 → 客户端收到什么)只验证到"逻辑上
    应该正确",没有在真实引擎上跑过。
-2. **prefill→decode 过渡的实际发生率**:没有了强制原子准入,sibling 们在真实负载下实际上有
-   多大比例仍然一起进 decode(而不是触发上面的 abort 路径)。这直接决定这个功能在生产环境下
-   的可用性,需要用不同长度的参考音频实测。
+2. **prefill→decode 过渡的实际发生率,以及新增门控的实际效果**:加了
+   `_reorder_queue_for_atomic_fusion_admission` 门控之后,sibling 们在真实负载下实际上有
+   多大比例一起进 decode(而不是触发 decode 侧的 abort 路径),门控生效前后这个比例的对比,
+   `_estimate_available_prefill_tokens` 的保守估计在真实 KV 池/tree cache 状态下是否经常
+   过度保守(不必要地多等 tick,浪费吞吐)或——更需要关注——是否存在被低估掉的预算维度导致
+   估计过于乐观、仍然放行了实际装不下的组。这些只有在真实引擎 + 真实负载下才能量化,直接决定
+   这个功能在生产环境下的可用性,需要用不同长度的参考音频、不同并发度实测。
 3. **CUDA graph 兼容性**:`_cg_fusion_group`/`_cg_fusion_weight` 每步重填是否与图重放兼容。
 4. **非融合热路径零开销**:`FusionRegistry.has_any()` 让零融合流量的服务器跳过每步的
    follower 检查/buffer 填充,已有针对计数器本身的纯 Python 单测
@@ -216,3 +318,11 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
    带来的时间窗口根本不存在。这个修法本身只在本机做了静态代码走查(确认
    `lookahead_eligible` 返回值确实能让 `_event_loop_async_decode` 完整跳过 launch/resolve
    分离,直接同步跑),没有在真实开启 `enable_async_decode` 的引擎上实测过。
+7. **prefill 门控与并发 `abort()` 的真实交互,以及放弃阈值的标定**:
+   `_reorder_queue_for_atomic_fusion_admission`/`_restore_queue_after_atomic_fusion_admission`
+   持 `self._request_admission_lock` 防止一个正在暂扣窗口期内的请求被另一个线程的 `abort()`
+   复活(见"Co-batching"一节),这个交互只在单测里用 mock/手写的 `abort` 验证过锁本身可重入、
+   以及 restore 会剔除 `_aborted_request_ids` 里的 rid,没有在真实并发(多个请求同时到达/
+   取消、真实 GIL 调度)下跑过。`_MAX_FUSION_WITHHOLD_TICKS=200` 这个放弃阈值也是拍的,没有
+   基于真实引擎下"正常场景最多暂扣几个 tick 就该放行"的数据标定过,过小可能在正常波动下就误杀
+   本该等等就成的组,过大则放大"客户端要等很久才会等到最终失败"的体感延迟。
