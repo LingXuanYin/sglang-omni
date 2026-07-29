@@ -13,6 +13,7 @@ torch venv. The pure-tensor blend math is covered separately by
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -186,6 +187,8 @@ def _build_populate_buffers_runner(bs: int):
         fusion_membership_snapshot=registry.snapshot,
         expected_fusion_group_size=registry.expected_size,
         is_fusion_group_poisoned=registry.is_poisoned,
+        get_fusion_delta=registry.get_delta,
+        update_fusion_delta=registry.update_delta,
         _cg_fusion_group=torch.arange(bs, dtype=torch.long),
         _cg_fusion_weight=torch.ones(bs, dtype=torch.float32),
     )
@@ -225,6 +228,23 @@ def test_populate_buffers_intact_group_blends():
     assert runner.model._cg_fusion_weight.tolist() == pytest.approx([0.6, 0.4, 1.0])
     assert all(r.finished_reason is None for r in reqs)
     assert runner._fusion_buffers_dirty is True
+
+
+def test_populate_buffers_applies_trajectory_feedback_delta_to_weight():
+    """The effective weight fed into the blend is nominal_weight *
+    exp(delta), not the raw nominal weight — see FusionRegistry's delta
+    docstring. A fresh registration has delta=0 (test above pins that as an
+    identity); this pins the case where a persistent tilt has accumulated."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    registry.update_delta("r0", 0.3)
+    registry.update_delta("r1", -0.3)
+    runner._populate_fusion_buffers(requests, bs=2, n_real=2)
+    assert runner.model._cg_fusion_weight.tolist() == pytest.approx(
+        [0.5 * math.exp(0.3), 0.5 * math.exp(-0.3)]
+    )
 
 
 def test_populate_buffers_split_group_isolates_present_row_and_aborts():
@@ -354,3 +374,70 @@ def test_populate_buffers_clean_reset_scrubs_stale_slots_beyond_a_shrunk_batch()
     assert runner.model._cg_fusion_weight.tolist() == pytest.approx(
         [1.0, 1.0, 1.0, 1.0]
     )
+
+
+# --------------------------------------------------------------------------- #
+# HiggsTTSModelRunner._update_fusion_deltas — the CG-decode-path host-side
+# half of the trajectory-feedback controller (see FusionRegistry's _delta
+# docstring): given each row's own pre-fusion log-likelihood of the frame the
+# group just sampled together, nudges each member's persistent delta toward
+# closing the gap with its group's nominal-weighted-average opinion.
+# --------------------------------------------------------------------------- #
+def test_update_fusion_deltas_pushes_the_dominant_members_delta_down():
+    """The member whose own distribution liked the sampled frame MORE than
+    the group's weighted average gets its delta DECREASED (dampening its
+    effective weight next step); the other gets INCREASED."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, _reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    # r0's own distribution strongly endorses the sampled frame (-0.1 nat);
+    # r1's barely does (-5.0 nat) -- r0 is "winning" this step.
+    ell = torch.tensor([-0.1, -5.0])
+
+    runner._update_fusion_deltas(requests, ell)
+
+    assert registry.get_delta("r0") < 0.0
+    assert registry.get_delta("r1") > 0.0
+
+
+def test_update_fusion_deltas_is_symmetric_for_equal_likelihoods():
+    """If both members equally endorse the sampled frame, there's no gap to
+    correct -- delta stays at 0 for both."""
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, _reqs = _fake_requests(2)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("r1", "gid-a", 0.5, is_leader=False)
+    ell = torch.tensor([-2.0, -2.0])
+
+    runner._update_fusion_deltas(requests, ell)
+
+    assert registry.get_delta("r0") == pytest.approx(0.0)
+    assert registry.get_delta("r1") == pytest.approx(0.0)
+
+
+def test_update_fusion_deltas_is_a_no_op_for_non_fusion_requests():
+    runner, registry = _build_populate_buffers_runner(2)
+    requests, _reqs = _fake_requests(2)
+    ell = torch.tensor([-1.0, -3.0])
+
+    runner._update_fusion_deltas(requests, ell)  # must not raise
+
+    assert registry.get_delta("r0") == pytest.approx(0.0)
+    assert registry.get_delta("r1") == pytest.approx(0.0)
+
+
+def test_update_fusion_deltas_skips_a_group_with_only_one_row_present():
+    """A group's expected size is 2 but only one member is in THIS batch
+    (e.g. the other hasn't reached decode yet) -- nothing meaningful to
+    aggregate against, so its delta is left untouched rather than compared
+    against itself."""
+    runner, registry = _build_populate_buffers_runner(1)
+    requests, _reqs = _fake_requests(1)
+    registry.set("r0", "gid-a", 0.5, is_leader=True)
+    registry.set("sib1", "gid-a", 0.5, is_leader=False)  # absent from this batch
+    ell = torch.tensor([-1.0])
+
+    runner._update_fusion_deltas(requests, ell)
+
+    assert registry.get_delta("r0") == pytest.approx(0.0)

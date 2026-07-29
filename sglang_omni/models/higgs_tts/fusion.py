@@ -50,6 +50,7 @@ grouped rows get temperature folded away.
 
 from __future__ import annotations
 
+import math
 import threading
 
 import torch
@@ -59,17 +60,27 @@ import torch
 # instead of zero, rather than propagating inf/nan into the pooled logits.
 _LOG_FLOOR = 1e-30
 
-# Entropy-matching Newton solve (see _solve_entropy_matching_gamma): a fixed,
-# small iteration count is enough in practice (each step roughly doubles the
-# number of correct digits near the root) and keeps the op shape-static/
-# CUDA-Graph-safe — no host-side convergence check. Gamma is clamped to
+# Cap for FusionRegistry.update_delta's trajectory-feedback tilt: at most a
+# 2x effective-weight swing in either direction, so a runaway
+# integral-controller update can't overwhelm the user's own nominal weight
+# the way an unclamped correction could.
+_DELTA_MAX = math.log(2.0)
+
+# Entropy-matching Newton solve (see _solve_entropy_matching_gamma): a fixed
+# iteration count keeps the op shape-static/CUDA-Graph-safe (no host-side
+# convergence check). Measured convergence: in the moderate-entropy regime
+# (H ~2.5-6.5 nats) 3 iterations is already exact to float precision, but in
+# the sharp/confident regime a real decode step actually lives in (H ~0.2-1.8
+# nats — a member's distribution well after it has locked onto a specific
+# codec token) 3 iterations leaves a real residual (measured 0.1-0.35 nats);
+# 5 closes that to 1e-4-1e-5 nats. Gamma is clamped to
 # [1/_ENTROPY_MATCH_GAMMA_CLAMP, _ENTROPY_MATCH_GAMMA_CLAMP] so a
 # near-degenerate (near-zero-variance) distribution can't blow up the scale
 # to something numerically wild; the clamp value is a "confidence fine-tunes,
 # blend weight decides" cap, not a tight bound — a member is still allowed to
 # end up noticeably sharper or flatter than its groupmates' average, just not
 # unboundedly so.
-_ENTROPY_MATCH_ITERS = 3
+_ENTROPY_MATCH_ITERS = 5
 _ENTROPY_MATCH_GAMMA_CLAMP = 3.0
 
 
@@ -147,6 +158,19 @@ class FusionRegistry:
         self._group_of: dict[str, str] = {}
         self._weight_of: dict[str, float] = {}
         self._leader: dict[str, bool] = {}
+        # Trajectory-level integral-feedback correction (see
+        # ``docs/voice_fusion_design.md``'s "AR 滞后" section): entropy
+        # matching only corrects the marginal per-step distribution, which
+        # can't reach the autoregressive lock-in that happens once shared
+        # context already favors one voice. This tracks a persistent, slowly
+        # updated per-request weight tilt (log-scale, so
+        # ``effective_weight = weight * exp(delta)``) driven by each step's
+        # actual per-member log-likelihood of the emitted frame — unlike
+        # ``_weight_of`` (set once at group registration and never touched
+        # again), this is written every decode step by the GPU-worker thread
+        # itself (see ``HiggsTTSModelRunner._decode_collect_host``), not just
+        # read by it.
+        self._delta: dict[str, float] = {}
         # group_ids that were ever caught split at prefill (see mark_poisoned)
         # and must be aborted the next time they reach decode, even if by
         # then every member happens to be present again ("healed"). A group
@@ -184,6 +208,7 @@ class FusionRegistry:
                     self._active_count -= 1
                 self._weight_of.pop(req_id, None)
                 self._leader.pop(req_id, None)
+                self._delta.pop(req_id, None)
                 if old_gid is not None and old_gid not in self._group_of.values():
                     # Last member of this group just cleared — drop its
                     # poisoned marker too, or it would leak forever (group
@@ -195,6 +220,36 @@ class FusionRegistry:
             self._group_of[req_id] = group_id
             self._weight_of[req_id] = float(weight)
             self._leader[req_id] = bool(is_leader)
+            self._delta[req_id] = 0.0  # fresh group membership starts untilted
+
+    def update_delta(self, req_id: str, new_delta: float) -> None:
+        """Overwrite ``req_id``'s trajectory-feedback tilt (see ``_delta``'s
+        docstring), clamped to ``±_DELTA_MAX`` here (not left to the caller)
+        so every write path — today just
+        ``HiggsTTSModelRunner._decode_collect_host``, but any future one too
+        — automatically gets the same bound an unbounded integral controller
+        would otherwise be able to run away past, the same "confidence
+        fine-tunes, weight decides" philosophy as
+        ``_ENTROPY_MATCH_GAMMA_CLAMP``.
+
+        Called every decode step for a registered fusion member. A no-op for
+        an id that isn't (or is no longer) currently registered — checked
+        explicitly rather than writing unconditionally, or a caller racing a
+        concurrent ``set(req_id, None, ...)`` clear (or a plain bug passing a
+        stale/unknown rid) would leave a ``_delta`` entry with nothing left
+        to ever clear it, leaking one dict entry per such call for the
+        lifetime of the server.
+        """
+        with self._lock:
+            if req_id in self._group_of:
+                clamped = max(-_DELTA_MAX, min(_DELTA_MAX, float(new_delta)))
+                self._delta[req_id] = clamped
+
+    def get_delta(self, req_id: str) -> float:
+        """Current trajectory-feedback tilt for ``req_id`` (0.0 if unset or
+        not a fusion member)."""
+        with self._lock:
+            return self._delta.get(req_id, 0.0)
 
     def mark_poisoned(self, group_id: str) -> None:
         """Flag ``group_id`` as having sampled at least one unblended frame
@@ -228,18 +283,26 @@ class FusionRegistry:
         with self._lock:
             return sum(1 for g in self._group_of.values() if g == group_id)
 
-    def snapshot(self, req_ids: list[str]) -> tuple[dict[str, str], dict[str, float]]:
-        """Atomic snapshot of (group_id, weight) for the given req_ids.
+    def snapshot(
+        self, req_ids: list[str]
+    ) -> tuple[dict[str, str], dict[str, float], dict[str, float]]:
+        """Atomic snapshot of (group_id, weight, delta) for the given req_ids.
 
         Taken under the lock so a decode step sees a consistent view of every
         row's membership even if a concurrent register/clear is in flight.
-        Returns ``(group_of, weight_of)`` restricted to req_ids that are
-        fusion members; non-members are absent from both dicts.
+        Returns ``(group_of, weight_of, delta_of)`` restricted to req_ids
+        that are fusion members; non-members are absent from all three
+        dicts. ``delta_of`` is the trajectory-feedback tilt (see ``_delta``'s
+        docstring) — the caller combines it with ``weight_of`` as
+        ``weight * exp(delta)`` to get the *effective* blend weight fed into
+        this step's pool; the raw nominal weight in ``weight_of`` is never
+        itself mutated by the correction.
         """
         with self._lock:
             group_of = {r: self._group_of[r] for r in req_ids if r in self._group_of}
             weight_of = {r: self._weight_of.get(r, 1.0) for r in group_of}
-        return group_of, weight_of
+            delta_of = {r: self._delta.get(r, 0.0) for r in group_of}
+        return group_of, weight_of, delta_of
 
     def is_leader(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member and the group's output leader."""
@@ -414,4 +477,61 @@ def fuse_group_generation_done(
     return group_any.index_select(0, gid) > 0
 
 
-__all__ = ["FusionRegistry", "fuse_group_logits", "fuse_group_generation_done"]
+def mean_log_likelihood_of_sampled_frame(
+    raw_logits_BNV: torch.Tensor,
+    temperature_B: torch.Tensor,
+    codes_BN: torch.Tensor,
+) -> torch.Tensor:
+    """Each row's own (pre-fusion) mean-over-codebooks log-probability of the
+    frame that was ACTUALLY sampled this step — "how much does this row's own,
+    un-blended distribution endorse the emitted trajectory". This is the
+    per-step observation the trajectory-feedback controller
+    (``FusionRegistry.update_delta``) is driven by: entropy-matched log-linear
+    pooling (see ``fuse_group_logits``) only corrects the per-step *marginal*
+    distribution, which can't reach the autoregressive lock-in that happens
+    once the shared sampled context already favors one group member over
+    another — measuring each member's likelihood of the trajectory itself,
+    integrated over many steps, is what can.
+
+    Args:
+        raw_logits_BNV: each row's own PRE-fusion logits (i.e. straight from
+            the model head, before ``fuse_group_logits`` pools them across a
+            group) — using the pooled logits here would just measure how
+            much a row agrees with the group consensus it already voted on,
+            not its independent opinion.
+        temperature_B: ``[B]`` per-row temperature (same one passed to
+            ``fuse_group_logits`` for this step).
+        codes_BN: ``[B, N]`` long, the codebook tokens actually sampled this
+            step (post-fusion — the whole point is measuring each row's own
+            opinion of the group's shared, already-decided outcome). Clamped
+            to ``>= 0`` before use: a row already ``generation_done`` at step
+            entry decodes ``STOP_CODE`` (``-1``) for every codebook (see
+            ``sampler.py``), and an ungathered ``-1`` index is out of bounds
+            for ``V`` (a device-side assert under CUDA, fatal to the whole
+            engine) — every other consumer of these codes
+            (``model_runner.py``'s ``post_decode_launch``/
+            ``_decode_step_logprobs``) clamps for the exact same reason. A
+            clamped row's own likelihood is never actually used: the
+            fusion-group "any done ⇒ all done" barrier means a done row's
+            group is done too, so this observation has no live group left to
+            update by the time the caller aggregates it.
+
+    Returns:
+        ``[B]`` float32. No grouping/weighting applied here — purely a
+        per-row observation; the caller aggregates it per group (see
+        ``docs/voice_fusion_design.md``).
+    """
+    device = raw_logits_BNV.device
+    safe_temp = temperature_B.to(device=device).clamp_min(1e-5).view(-1, 1, 1)
+    log_p_BNV = torch.log_softmax(raw_logits_BNV.float() / safe_temp, dim=-1)
+    codes_BN1 = codes_BN.to(device=device, dtype=torch.long).clamp_min(0).unsqueeze(-1)
+    ell_BN = log_p_BNV.gather(-1, codes_BN1).squeeze(-1)
+    return ell_BN.mean(dim=-1)
+
+
+__all__ = [
+    "FusionRegistry",
+    "fuse_group_logits",
+    "fuse_group_generation_done",
+    "mean_log_likelihood_of_sampled_frame",
+]

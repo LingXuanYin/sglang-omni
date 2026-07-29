@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for voice-fusion blend ops (pure torch, no sglang engine)."""
 
+import math
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from sglang_omni.models.higgs_tts.fusion import (
     _solve_entropy_matching_gamma,
     fuse_group_generation_done,
     fuse_group_logits,
+    mean_log_likelihood_of_sampled_frame,
 )
 
 
@@ -320,6 +323,82 @@ def test_generation_done_singletons_identity():
     assert torch.equal(fuse_group_generation_done(done, gid), done)
 
 
+# --------------------------------------------------------------------------- #
+# mean_log_likelihood_of_sampled_frame — the per-step observation driving
+# FusionRegistry's trajectory-feedback delta (entropy matching alone corrects
+# only the marginal distribution per step, not the AR lock-in across steps).
+# --------------------------------------------------------------------------- #
+def test_mean_log_likelihood_matches_hand_computed_value():
+    torch.manual_seed(30)
+    B, N, V = 2, 3, 8
+    logits = torch.randn(B, N, V)
+    temp = torch.ones(B)
+    codes = torch.randint(0, V, (B, N))
+
+    ell = mean_log_likelihood_of_sampled_frame(logits, temp, codes)
+
+    expected = torch.zeros(B)
+    for b in range(B):
+        lp = torch.log_softmax(logits[b], dim=-1)
+        per_codebook = torch.stack([lp[n, codes[b, n]] for n in range(N)])
+        expected[b] = per_codebook.mean()
+    torch.testing.assert_close(ell, expected, atol=1e-5, rtol=1e-4)
+
+
+def test_mean_log_likelihood_is_highest_for_the_argmax_frame():
+    """A row's own likelihood of the frame it would itself have picked
+    (argmax at every codebook) must be its highest possible value — sanity
+    check that this is really measuring "does this row endorse the sampled
+    frame", not something inverted."""
+    torch.manual_seed(31)
+    N, V = 4, 16
+    logits = torch.randn(1, N, V)
+    own_argmax = logits[0].argmax(-1).unsqueeze(0)  # [1, N]
+    other = torch.randint(0, V, (1, N))
+    temp = torch.ones(1)
+
+    ell_own = mean_log_likelihood_of_sampled_frame(logits, temp, own_argmax)
+    ell_other = mean_log_likelihood_of_sampled_frame(logits, temp, other)
+    assert bool((ell_own >= ell_other).all())
+
+
+def test_mean_log_likelihood_respects_temperature():
+    """A hotter temperature flattens the distribution, pulling every
+    non-degenerate frame's log-likelihood toward the uniform value
+    -log(V) — including the argmax frame's, which must therefore DROP as
+    temperature rises (it starts above uniform and is squeezed toward it)."""
+    torch.manual_seed(32)
+    N, V = 4, 16
+    logits = torch.randn(1, N, V) * 3.0  # sharp distribution
+    codes = logits[0].argmax(-1).unsqueeze(0)
+
+    ell_cold = mean_log_likelihood_of_sampled_frame(logits, torch.tensor([0.5]), codes)
+    ell_hot = mean_log_likelihood_of_sampled_frame(logits, torch.tensor([5.0]), codes)
+    assert bool((ell_hot < ell_cold).all())
+
+
+def test_mean_log_likelihood_clamps_stop_code_instead_of_crashing():
+    """A row already ``generation_done`` at step entry decodes STOP_CODE
+    (-1) for every codebook (see sampler.py) -- gathering a raw -1 index is
+    out of bounds and, unclamped, would be a fatal device-side assert under
+    CUDA inside a captured graph. Must not raise, and (harmlessly, since a
+    done row's fusion group is done too and this observation is never
+    consumed) just clamps to codebook 0 instead."""
+    torch.manual_seed(33)
+    B, N, V = 2, 3, 8
+    logits = torch.randn(B, N, V)
+    temp = torch.ones(B)
+    codes = torch.full((B, N), -1, dtype=torch.long)
+
+    ell = mean_log_likelihood_of_sampled_frame(logits, temp, codes)
+
+    assert torch.isfinite(ell).all()
+    expected = mean_log_likelihood_of_sampled_frame(
+        logits, temp, torch.zeros((B, N), dtype=torch.long)
+    )
+    torch.testing.assert_close(ell, expected)
+
+
 def test_temperature_applied_before_blend():
     """temperature_B scales each row's logits before the log-linear pool.
     Rows share one entropy (post temperature-scaling) so entropy-matching is
@@ -543,16 +622,18 @@ def test_registry_snapshot_restricted_to_members():
     reg = FusionRegistry()
     reg.set("r0", "g0", 0.7, is_leader=True)
     reg.set("r1", "g0", 0.3, is_leader=False)
-    group_of, weight_of = reg.snapshot(["r0", "r1", "not-a-member"])
+    group_of, weight_of, delta_of = reg.snapshot(["r0", "r1", "not-a-member"])
     assert group_of == {"r0": "g0", "r1": "g0"}
     assert weight_of == {"r0": pytest.approx(0.7), "r1": pytest.approx(0.3)}
+    assert delta_of == {"r0": pytest.approx(0.0), "r1": pytest.approx(0.0)}
 
 
 def test_registry_snapshot_empty_for_all_non_members():
     reg = FusionRegistry()
-    group_of, weight_of = reg.snapshot(["a", "b"])
+    group_of, weight_of, delta_of = reg.snapshot(["a", "b"])
     assert group_of == {}
     assert weight_of == {}
+    assert delta_of == {}
 
 
 def test_registry_poisoned_group_starts_unpoisoned():
@@ -590,3 +671,65 @@ def test_registry_poisoned_flag_clears_when_last_member_clears():
     reg.mark_poisoned("g0")
     reg.set("r0", None, 1.0, is_leader=True)
     assert reg.is_poisoned("g0") is False
+
+
+# --------------------------------------------------------------------------- #
+# FusionRegistry delta — the trajectory-level integral-feedback tilt, on top
+# of entropy matching, for the AR-hysteresis lock-in that per-step marginal
+# correction alone can't reach (see docs/voice_fusion_design.md).
+# --------------------------------------------------------------------------- #
+def test_registry_delta_starts_at_zero_for_a_fresh_member():
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 0.5, is_leader=True)
+    assert reg.get_delta("r0") == pytest.approx(0.0)
+
+
+def test_registry_delta_unset_member_is_zero():
+    reg = FusionRegistry()
+    assert reg.get_delta("ghost") == pytest.approx(0.0)
+
+
+def test_registry_update_delta_is_visible_via_get_delta():
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 0.5, is_leader=True)
+    reg.update_delta("r0", 0.2)
+    assert reg.get_delta("r0") == pytest.approx(0.2)
+
+
+def test_registry_update_delta_is_clamped():
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 0.5, is_leader=True)
+    reg.update_delta("r0", 10.0)
+    assert reg.get_delta("r0") == pytest.approx(math.log(2.0))
+    reg.update_delta("r0", -10.0)
+    assert reg.get_delta("r0") == pytest.approx(-math.log(2.0))
+
+
+def test_registry_update_delta_is_a_no_op_for_an_unregistered_id():
+    """Writing a delta for an id that was never (or is no longer)
+    registered must not leak a dict entry — there would be nothing left to
+    ever clear it."""
+    reg = FusionRegistry()
+    reg.update_delta("ghost", 0.3)
+    assert reg.get_delta("ghost") == pytest.approx(0.0)
+    assert "ghost" not in reg._delta
+
+
+def test_registry_delta_resets_to_zero_on_fresh_registration():
+    """Re-registering a request id (e.g. id reuse, or a retry) starts its
+    tilt fresh at 0 rather than carrying over a stale value from a
+    previous, unrelated group membership."""
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 0.5, is_leader=True)
+    reg.update_delta("r0", 0.3)
+    reg.set("r0", None, 1.0, is_leader=True)
+    reg.set("r0", "g1", 0.5, is_leader=True)
+    assert reg.get_delta("r0") == pytest.approx(0.0)
+
+
+def test_registry_delta_cleared_when_member_clears():
+    reg = FusionRegistry()
+    reg.set("r0", "g0", 0.5, is_leader=True)
+    reg.update_delta("r0", 0.3)
+    reg.set("r0", None, 1.0, is_leader=True)
+    assert "r0" not in reg._delta

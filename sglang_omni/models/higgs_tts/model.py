@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
@@ -16,6 +18,7 @@ from sglang_omni.models.higgs_tts.fusion import (
     FusionRegistry,
     fuse_group_generation_done,
     fuse_group_logits,
+    mean_log_likelihood_of_sampled_frame,
 )
 from sglang_omni.models.higgs_tts.hf_config import HiggsMultimodalQwen3Config
 from sglang_omni.models.higgs_tts.modeling import (
@@ -33,6 +36,14 @@ from sglang_omni.models.higgs_tts.weight_loader import DiscreteWeightMapper
 from sglang_omni.sampling.seed import resolve_row_seed
 
 logger = logging.getLogger(__name__)
+
+# Trajectory-feedback integral gain (see FusionRegistry's delta docstring and
+# HiggsTTSModel._update_fusion_deltas): how strongly one step's observed
+# per-member likelihood gap nudges the persistent delta. Env-overridable
+# specifically so this can be swept (e.g. 0.05/0.1/0.2) against a live engine
+# without a full redeploy per value while this correction is still being
+# tuned — see docs/voice_fusion_design.md's "AR 滞后" section.
+_TRAJECTORY_DELTA_LAMBDA = float(os.environ.get("HIGGS_FUSION_DELTA_LAMBDA", "0.1"))
 
 # Higgs ckpt prefixes → sglang Qwen3ForCausalLM parameter tree (under ``backbone.``).
 _BACKBONE_PREFIX_MAP: dict[str, str] = {
@@ -236,6 +247,24 @@ class HiggsTTSModel(nn.Module):
         self._cg_fusion_weight = torch.ones(
             pool_size, dtype=torch.float32, device=cg_device
         )
+        # Trajectory-feedback shadow buffer (CG decode path only — the eager
+        # decode_codebooks_batch computes this observation inline, it never
+        # touches this buffer): each row's own (pre-fusion) mean-over-
+        # codebooks log-likelihood of the frame actually sampled this step,
+        # written unconditionally in decode_codebooks_batch_cg (cheap gather
+        # + mean, a no-op contribution for non-fusion rows — no host branch,
+        # required for CUDA Graph capture), read back only when fusion
+        # traffic exists (see HiggsTTSModelRunner._collect_step_outputs_cg)
+        # to drive FusionRegistry.update_delta. Unlike
+        # _cg_fusion_group/_cg_fusion_weight this is NOT itself the
+        # correction — it's the per-step observation the host-side integral
+        # controller consumes; the actual persistent state (delta) lives in
+        # the registry, not a CG buffer, because it must survive across
+        # steps rather than being reset to an identity default every time
+        # like the other two.
+        self._cg_fusion_ell = torch.zeros(
+            pool_size, dtype=torch.float32, device=cg_device
+        )
         # Engine-side fusion bookkeeping: which in-flight requests belong to
         # which voice-fusion group, at what blend weight, and who the group's
         # audio-emitting leader is. Written by the scheduler's request-build
@@ -281,13 +310,22 @@ class HiggsTTSModel(nn.Module):
 
     def fusion_membership_snapshot(
         self, req_ids: list[str]
-    ) -> tuple[dict[str, str], dict[str, float]]:
-        """Atomic snapshot of (group_id, weight) for the given req_ids.
+    ) -> tuple[dict[str, str], dict[str, float], dict[str, float]]:
+        """Atomic snapshot of (group_id, weight, delta) for the given req_ids.
 
-        Returns ``(group_of, weight_of)`` restricted to req_ids that are fusion
-        members; non-members are absent from both dicts.
+        Returns ``(group_of, weight_of, delta_of)`` restricted to req_ids
+        that are fusion members; non-members are absent from all three
+        dicts. See ``FusionRegistry.snapshot`` for what ``delta_of`` means.
         """
         return self._fusion_registry.snapshot(req_ids)
+
+    def update_fusion_delta(self, req_id: str, new_delta: float) -> None:
+        """See ``FusionRegistry.update_delta``."""
+        self._fusion_registry.update_delta(req_id, new_delta)
+
+    def get_fusion_delta(self, req_id: str) -> float:
+        """See ``FusionRegistry.get_delta``."""
+        return self._fusion_registry.get_delta(req_id)
 
     def is_fusion_leader(self, req_id: str) -> bool:
         """True iff ``req_id`` is a fusion member and the group's output leader."""
@@ -462,6 +500,60 @@ class HiggsTTSModel(nn.Module):
         weight_B = torch.tensor(weight, dtype=torch.float32, device=device)
         return group_B, weight_B, is_fused
 
+    def _update_fusion_deltas(
+        self,
+        req_ids: list[str],
+        raw_logits_BNV: torch.Tensor,
+        real_temperature_B: torch.Tensor,
+        codes_BN: torch.Tensor,
+        group_B: torch.Tensor,
+        nominal_weight_of: dict[str, float],
+    ) -> None:
+        """Trajectory-feedback update, eager-decode path (see
+        ``FusionRegistry``'s ``_delta`` docstring and
+        ``docs/voice_fusion_design.md``'s "AR 滞后" section for why entropy
+        matching alone — a per-step marginal correction — can't reach the
+        autoregressive lock-in this exists to counteract).
+
+        After this step's shared frame (``codes_BN``) is sampled, measure
+        each fusion row's own (pre-fusion) log-likelihood of it
+        (:func:`mean_log_likelihood_of_sampled_frame`), aggregate per group
+        using the NOMINAL blend weights (not the delta-adjusted effective
+        ones the blend itself just used — the controller's target is "match
+        the ratio the caller asked for", not "match whatever this step
+        already leaned toward"), and nudge each member's persistent delta
+        toward closing the gap between its own opinion and the group's
+        weighted-average opinion. Runs synchronously (this path already does
+        a D2H per step regardless, see the caller's own comment) — no CUDA
+        Graph constraint here, unlike ``decode_codebooks_batch_cg``.
+        """
+        ell_B = mean_log_likelihood_of_sampled_frame(
+            raw_logits_BNV, real_temperature_B, codes_BN
+        )
+        ell_list = ell_B.detach().cpu().tolist()
+        group_list = group_B.detach().cpu().tolist()
+
+        members_by_group: dict[int, list[int]] = {}
+        for b, g in enumerate(group_list):
+            members_by_group.setdefault(g, []).append(b)
+
+        for members in members_by_group.values():
+            if len(members) < 2:
+                continue  # singleton row, not a real fusion group
+            raw_weights = [nominal_weight_of.get(req_ids[b], 1.0) for b in members]
+            total_w = sum(raw_weights) or 1.0
+            norm_weights = [w / total_w for w in raw_weights]
+            weighted_avg_ell = sum(
+                w * ell_list[b] for w, b in zip(norm_weights, members)
+            )
+            for b in members:
+                rid = req_ids[b]
+                current_delta = self._fusion_registry.get_delta(rid)
+                new_delta = current_delta - _TRAJECTORY_DELTA_LAMBDA * (
+                    ell_list[b] - weighted_avg_ell
+                )
+                self._fusion_registry.update_delta(rid, new_delta)
+
     @torch.no_grad()
     def decode_codebooks_batch(
         self,
@@ -523,13 +615,24 @@ class HiggsTTSModel(nn.Module):
         # absent from the maps → fields stay None/1.0 → singleton/identity. One
         # locked snapshot keeps the per-row view consistent with a concurrent
         # register/clear on the build thread (Bug D).
-        group_of, weight_of = self.fusion_membership_snapshot(list(req_ids))
+        group_of, weight_of, delta_of = self.fusion_membership_snapshot(list(req_ids))
         for rid, p in zip(req_ids, gen_params):
             p.fusion_group_id = group_of.get(rid)
             if p.fusion_group_id is not None:
-                p.fusion_weight = weight_of.get(rid, 1.0)
+                # Effective weight = nominal weight * exp(trajectory-feedback
+                # tilt) — see FusionRegistry's delta docstring. The raw
+                # nominal weight (what the caller asked for) is never itself
+                # mutated; only this per-step effective value is.
+                p.fusion_weight = weight_of.get(rid, 1.0) * math.exp(
+                    delta_of.get(rid, 0.0)
+                )
 
         group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
+        # Pre-fusion logits and each row's own REAL temperature, kept for the
+        # delta observation below — `temperature` itself gets folded to 1 for
+        # grouped rows right after this, which would double-divide if reused.
+        raw_logits_BNV = logits_BNV
+        real_temperature = temperature
         if is_fused:
             logits_BNV, is_grouped_B = fuse_group_logits(
                 logits_BNV, group_B, weight_B, temperature_B=temperature
@@ -562,6 +665,9 @@ class HiggsTTSModel(nn.Module):
                 self._sampler_pool.generation_done[row_indices], group_B
             )
             self._sampler_pool.generation_done[row_indices] = synced_done
+            self._update_fusion_deltas(
+                req_ids, raw_logits_BNV, real_temperature, codes_BN, group_B, weight_of
+            )
 
         # Note(yichi): One D2H per step to skip STOP-sentinel rows in the Python append loop.
         was_done_cpu = was_done.cpu().tolist()
@@ -611,6 +717,7 @@ class HiggsTTSModel(nn.Module):
         # keeps this branchless while still being correct per row.
         fusion_group_B = self._cg_fusion_group[:batch_size]
         fusion_weight_B = self._cg_fusion_weight[:batch_size]
+        raw_logits_BNV = logits_BNV  # pre-fusion, kept for the delta observation below
         logits_BNV, is_grouped_B = fuse_group_logits(
             logits_BNV,
             fusion_group_B,
@@ -675,6 +782,22 @@ class HiggsTTSModel(nn.Module):
         self._cg_active_generation_done[:batch_size] = new_generation_done_B
         self._cg_active_last_codes[:batch_size] = new_last_codes_BN
         self._cg_codes_BN[:batch_size] = codes_BN
+
+        # Trajectory-feedback observation (see FusionRegistry's _delta
+        # docstring): each row's own (pre-fusion) mean-over-codebooks
+        # log-likelihood of the frame the group actually just sampled
+        # together. Always computed (cheap gather+mean, no host branching,
+        # per the CG-capture constraint — same "unconditional, no-op for
+        # non-fusion rows" pattern as fuse_group_logits itself); the runner
+        # only reads this buffer back (a D2H, so genuinely has a cost) when
+        # fusion traffic is actually present (see
+        # HiggsTTSModelRunner._decode_pack_gpu). Uses `temperature`, each
+        # row's REAL per-row value, not `sampler_temperature` (which folds
+        # grouped rows to 1 for the sampler call above — reusing that here
+        # would measure likelihood in the wrong temperature scale).
+        self._cg_fusion_ell[:batch_size] = mean_log_likelihood_of_sampled_frame(
+            raw_logits_BNV, temperature, codes_BN
+        )
 
         text_vocab_size = self.backbone.config.vocab_size
         return torch.zeros(

@@ -89,14 +89,60 @@ log-linear 骨架上加一个无条件(无参考音色)的额外 sibling 行、�
 修法:在 `fuse_group_logits` 做加权求和**之前**,先把组内每个成员的 logits 按
 `_solve_entropy_matching_gamma` 求出的每行(按 codebook 单独求)缩放系数 gamma 校正到同一个
 "置信度基准"(组内按权重加权平均的熵),再做加权求和——这样权重才重新变回真正起决定作用的
-因素。gamma 的求解用 3 步定长牛顿迭代(`dH/dgamma = -gamma·Var_p(logits)`,标准指数族分布对
+因素。gamma 的求解用 5 步定长牛顿迭代(`dH/dgamma = -gamma·Var_p(logits)`,标准指数族分布对
 数熵的解析导数,推导:`H(gamma) = -gamma·E_p[z] + logZ(gamma)`,`dlogZ/dgamma = E_p[z]`,
 两次求导消去 `E_p[z]` 项即得),定长迭代次数、定长张量形状,没有 host 端收敛判断分支,CUDA
 graph 安全;gamma 钳制在 `[1/3, 3]` 防止极端不对称的输入把缩放系数推到数值不稳定的范围。
-单行组(非融合请求)完全不受影响——仍然走最后那个 `torch.where` 直接返回原始 logits,校正后
-的值只在真正被分组的行上才会被使用。单测见 `test_voice_fusion.py` 里
-`test_entropy_matching_*` 一组:已匹配熵的两行是近似恒等变换、明显更平坦的一方会被上调、
-组间互不影响、极端不对称时钳制生效。真实引擎上的复现验证见"仍需真实引擎验证的项"。
+迭代次数从 3 步调到 5 步:实测中等熵区间(2.5-6.5 nat)3 步就已经是浮点精度下的精确解,但真实
+解码时一个音色的分布常年处在高置信度(低熵,0.2-1.8 nat)区间,3 步在那个区间还留有
+0.1-0.35 nat 的残差,5 步能把残差收到 1e-4~1e-5 nat。单行组(非融合请求)完全不受影响——仍然
+走最后那个 `torch.where` 直接返回原始 logits,校正后的值只在真正被分组的行上才会被使用。
+单测见 `test_voice_fusion.py` 里 `test_entropy_matching_*` 一组:已匹配熵的两行是近似恒等
+变换、明显更平坦的一方会被上调、组间互不影响、极端不对称时钳制生效。
+
+**熵匹配之后仍然残留的问题:AR 滞后(第三个真实 bug,已实现修法,真实引擎验证进行中)**:
+熵匹配上线后重新实测(同样的 A/B 对照协议),0.5/0.5 权重的 8 次独立生成从"绝大多数锁死同一个"
+变成了更分散的分布——出现了真正居中的样本,也仍有靠近两端的样本,不是稳定居中。原因:熵匹配
+只纠正**每一步的边际分布**,纠正不了自回归解码里的滞后放大——两个 sibling 共享同一段已经
+采样出来的上下文,一旦前几步(建立音高/音区的关键步)偶然采到了偏向某一方,那一方自己的条件
+分布会因为"上文更像自己会说的话"而更自信、在混合里占比越滚越大,这个反馈发生在跨步骤的轨迹
+层面,不是熵匹配能触及的单步边际分布层面。
+
+修法:`FusionRegistry` 给每个融合请求维护一个跨解码步持续存在的"轨迹反馈"微调量 `delta`
+(log 尺度:`有效权重 = 名义权重 * exp(delta)`,不是名义权重本身被改写,只是这一步实际喂给
+归约的值被调整)。每个解码步采样出这一步的共享帧之后,用
+`mean_log_likelihood_of_sampled_frame` 算出每个成员自己(未经融合的)分布对这一帧的
+似然,和组内按**名义**权重(不是已经被 delta 调整过的有效权重——目标是"贴近调用方要的比例",
+不是"贴近这一步已经倒向的比例")加权平均的似然比较,按 `delta ← clip(delta - λ·(ℓ_i - 组内
+加权平均 ℓ), ±ln2)` 更新——哪个成员这一步"赢得"更多(自己的似然比组内平均高很多),它的
+delta 就被压低,下一步有效权重跟着降低;反之则被抬高。这是一个积分反馈控制器,直接消掉滚雪球
+效应,而不是像熵匹配那样只治标(削弱雪球的启动速度)。
+
+实现上分两条路径:eager 解码路径(`HiggsTTSModel._update_fusion_deltas`)在同一次
+`decode_codebooks_batch` 调用内直接同步算完更新(这条路径本来就有一次 D2H,不受 CUDA graph
+约束);CG 解码路径(生产环境走的路径)拆成两半——`decode_codebooks_batch_cg` 内部无条件写入
+一个新增的 shadow buffer `_cg_fusion_ell`(每行自己对这一步采样帧的似然,定长张量操作,无
+host 分支,对非融合请求是零成本占位),`HiggsTTSModelRunner` 只在真的有融合流量时才把这个
+buffer D2H 回来(`_collect_step_outputs_cg`),再在纯 Python 的 `_decode_collect_host` 收尾
+循环里做实际的 delta 更新(`HiggsTTSModelRunner._update_fusion_deltas`)——这一步会跳过本步
+已经被 `_populate_fusion_buffers` 因为拆散/中毒而隔离并标记 `FINISH_ABORT` 的行(它们这一步
+是按独立单例解码的,不是真的融合意见,不该污染正在被拆掉的组的 delta)。`delta` 本身存在
+`FusionRegistry`(host 端 Python dict),不是 CG buffer——因为它必须跨步持续存在,不能像
+`_cg_fusion_group`/`_cg_fusion_weight` 那样每步都被重置成默认值。`mean_log_likelihood_of_
+sampled_frame` 对已经 `generation_done`(会解出 `STOP_CODE=-1`)的行做了 `clamp_min(0)`——
+不 clamp 会在 `gather` 时越界,CUDA 下是致命的 device-side assert;clamp 之后的值本身是
+"未使用的占位",因为组内任一成员 done 就代表整组 done,这行的观测值不会再被任何存活的组消费。
+
+积分增益 `λ` 通过环境变量 `HIGGS_FUSION_DELTA_LAMBDA`(默认 0.1)配置,专门为了能在真实引擎上
+不用每次都重新发布镜像就扫一遍候选值(0.05/0.1/0.2)。单测见 `test_voice_fusion.py` 的
+`test_registry_delta_*`/`test_mean_log_likelihood_*` 和
+`test_voice_fusion_pipeline.py` 的 `test_update_fusion_deltas_*`(后者依赖 sglang,本机
+Windows 环境跑不了,只能 `py_compile` 语法检查,真实正确性靠单测里手工验证过的算例 + 独立
+review)。真实引擎上"0.5/0.5 是否真的稳定居中"的验证见"仍需真实引擎验证的项"。这是目前为止
+针对这个 bug 尝试的第三层修法,如果这一层还不能收敛,已知的止损点是:接受现状(不再是随机
+锁死单一音色,只是权重-结果映射还不够精确),把残留局限性写清楚,不再往输出分布层面继续加码
+——下一步升级会是条件层面的融合(prompt/embedding 插值,或者真正的 CFG 外推),那是另一个
+项目,不是这个 bug 的延伸。
 
 `fuse_group_generation_done` 做"组内任一成员 done ⇒ 全部 done"的屏障,让共享 seed 的
 sibling 行在同一步终止,不会有的先跑完、有的还在解码的错位。
