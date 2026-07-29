@@ -322,7 +322,7 @@ def fuse_group_logits(
     weight_B: torch.Tensor,
     *,
     temperature_B: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Blend per-codebook output distributions within each fusion group.
 
     Args:
@@ -341,7 +341,7 @@ def fuse_group_logits(
             the caller for every row, grouped or not).
 
     Returns:
-        ``(logits_out, is_grouped_B)``:
+        ``(logits_out, is_grouped_B, matched_logits_BNV)``:
 
         - ``logits_out``: ``[B, N, V]``. Grouped rows carry the blended
           log-distribution (temperature already folded in — sample these at
@@ -357,6 +357,24 @@ def fuse_group_logits(
           their **real** ``temperature_B`` — folding every row to 1
           unconditionally defeats the sampler's greedy short-circuit for
           ordinary (non-fusion) requests. See the module docstring.
+        - ``matched_logits_BNV``: ``[B, N, V]``, each row's OWN (still
+          per-member, not yet group-pooled) temperature-scaled logits after
+          entropy-matching rescaling — i.e. exactly what this function feeds
+          into the weighted sum, one step before ``scatter_add_`` pools it
+          across the group. This is what the trajectory-feedback controller
+          (``FusionRegistry.update_delta``,
+          ``mean_log_likelihood_of_sampled_frame``) must measure each member's
+          own opinion on, NOT the true raw (unmatched) ``logits_BNV``: raw
+          per-member logits differ in sharpness by construction (that's the
+          whole reason entropy-matching exists), so a controller servoing
+          "equalize raw log-likelihood across members" is actually servoing
+          raw-space KL-divergence equidistance, which sits far from the
+          nominal blend ratio whenever members differ in sharpness — this was
+          a real, measured bug (see ``docs/voice_fusion_design.md``'s "AR
+          滞后" section): the controller converged to a fixed, systematically
+          wrong set-point instead of the intended 50/50 center, and got
+          WORSE (not better) as the integral gain increased, because a larger
+          gain just reaches that wrong fixed point faster.
 
     The blend is a weighted **log-linear pool** (product-of-experts / weighted
     geometric mean) over members ``i`` of each group ``g``:
@@ -453,7 +471,7 @@ def fuse_group_logits(
     # no host branch.
     is_grouped_B = group_count.index_select(0, gid) > 1.5
     logits_out = torch.where(is_grouped_B.view(B, 1, 1), blended_logits, raw_logits)
-    return logits_out, is_grouped_B
+    return logits_out, is_grouped_B, matched_logits
 
 
 def fuse_group_generation_done(
@@ -478,13 +496,13 @@ def fuse_group_generation_done(
 
 
 def mean_log_likelihood_of_sampled_frame(
-    raw_logits_BNV: torch.Tensor,
+    observation_logits_BNV: torch.Tensor,
     temperature_B: torch.Tensor,
     codes_BN: torch.Tensor,
 ) -> torch.Tensor:
-    """Each row's own (pre-fusion) mean-over-codebooks log-probability of the
-    frame that was ACTUALLY sampled this step — "how much does this row's own,
-    un-blended distribution endorse the emitted trajectory". This is the
+    """Each row's own mean-over-codebooks log-probability of the frame that
+    was ACTUALLY sampled this step — "how much does this row's own,
+    un-pooled distribution endorse the emitted trajectory". This is the
     per-step observation the trajectory-feedback controller
     (``FusionRegistry.update_delta``) is driven by: entropy-matched log-linear
     pooling (see ``fuse_group_logits``) only corrects the per-step *marginal*
@@ -494,13 +512,27 @@ def mean_log_likelihood_of_sampled_frame(
     integrated over many steps, is what can.
 
     Args:
-        raw_logits_BNV: each row's own PRE-fusion logits (i.e. straight from
-            the model head, before ``fuse_group_logits`` pools them across a
-            group) — using the pooled logits here would just measure how
-            much a row agrees with the group consensus it already voted on,
-            not its independent opinion.
-        temperature_B: ``[B]`` per-row temperature (same one passed to
-            ``fuse_group_logits`` for this step).
+        observation_logits_BNV: each row's own, still per-member (not
+            group-pooled) logits, evaluated at the group's shared
+            entropy-matched confidence scale — i.e. ``fuse_group_logits``'s
+            ``matched_logits_BNV`` return, NOT its true raw (pre-entropy-match)
+            head logits. Using the true raw per-member logits here was a
+            real, measured bug: two members always differ in native
+            sharpness (that's exactly what entropy-matching corrects for the
+            *blend*), so measuring raw log-likelihood servos raw-space
+            KL-divergence equidistance between members instead of the
+            intended "match the nominal blend ratio" — a fixed,
+            systematically wrong set-point that a larger integral gain
+            reaches *faster*, not one it corrects (see
+            ``docs/voice_fusion_design.md``'s "AR 滞后" section). Using the
+            group-*pooled* consensus logits instead would be wrong in the
+            opposite direction — that would just measure how much a row
+            agrees with a consensus it already voted on, not its independent
+            opinion.
+        temperature_B: ``[B]`` per-row temperature. Pass ``torch.ones_like``
+            when ``observation_logits_BNV`` is already temperature-scaled
+            (true of ``matched_logits_BNV``, which folds in ``temperature_B``
+            before entropy-matching) — dividing again would double-apply it.
         codes_BN: ``[B, N]`` long, the codebook tokens actually sampled this
             step (post-fusion — the whole point is measuring each row's own
             opinion of the group's shared, already-decided outcome). Clamped
@@ -521,9 +553,9 @@ def mean_log_likelihood_of_sampled_frame(
         per-row observation; the caller aggregates it per group (see
         ``docs/voice_fusion_design.md``).
     """
-    device = raw_logits_BNV.device
+    device = observation_logits_BNV.device
     safe_temp = temperature_B.to(device=device).clamp_min(1e-5).view(-1, 1, 1)
-    log_p_BNV = torch.log_softmax(raw_logits_BNV.float() / safe_temp, dim=-1)
+    log_p_BNV = torch.log_softmax(observation_logits_BNV.float() / safe_temp, dim=-1)
     codes_BN1 = codes_BN.to(device=device, dtype=torch.long).clamp_min(0).unsqueeze(-1)
     ell_BN = log_p_BNV.gather(-1, codes_BN1).squeeze(-1)
     return ell_BN.mean(dim=-1)

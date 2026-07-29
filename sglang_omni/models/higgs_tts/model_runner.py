@@ -588,10 +588,11 @@ class HiggsTTSModelRunner(ModelRunner):
         output processing.
 
         ``fusion_ell_cpu`` (present only on the sync path — see
-        ``_collect_step_outputs_cg``) is each row's own pre-fusion
-        log-likelihood of this step's sampled frame; when given, drives the
-        trajectory-feedback delta update (see ``_update_fusion_deltas``)
-        after the main per-row loop below.
+        ``_collect_step_outputs_cg``) is each row's own, still per-member
+        (not group-pooled) entropy-matched log-likelihood of this step's
+        sampled frame; when given, drives the trajectory-feedback delta
+        update (see ``_update_fusion_deltas``) after the main per-row loop
+        below.
         """
         model = self.model
         num_codebooks = model._cg_codes_BN.shape[1]
@@ -666,10 +667,13 @@ class HiggsTTSModelRunner(ModelRunner):
         alone can't reach it.
 
         Runs entirely host-side, after ``fusion_ell_cpu`` (this step's
-        per-row pre-fusion log-likelihood of the sampled frame, written
-        inside the captured graph by ``HiggsTTSModel.decode_codebooks_batch_cg``)
-        has already been D2H'd by the caller — this method itself does no
-        GPU work, just Python dict aggregation over however many rows are
+        per-row, still per-member (not group-pooled) entropy-matched
+        log-likelihood of the sampled frame, written inside the captured
+        graph by ``HiggsTTSModel.decode_codebooks_batch_cg`` — see that
+        method's comment for why this must be measured on the
+        entropy-matched logits, not the true raw per-member ones) has
+        already been D2H'd by the caller — this method itself does no GPU
+        work, just Python dict aggregation over however many rows are
         actually fusion members this step (typically a small fraction of the
         batch, if any).
         """

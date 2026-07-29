@@ -47,7 +47,7 @@ def test_singleton_is_sampling_identity():
     B, N, V = 4, 8, 1026
     logits = torch.randn(B, N, V)
     gid, w = _singleton_groups(B)
-    out, is_grouped = fuse_group_logits(logits, gid, w)
+    out, is_grouped, _ = fuse_group_logits(logits, gid, w)
     assert not is_grouped.any()
     # argmax preserved per (row, codebook)
     assert torch.equal(out.argmax(-1), logits.argmax(-1))
@@ -75,13 +75,13 @@ def test_singleton_is_byte_identical_to_raw_logits_regardless_of_temperature():
     gid, w = _singleton_groups(B)
     # temperature == 1: out must equal the raw logits (division by 1 is moot
     # either way, so this alone would NOT catch the T² bug).
-    out1, is_grouped1 = fuse_group_logits(logits, gid, w, temperature_B=torch.ones(B))
+    out1, is_grouped1, _ = fuse_group_logits(logits, gid, w, temperature_B=torch.ones(B))
     assert not is_grouped1.any()
     assert torch.equal(out1, logits.float())
     # arbitrary per-row temperature != 1: out must STILL equal the raw logits,
     # not logits / T. This is the case the T² bug would actually break.
     temp = torch.tensor([0.7, 1.0, 1.5])
-    out2, is_grouped2 = fuse_group_logits(logits, gid, w, temperature_B=temp)
+    out2, is_grouped2, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
     assert not is_grouped2.any()
     assert torch.equal(out2, logits.float())
 
@@ -96,7 +96,7 @@ def test_mixed_batch_singleton_rows_byte_identical_to_raw_logits():
     gid = torch.tensor([0, 0, 2, 3], dtype=torch.long)  # rows 0,1 fused; 2,3 alone
     w = torch.tensor([0.5, 0.5, 1.0, 1.0], dtype=torch.float32)
     temp = torch.tensor([1.0, 1.0, 0.8, 1.3])
-    out, is_grouped = fuse_group_logits(logits, gid, w, temperature_B=temp)
+    out, is_grouped, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
     assert is_grouped.tolist() == [True, True, False, False]
     # singleton rows: exact raw logits, untouched by temperature
     assert torch.equal(out[2], logits[2].float())
@@ -129,7 +129,7 @@ def test_two_member_equal_weight_is_geometric_mean():
     logits = torch.stack([row0, row1])
     gid = torch.tensor([0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.5], dtype=torch.float32)
-    out, is_grouped = fuse_group_logits(logits, gid, w)
+    out, is_grouped, _ = fuse_group_logits(logits, gid, w)
     assert is_grouped.all()
 
     geometric_mean = (logits[0].softmax(-1) ** 0.5) * (logits[1].softmax(-1) ** 0.5)
@@ -250,7 +250,7 @@ def test_three_member_group_is_weighted_geometric_mean():
     logits = torch.stack([row0, row1, row2])
     gid = torch.tensor([0, 0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float32)
-    out, is_grouped = fuse_group_logits(logits, gid, w)
+    out, is_grouped, _ = fuse_group_logits(logits, gid, w)
     assert is_grouped.all()
 
     probs = [logits[i].softmax(-1) for i in range(3)]
@@ -267,8 +267,8 @@ def test_weight_ratio_only():
     N, V = 8, 1026
     logits = torch.randn(2, N, V)
     gid = torch.tensor([0, 0], dtype=torch.long)
-    out_raw, _ = fuse_group_logits(logits, gid, torch.tensor([3.0, 1.0]))
-    out_norm, _ = fuse_group_logits(logits, gid, torch.tensor([0.75, 0.25]))
+    out_raw, _, _ = fuse_group_logits(logits, gid, torch.tensor([3.0, 1.0]))
+    out_norm, _, _ = fuse_group_logits(logits, gid, torch.tensor([0.75, 0.25]))
     torch.testing.assert_close(
         out_raw.softmax(-1), out_norm.softmax(-1), atol=1e-6, rtol=1e-5
     )
@@ -280,7 +280,7 @@ def test_fused_rows_sample_identically_with_shared_seed():
     N, V = 8, 1026
     logits = torch.randn(2, N, V)
     gid = torch.tensor([0, 0], dtype=torch.long)
-    fused, _ = fuse_group_logits(logits, gid, torch.tensor([0.5, 0.5]))
+    fused, _, _ = fuse_group_logits(logits, gid, torch.tensor([0.5, 0.5]))
     g0 = torch.Generator().manual_seed(42)
     g1 = torch.Generator().manual_seed(42)
     s0 = fused[0].softmax(-1).multinomial(1, generator=g0)
@@ -299,7 +299,7 @@ def test_mixed_batch_groups_and_singletons():
     logits = torch.stack([row0, row1, row2])
     gid = torch.tensor([0, 0, 2], dtype=torch.long)  # rows 0,1 grouped; row 2 alone
     w = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32)
-    out, is_grouped = fuse_group_logits(logits, gid, w)
+    out, is_grouped, _ = fuse_group_logits(logits, gid, w)
     assert is_grouped.tolist() == [True, True, False]
     expected01 = (logits[0].softmax(-1) ** 0.5) * (logits[1].softmax(-1) ** 0.5)
     expected01 = expected01 / expected01.sum(-1, keepdim=True)
@@ -399,6 +399,80 @@ def test_mean_log_likelihood_clamps_stop_code_instead_of_crashing():
     torch.testing.assert_close(ell, expected)
 
 
+# --------------------------------------------------------------------------- #
+# Regression test for a real, measured bug in the trajectory-feedback
+# controller (round 4): the delta observation must be measured on
+# ``fuse_group_logits``'s ``matched_logits`` (entropy-matched, still
+# per-member), NOT the true raw per-member logits. Two members that differ
+# in native sharpness (any two distinct real reference voices) produce a
+# systematically nonzero raw-observation gap even at a genuine nominal
+# 50/50 pool -- confirmed live (the controller converged to a fixed WRONG
+# voice, and got there FASTER, not more centered, as the integral gain
+# increased) and by a standalone closed-loop simulation. See
+# docs/voice_fusion_design.md's "AR 滞后" section.
+# --------------------------------------------------------------------------- #
+def test_delta_observation_on_raw_logits_is_biased_toward_the_sharper_member():
+    """Sanity check that the bug is real and reproducible: averaged over many
+    independent (sharp, flat) trials, measuring each member's OWN raw logits'
+    likelihood of the group's actually-sampled shared frame gives the sharper
+    member a systematically higher score than the flatter one, even though
+    the pool was requested at equal weight."""
+    torch.manual_seed(40)
+    N, V = 8, 1026
+    n_trials = 100
+    gid = torch.tensor([0, 0], dtype=torch.long)
+    norm_w = torch.tensor([0.5, 0.5], dtype=torch.float32)
+    ones2 = torch.ones(2)
+
+    raw_gaps = []
+    for _ in range(n_trials):
+        sharp = torch.randn(N, V) * 1.4
+        flat = torch.randn(N, V) * 1.0
+        logits = torch.stack([sharp, flat])
+        out, _, _ = fuse_group_logits(logits, gid, norm_w)
+        codes = out[0].argmax(-1).unsqueeze(0).expand(2, -1)
+
+        ell_raw = mean_log_likelihood_of_sampled_frame(logits, ones2, codes)
+        raw_gaps.append((ell_raw[0] - ell_raw[1]).item())
+
+    raw_gap_mean = sum(raw_gaps) / n_trials
+    # Consistent sign, not just noise: the sharper member (index 0) is
+    # systematically less "surprised" by the shared frame.
+    assert raw_gap_mean > 0.1
+
+
+def test_delta_observation_on_matched_logits_is_not_biased_by_sharpness():
+    """The fix: measuring on ``matched_logits`` instead of raw per-member
+    logits removes the sharpness bias the test above demonstrates -- averaged
+    over the same kind of (sharp, flat) trials, the matched-logits gap must
+    sit much closer to zero than the raw-logits gap does."""
+    torch.manual_seed(40)
+    N, V = 8, 1026
+    n_trials = 100
+    gid = torch.tensor([0, 0], dtype=torch.long)
+    norm_w = torch.tensor([0.5, 0.5], dtype=torch.float32)
+    ones2 = torch.ones(2)
+
+    raw_gaps = []
+    matched_gaps = []
+    for _ in range(n_trials):
+        sharp = torch.randn(N, V) * 1.4
+        flat = torch.randn(N, V) * 1.0
+        logits = torch.stack([sharp, flat])
+        out, _, matched = fuse_group_logits(logits, gid, norm_w)
+        codes = out[0].argmax(-1).unsqueeze(0).expand(2, -1)
+
+        ell_raw = mean_log_likelihood_of_sampled_frame(logits, ones2, codes)
+        raw_gaps.append((ell_raw[0] - ell_raw[1]).item())
+
+        ell_matched = mean_log_likelihood_of_sampled_frame(matched, ones2, codes)
+        matched_gaps.append((ell_matched[0] - ell_matched[1]).item())
+
+    raw_gap_mean = sum(raw_gaps) / n_trials
+    matched_gap_mean = sum(matched_gaps) / n_trials
+    assert abs(matched_gap_mean) < abs(raw_gap_mean) * 0.5
+
+
 def test_temperature_applied_before_blend():
     """temperature_B scales each row's logits before the log-linear pool.
     Rows share one entropy (post temperature-scaling) so entropy-matching is
@@ -411,7 +485,7 @@ def test_temperature_applied_before_blend():
     gid = torch.tensor([0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.5])
     temp = torch.tensor([2.0, 2.0])
-    out, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
+    out, _, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
     p0 = (logits[0] / 2.0).softmax(-1)
     p1 = (logits[1] / 2.0).softmax(-1)
     expected = (p0 ** 0.5) * (p1 ** 0.5)
@@ -442,7 +516,7 @@ def _wrong_caller_sample(
     gid = torch.arange(logits_NV.shape[0], dtype=torch.long)
     w = torch.ones(logits_NV.shape[0])
     temp = torch.full((logits_NV.shape[0],), 1e-5)  # requested: greedy
-    blended, _ = fuse_group_logits(logits_NV.unsqueeze(1), gid, w, temperature_B=temp)
+    blended, _, _ = fuse_group_logits(logits_NV.unsqueeze(1), gid, w, temperature_B=temp)
     probs = blended.squeeze(1).softmax(dim=-1)
     return probs.multinomial(num_samples=1, generator=generator).squeeze(-1)
 
@@ -454,7 +528,7 @@ def _correct_caller_sample(logits_NV: torch.Tensor) -> torch.Tensor:
     gid = torch.arange(logits_NV.shape[0], dtype=torch.long)
     w = torch.ones(logits_NV.shape[0])
     temp = torch.full((logits_NV.shape[0],), 1e-5)
-    blended, is_grouped = fuse_group_logits(
+    blended, is_grouped, _ = fuse_group_logits(
         logits_NV.unsqueeze(1), gid, w, temperature_B=temp
     )
     assert not is_grouped.any()  # every row here is a singleton
@@ -518,7 +592,7 @@ def test_singleton_nongreedy_sampling_is_not_scaled_by_temperature_twice():
 
     gid = torch.arange(B, dtype=torch.long)
     w = torch.ones(B)
-    blended, is_grouped = fuse_group_logits(
+    blended, is_grouped, _ = fuse_group_logits(
         logits.unsqueeze(1), gid, w, temperature_B=temp
     )
     assert not is_grouped.any()

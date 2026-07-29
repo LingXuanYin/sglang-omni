@@ -503,8 +503,7 @@ class HiggsTTSModel(nn.Module):
     def _update_fusion_deltas(
         self,
         req_ids: list[str],
-        raw_logits_BNV: torch.Tensor,
-        real_temperature_B: torch.Tensor,
+        observation_logits_BNV: torch.Tensor,
         codes_BN: torch.Tensor,
         group_B: torch.Tensor,
         nominal_weight_of: dict[str, float],
@@ -516,19 +515,31 @@ class HiggsTTSModel(nn.Module):
         autoregressive lock-in this exists to counteract).
 
         After this step's shared frame (``codes_BN``) is sampled, measure
-        each fusion row's own (pre-fusion) log-likelihood of it
-        (:func:`mean_log_likelihood_of_sampled_frame`), aggregate per group
-        using the NOMINAL blend weights (not the delta-adjusted effective
-        ones the blend itself just used — the controller's target is "match
-        the ratio the caller asked for", not "match whatever this step
-        already leaned toward"), and nudge each member's persistent delta
-        toward closing the gap between its own opinion and the group's
-        weighted-average opinion. Runs synchronously (this path already does
-        a D2H per step regardless, see the caller's own comment) — no CUDA
-        Graph constraint here, unlike ``decode_codebooks_batch_cg``.
+        each fusion row's own entropy-matched-but-not-yet-pooled
+        log-likelihood of it (:func:`mean_log_likelihood_of_sampled_frame`,
+        fed ``fuse_group_logits``'s ``matched_logits`` output — NOT the true
+        raw per-member logits, which differ in native sharpness by
+        construction and would make this measure raw-space KL-divergence
+        equidistance instead of "match the nominal blend ratio", a real bug
+        that made results converge to a fixed wrong voice *faster* as the
+        integral gain increased rather than centering — see the fusion.py
+        docstring), aggregate per group using the NOMINAL blend weights (not
+        the delta-adjusted effective ones the blend itself just used — the
+        controller's target is "match the ratio the caller asked for", not
+        "match whatever this step already leaned toward"), and nudge each
+        member's persistent delta toward closing the gap between its own
+        opinion and the group's weighted-average opinion. Runs synchronously
+        (this path already does a D2H per step regardless, see the caller's
+        own comment) — no CUDA Graph constraint here, unlike
+        ``decode_codebooks_batch_cg``.
         """
+        ones_temperature_B = torch.ones(
+            observation_logits_BNV.shape[0],
+            dtype=torch.float32,
+            device=observation_logits_BNV.device,
+        )
         ell_B = mean_log_likelihood_of_sampled_frame(
-            raw_logits_BNV, real_temperature_B, codes_BN
+            observation_logits_BNV, ones_temperature_B, codes_BN
         )
         ell_list = ell_B.detach().cpu().tolist()
         group_list = group_B.detach().cpu().tolist()
@@ -628,13 +639,8 @@ class HiggsTTSModel(nn.Module):
                 )
 
         group_B, weight_B, is_fused = self._batch_local_fusion(gen_params, device)
-        # Pre-fusion logits and each row's own REAL temperature, kept for the
-        # delta observation below — `temperature` itself gets folded to 1 for
-        # grouped rows right after this, which would double-divide if reused.
-        raw_logits_BNV = logits_BNV
-        real_temperature = temperature
         if is_fused:
-            logits_BNV, is_grouped_B = fuse_group_logits(
+            logits_BNV, is_grouped_B, observation_logits_BNV = fuse_group_logits(
                 logits_BNV, group_B, weight_B, temperature_B=temperature
             )
             # Grouped rows already had temperature folded into the blend, so
@@ -666,7 +672,7 @@ class HiggsTTSModel(nn.Module):
             )
             self._sampler_pool.generation_done[row_indices] = synced_done
             self._update_fusion_deltas(
-                req_ids, raw_logits_BNV, real_temperature, codes_BN, group_B, weight_of
+                req_ids, observation_logits_BNV, codes_BN, group_B, weight_of
             )
 
         # Note(yichi): One D2H per step to skip STOP-sentinel rows in the Python append loop.
@@ -717,8 +723,7 @@ class HiggsTTSModel(nn.Module):
         # keeps this branchless while still being correct per row.
         fusion_group_B = self._cg_fusion_group[:batch_size]
         fusion_weight_B = self._cg_fusion_weight[:batch_size]
-        raw_logits_BNV = logits_BNV  # pre-fusion, kept for the delta observation below
-        logits_BNV, is_grouped_B = fuse_group_logits(
+        logits_BNV, is_grouped_B, observation_logits_BNV = fuse_group_logits(
             logits_BNV,
             fusion_group_B,
             fusion_weight_B,
@@ -784,19 +789,26 @@ class HiggsTTSModel(nn.Module):
         self._cg_codes_BN[:batch_size] = codes_BN
 
         # Trajectory-feedback observation (see FusionRegistry's _delta
-        # docstring): each row's own (pre-fusion) mean-over-codebooks
-        # log-likelihood of the frame the group actually just sampled
-        # together. Always computed (cheap gather+mean, no host branching,
-        # per the CG-capture constraint — same "unconditional, no-op for
-        # non-fusion rows" pattern as fuse_group_logits itself); the runner
-        # only reads this buffer back (a D2H, so genuinely has a cost) when
-        # fusion traffic is actually present (see
-        # HiggsTTSModelRunner._decode_pack_gpu). Uses `temperature`, each
-        # row's REAL per-row value, not `sampler_temperature` (which folds
-        # grouped rows to 1 for the sampler call above — reusing that here
-        # would measure likelihood in the wrong temperature scale).
+        # docstring): each row's own, still per-member (not group-pooled),
+        # entropy-matched mean-over-codebooks log-likelihood of the frame the
+        # group actually just sampled together. Always computed (cheap
+        # gather+mean, no host branching, per the CG-capture constraint —
+        # same "unconditional, no-op for non-fusion rows" pattern as
+        # fuse_group_logits itself); the runner only reads this buffer back
+        # (a D2H, so genuinely has a cost) when fusion traffic is actually
+        # present (see HiggsTTSModelRunner._decode_pack_gpu). Measures
+        # ``observation_logits_BNV`` (``fuse_group_logits``'s
+        # ``matched_logits`` — already temperature-scaled AND
+        # entropy-matched) at temperature 1, NOT the true raw per-member
+        # logits at the real per-row temperature: raw logits differ in
+        # native sharpness between members by construction, so measuring
+        # them here servos raw-space KL-divergence equidistance instead of
+        # the intended "match the nominal blend ratio" — a real, measured
+        # bug where the controller converged to a fixed wrong voice faster
+        # (not more centered) as the integral gain increased. See the
+        # fusion.py docstring for the full derivation.
         self._cg_fusion_ell[:batch_size] = mean_log_likelihood_of_sampled_frame(
-            raw_logits_BNV, temperature, codes_BN
+            observation_logits_BNV, torch.ones_like(temperature), codes_BN
         )
 
         text_vocab_size = self.backbone.config.vocab_size
