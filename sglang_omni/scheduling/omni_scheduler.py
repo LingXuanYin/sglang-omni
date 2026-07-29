@@ -1181,14 +1181,22 @@ class OmniScheduler:
         siblings = getattr(req_data, "fusion_siblings", None)
         if siblings:
             req_data.fusion_siblings = None
-            # Record the full group membership so an abort of any member can
-            # cascade to the rest (prevents a follower's sampler slot leaking
-            # when the leader is aborted mid-flight).
-            group_rids = {req_data.req.rid} | {
-                sibling_data.req.rid for sibling_data in siblings
-            }
-            for rid in group_rids:
-                self._fusion_group_members[rid] = group_rids
+            # Engine-internal fan-outs (e.g. reference-fusion calibration rows)
+            # are independent requests that only want adjacent enqueueing, NOT
+            # atomic co-admission: registering them in the member registry
+            # would subject them to the admission gate, whose combined-cost
+            # check can never pass for a large fan-out (the gate would withhold
+            # them for 200 ticks and give up). Their abort cascade is handled
+            # by their orchestrator's own client-facing registry entry instead.
+            if not bool(getattr(req_data, "fusion_skip_atomic_admission", False)):
+                # Record the full group membership so an abort of any member
+                # can cascade to the rest (prevents a follower's sampler slot
+                # leaking when the leader is aborted mid-flight).
+                group_rids = {req_data.req.rid} | {
+                    sibling_data.req.rid for sibling_data in siblings
+                }
+                for rid in group_rids:
+                    self._fusion_group_members[rid] = group_rids
             for sibling_data in siblings:
                 self._enqueue_built_request(
                     payload,

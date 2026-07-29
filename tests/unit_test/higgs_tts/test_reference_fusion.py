@@ -149,8 +149,12 @@ def _bound_orchestrator(monkeypatch):
     return orch, sched
 
 
-def _register(orch, request_id="req1", n=2):
-    refs = _refs(seed=7, n=n)
+def _register(orch, request_id="req1", n=2, refs=None, fp_of_slot=None):
+    refs = refs if refs is not None else _refs(seed=7, n=n)
+    fps = fp_of_slot if fp_of_slot is not None else [
+        fr.ref_fingerprint(r) for r in refs
+    ]
+    ref_of_fp = {fp: ref for fp, ref in zip(fps, refs)}
     built = {}
 
     def make_real(delayed_rows):
@@ -158,15 +162,16 @@ def _register(orch, request_id="req1", n=2):
         return SimpleNamespace(req=SimpleNamespace(rid=request_id), real=True)
 
     rows = [
-        fr._CalRow(ref_idx=i, seed_idx=0, rid=f"{request_id}#cal{i}r0")
-        for i in range(n)
+        fr._CalRow(fp=fp, seed_idx=0, rid=f"{request_id}#cal{fp[:8]}r0")
+        for fp in dict.fromkeys(fps)
     ]
     orch.register_group(
         request_id=request_id,
         payload=SimpleNamespace(request_id=request_id),
         cache_key="key-" + request_id,
-        refs=refs,
-        weights=[1.0 / n] * n,
+        fp_of_slot=fps,
+        ref_of_fp=ref_of_fp,
+        weights=[1.0 / len(fps)] * len(fps),
         cal_text="cal",
         make_real_request=make_real,
         cal_rows=rows,
@@ -177,14 +182,15 @@ def _register(orch, request_id="req1", n=2):
 def test_happy_path_builds_and_enqueues_real_request(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
     monkeypatch.setattr(
-        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+        fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
     rows, built = _register(orch)
 
-    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(rows[0].rid))
     assert not sched.enqueued  # one calibration row is not enough
-    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+    orch.on_internal_done("req1", rows[1].fp, _cal_row_result(rows[1].rid))
 
     assert built["rows"], "hybrid delayed rows must reach make_real_request"
     assert len(sched.enqueued) == 1 and getattr(sched.enqueued[0], "real", False)
@@ -192,6 +198,9 @@ def test_happy_path_builds_and_enqueues_real_request(monkeypatch):
     # group + abort entry fully cleaned up
     assert "req1" not in orch._groups
     assert "req1" not in sched._fusion_group_members
+    # gate-validated calibration codes are now cached per voice
+    assert orch.cal_cache_get(rows[0].fp, "cal") is not None
+    assert orch.cal_cache_get(rows[1].fp, "cal") is not None
 
 
 def test_short_real_reference_passes_the_length_floor(monkeypatch):
@@ -200,26 +209,40 @@ def test_short_real_reference_passes_the_length_floor(monkeypatch):
     (Regression: an erroneous 75-frame floor rejected real 53-frame refs.)"""
     orch, sched = _bound_orchestrator(monkeypatch)
     monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
     monkeypatch.setattr(
-        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+        fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
-    refs = _refs(seed=11, n=2, frames=53)
-    built = {}
-    rows = [fr._CalRow(ref_idx=i, seed_idx=0, rid=f"req2#cal{i}r0") for i in range(2)]
-    orch.register_group(
-        request_id="req2",
-        payload=SimpleNamespace(request_id="req2"),
-        cache_key="key-req2",
-        refs=refs,
-        weights=[0.5, 0.5],
-        cal_text="cal",
-        make_real_request=lambda rows_: built.setdefault("rows", rows_)
-        or SimpleNamespace(req=SimpleNamespace(rid="req2"), real=True),
-        cal_rows=rows,
-    )
-    orch.on_internal_done("req2", 0, _cal_row_result(rows[0].rid, frames=53))
-    orch.on_internal_done("req2", 1, _cal_row_result(rows[1].rid, frames=53))
+    rows, built = _register(orch, request_id="req2", refs=_refs(seed=11, n=2, frames=53))
+    orch.on_internal_done("req2", rows[0].fp, _cal_row_result(rows[0].rid, frames=53))
+    orch.on_internal_done("req2", rows[1].fp, _cal_row_result(rows[1].rid, frames=53))
     assert built.get("rows"), "53-frame references must build successfully"
+    assert not sched.errors
+
+
+def test_duplicate_references_deduplicate_to_distinct_voices(monkeypatch):
+    """12 slots of only 2 distinct voices: 2 calibration rows drive the whole
+    build, and the morph sees all 12 weighted slots."""
+    orch, sched = _bound_orchestrator(monkeypatch)
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    seen_entries = {}
+
+    def fake_fuse(entries, fs=24000):
+        seen_entries["n"] = len(entries)
+        return np.zeros(24000)
+
+    monkeypatch.setattr(fr, "_fuse_world_entries", fake_fuse)
+    two = _refs(seed=13, n=2)
+    refs12 = [two[i % 2] for i in range(12)]
+    fps12 = [fr.ref_fingerprint(r) for r in refs12]
+    assert len(set(fps12)) == 2
+    rows, built = _register(orch, request_id="req3", refs=refs12, fp_of_slot=fps12)
+    assert len(rows) == 2, "only distinct voices get calibration rows"
+    orch.on_internal_done("req3", rows[0].fp, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req3", rows[1].fp, _cal_row_result(rows[1].rid))
+    assert built.get("rows")
+    assert seen_entries["n"] == 12, "morph must weight all 12 slots"
     assert not sched.errors
 
 
@@ -236,7 +259,7 @@ def test_member_registration_excludes_client_facing_id(monkeypatch):
 def test_aborted_calibration_row_fails_group_without_client_error(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     rows, built = _register(orch)
-    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid, finish="abort"))
+    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(rows[0].rid, finish="abort"))
     assert "rows" not in built
     assert not sched.enqueued
     assert not sched.errors  # abort came from the client; no extra error
@@ -249,7 +272,7 @@ def test_empty_calibration_output_emits_error(monkeypatch):
     rows, _ = _register(orch)
     result = _cal_row_result(rows[0].rid)
     result.output_codes = []
-    orch.on_internal_done("req1", 0, result)
+    orch.on_internal_done("req1", rows[0].fp, result)
     assert sched.errors and sched.errors[0][0] == "req1"
     assert not sched.enqueued
 
@@ -261,8 +284,9 @@ def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
     # round one, then 4 more after the retry lands.)
     f0_values = iter([300.0, 100.0] + [100.0] * 10)
     monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: next(f0_values))
+    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
     monkeypatch.setattr(
-        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+        fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
     retry_builds = []
     monkeypatch.setitem(
@@ -276,15 +300,15 @@ def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
         ),
     )
     rows, built = _register(orch)
-    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
-    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req1", rows[1].fp, _cal_row_result(rows[1].rid))
 
     assert retry_builds and retry_builds[0]["seed"] == fr.CAL_SEEDS[1]
     assert len(sched.enqueued) == 1 and getattr(sched.enqueued[0], "retry", False)
     retry_rid = retry_builds[0]["rid"]
     assert retry_rid in sched._fusion_group_members["req1"]
 
-    orch.on_internal_done("req1", 0, _cal_row_result(retry_rid))
+    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(retry_rid))
     assert built["rows"]
     assert any(getattr(r, "real", False) for r in sched.enqueued)
 
@@ -292,13 +316,14 @@ def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
 def test_client_abort_before_finalize_drops_the_build(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
     monkeypatch.setattr(
-        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+        fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
     rows, built = _register(orch)
     sched._aborted_request_ids.add("req1")
-    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
-    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req1", rows[1].fp, _cal_row_result(rows[1].rid))
     assert not sched.enqueued
     assert "req1" not in orch._groups
 

@@ -68,6 +68,10 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     # ``stream_output`` instead of being emitted downstream. Such rows are
     # invisible to the client and never produce a stage result.
     internal_done_callback: Callable[["HiggsSGLangRequestData"], None] | None = None
+    # Set on a leader whose ``fusion_siblings`` are independent requests that
+    # only need adjacent enqueueing: skips the atomic-admission member
+    # registry, whose combined-cost gate can never admit a large fan-out.
+    fusion_skip_atomic_admission: bool = False
 
 
 class _ResettableHiggsModel(Protocol):
@@ -327,6 +331,7 @@ def build_calibration_request(
         request_id=rid,
     )
     data.internal_done_callback = done_callback
+    data.fusion_skip_atomic_admission = True
     data.engine_start_s = _perf_counter()
     return data
 
@@ -390,35 +395,59 @@ def build_reference_fusion_requests(
     if cached_rows is not None:
         return _make_real_request(cached_rows)
 
+    # Deduplicate by reference content: 12 slots of 2 distinct voices need 2
+    # calibration syntheses, and a voice already gate-validated by an earlier
+    # request (any weight combination) needs none.
+    fp_of_slot = [fusion_reference.ref_fingerprint(ref) for ref in refs]
+    ref_of_fp = {fp: ref for fp, ref in zip(fp_of_slot, refs)}
+    pre_collected: dict[str, Any] = {}
+    missing_fps: list[str] = []
+    for fp in dict.fromkeys(fp_of_slot):
+        cached_cal = orchestrator.cal_cache_get(fp, cal_text)
+        if cached_cal is not None:
+            pre_collected[fp] = cached_cal
+        else:
+            missing_fps.append(fp)
+    if not missing_fps:
+        # Every voice's calibration is cached but this weight combination's
+        # hybrid isn't. The builder protocol must return a queue row, and the
+        # heavy morph must not run on the (head-of-line-blocking) build
+        # thread — so re-run ONE calibration as a sentinel row whose
+        # completion drives the normal orchestrator finalize path.
+        sentinel = fp_of_slot[0]
+        pre_collected.pop(sentinel, None)
+        missing_fps = [sentinel]
+
     cal_rows: list[fusion_reference._CalRow] = []
     requests: list[HiggsSGLangRequestData] = []
-    for i, ref in enumerate(refs):
-        rid = f"{request_id}#cal{i}r0"
-        row = fusion_reference._CalRow(ref_idx=i, seed_idx=0, rid=rid)
-        cal_rows.append(row)
+    for fp in missing_fps:
+        rid = f"{request_id}#cal{fp[:8]}r0"
+        cal_rows.append(fusion_reference._CalRow(fp=fp, seed_idx=0, rid=rid))
         requests.append(
             build_calibration_request(
-                ref=ref,
+                ref=ref_of_fp[fp],
                 rid=rid,
                 seed=fusion_reference.CAL_SEEDS[0],
-                done_callback=orchestrator.make_done_callback(request_id, i),
+                done_callback=orchestrator.make_done_callback(request_id, fp),
             )
         )
     orchestrator.register_group(
         request_id=request_id,
         payload=payload,
         cache_key=cache_key,
-        refs=refs,
+        fp_of_slot=fp_of_slot,
+        ref_of_fp=ref_of_fp,
         weights=weights,
         cal_text=cal_text,
         make_real_request=_make_real_request,
         cal_rows=cal_rows,
+        pre_collected=pre_collected,
     )
-    leader = requests[0]
     # The sibling side-channel is reused purely as "enqueue these adjacent
-    # rows"; it also registers {cal rids} as an abort group, which
-    # ``register_group`` has already superseded with {request_id + cal rids}
-    # under the client-facing id — both mappings cascade correctly.
+    # rows" — the leader's ``fusion_skip_atomic_admission`` keeps them out of
+    # the admission gate's member registry (they are independent requests);
+    # abort cascade runs through ``register_group``'s client-facing entry.
+    leader = requests[0]
     leader.fusion_siblings = requests[1:]
     return leader
 

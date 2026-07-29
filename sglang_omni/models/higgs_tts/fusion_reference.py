@@ -196,6 +196,13 @@ def dtw_map(feats_a: np.ndarray, feats_b: np.ndarray) -> np.ndarray:
     return out
 
 
+# DTW cost is a pure-python O(Ta*Tb) DP; at the 5 ms WORLD frame rate an ~8 s
+# read is ~1600 frames (2.6M cells per pairwise merge). Aligning on a 4x
+# time-decimated feature track (20 ms) cuts that 16x; 20 ms alignment jitter
+# is far below what the envelope-averaging morph can perceive.
+_DTW_DECIMATE = 4
+
+
 def _morph_pair(
     world_a: tuple[np.ndarray, np.ndarray, np.ndarray],
     world_b: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -211,7 +218,13 @@ def _morph_pair(
     f0_a, sp_a, ap_a = world_a
     f0_b, sp_b, ap_b = world_b
     feats_a, feats_b = dtw_features(sp_a), dtw_features(sp_b)
-    map_ab = dtw_map(feats_a, feats_b)
+    d = _DTW_DECIMATE
+    map_ds = dtw_map(feats_a[::d], feats_b[::d])
+    map_ab = np.minimum(
+        np.repeat(map_ds * d, d)[: len(feats_a)], len(feats_b) - 1
+    )
+    if len(map_ab) < len(feats_a):  # decimated track shorter than full track
+        map_ab = np.pad(map_ab, (0, len(feats_a) - len(map_ab)), mode="edge")
     f0_bw, sp_bw, ap_bw = f0_b[map_ab], sp_b[map_ab], ap_b[map_ab]
 
     voiced_a, voiced_b = f0_a > 0, f0_bw > 0
@@ -233,28 +246,19 @@ def _morph_pair(
     return f0_m, sp_m, ap_m
 
 
-def build_fused_reference(
-    cal_wavs: list[np.ndarray],
-    weights: list[float],
+def _fuse_world_entries(
+    entries: list[dict],
     fs: int = _SAMPLE_RATE,
 ) -> np.ndarray:
-    """N same-content calibration waveforms + weights → hybrid waveform.
+    """``[{"world": (f0, sp, ap), "weight": float}, ...]`` → hybrid waveform.
 
-    N == 2 is exactly the live-validated E1 morph. N > 2 reduces pairwise
-    (always merging the two smallest current weights, Huffman-style) so every
-    step goes through the validated binary blend; the time axis converges to
-    the largest-weight member's.
+    Reduces pairwise (always merging the two smallest current weights,
+    Huffman-style) so every step goes through the validated binary blend; the
+    time axis converges to the largest-weight member's. Entries may share
+    ``world`` objects (duplicate references) — they are never mutated.
     """
-    if len(cal_wavs) != len(weights) or len(cal_wavs) < 2:
-        raise ValueError(
-            f"need >= 2 calibration waveforms with matching weights, got "
-            f"{len(cal_wavs)} / {len(weights)}"
-        )
     pw = _pyworld()
-    entries = [
-        {"world": world_extract(w, fs), "weight": float(wt)}
-        for w, wt in zip(cal_wavs, weights)
-    ]
+    entries = [dict(e) for e in entries]
     while len(entries) > 1:
         entries.sort(key=lambda e: e["weight"])
         low, high = entries.pop(0), entries.pop(0)
@@ -275,7 +279,42 @@ def build_fused_reference(
     return (wav / peak * 0.9).astype(np.float32)
 
 
+def build_fused_reference(
+    cal_wavs: list[np.ndarray],
+    weights: list[float],
+    fs: int = _SAMPLE_RATE,
+) -> np.ndarray:
+    """N same-content calibration waveforms + weights → hybrid waveform.
+
+    N == 2 is exactly the live-validated E1 morph.
+    """
+    if len(cal_wavs) != len(weights) or len(cal_wavs) < 2:
+        raise ValueError(
+            f"need >= 2 calibration waveforms with matching weights, got "
+            f"{len(cal_wavs)} / {len(weights)}"
+        )
+    entries = [
+        {"world": world_extract(w, fs), "weight": float(wt)}
+        for w, wt in zip(cal_wavs, weights)
+    ]
+    return _fuse_world_entries(entries, fs)
+
+
 # --- Cache -------------------------------------------------------------------
+
+
+def ref_fingerprint(ref: dict[str, Any]) -> str:
+    """Content fingerprint of ONE reference's delayed code sequence.
+
+    Keys the per-reference calibration/anchor caches AND deduplicates repeated
+    references inside a single fusion request (12 slots of 2 distinct voices
+    cost 2 calibration syntheses, not 12).
+    """
+    h = hashlib.blake2b(digest_size=16)
+    for row in ref["codes_delayed"]:
+        for c in row:
+            h.update(int(c).to_bytes(2, "little"))
+    return h.hexdigest()
 
 
 def fused_reference_cache_key(
@@ -288,9 +327,7 @@ def fused_reference_cache_key(
     for ref, weight in zip(refs, weights):
         h.update(b"|ref|")
         h.update(f"{weight:.6f}".encode())
-        for row in ref["codes_delayed"]:
-            for c in row:
-                h.update(int(c).to_bytes(2, "little"))
+        h.update(ref_fingerprint(ref).encode())
     return h.hexdigest()
 
 
@@ -299,7 +336,7 @@ def fused_reference_cache_key(
 
 @dataclass
 class _CalRow:
-    ref_idx: int
+    fp: str  # reference fingerprint this calibration row serves
     seed_idx: int
     rid: str
 
@@ -309,15 +346,20 @@ class _BuildGroup:
     request_id: str
     payload: Any
     cache_key: str
-    refs: list[dict[str, Any]]  # {"codes_delayed", "weight", "cal_prompt_token_ids"}
+    fp_of_slot: list[str]  # per-slot reference fingerprint (duplicates allowed)
+    ref_of_fp: dict[str, dict[str, Any]]  # fp -> one ref dict for that voice
     weights: list[float]
     cal_text: str
     make_real_request: Callable[[list[list[int]]], Any]
     deadline: float
     pending: dict[str, _CalRow] = field(default_factory=dict)
-    collected: dict[int, torch.Tensor] = field(default_factory=dict)  # raw [T, N]
-    seed_used: dict[int, int] = field(default_factory=dict)
+    collected: dict[str, torch.Tensor] = field(default_factory=dict)  # fp -> delayed
+    seed_used: dict[str, int] = field(default_factory=dict)
     failed: bool = False
+
+    @property
+    def unique_fps(self) -> list[str]:
+        return list(dict.fromkeys(self.fp_of_slot))
 
 
 class FusionReferenceOrchestrator:
@@ -336,6 +378,12 @@ class FusionReferenceOrchestrator:
         self._groups: dict[str, _BuildGroup] = {}
         self._cache: dict[str, list[list[int]]] = {}
         self._cache_order: list[str] = []
+        # Per-reference caches, keyed by ref fingerprint: gate-validated
+        # calibration codes (per cal_text) and the reference's own median F0.
+        # These survive across weight combinations and across requests, so a
+        # voice's calibration synthesis is only ever paid once per process.
+        self._cal_cache: dict[tuple[str, str], torch.Tensor] = {}
+        self._anchor_cache: dict[str, float | None] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="higgs-ref-fusion"
         )
@@ -365,6 +413,14 @@ class FusionReferenceOrchestrator:
                     self._cache.pop(evicted, None)
             self._cache[key] = delayed_rows
 
+    def cal_cache_get(self, fp: str, cal_text: str) -> torch.Tensor | None:
+        with self._lock:
+            return self._cal_cache.get((fp, cal_text))
+
+    def _cal_cache_put(self, fp: str, cal_text: str, delayed: torch.Tensor) -> None:
+        with self._lock:
+            self._cal_cache[(fp, cal_text)] = delayed
+
     # -- build lifecycle --
 
     def register_group(
@@ -373,26 +429,32 @@ class FusionReferenceOrchestrator:
         request_id: str,
         payload: Any,
         cache_key: str,
-        refs: list[dict[str, Any]],
+        fp_of_slot: list[str],
+        ref_of_fp: dict[str, dict[str, Any]],
         weights: list[float],
         cal_text: str,
         make_real_request: Callable[[list[list[int]]], Any],
         cal_rows: list[_CalRow],
+        pre_collected: dict[str, torch.Tensor] | None = None,
     ) -> None:
         group = _BuildGroup(
             request_id=request_id,
             payload=payload,
             cache_key=cache_key,
-            refs=refs,
+            fp_of_slot=fp_of_slot,
+            ref_of_fp=ref_of_fp,
             weights=weights,
             cal_text=cal_text,
             make_real_request=make_real_request,
             deadline=time.monotonic() + BUILD_DEADLINE_S,
         )
         self._sweep_expired()
+        for fp, delayed in (pre_collected or {}).items():
+            group.collected[fp] = delayed
+            group.seed_used[fp] = 0
         for row in cal_rows:
             group.pending[row.rid] = row
-            group.seed_used[row.ref_idx] = row.seed_idx
+            group.seed_used[row.fp] = row.seed_idx
         with self._lock:
             self._groups[request_id] = group
         # Abort entry point: a client abort of ``request_id`` must cascade
@@ -400,19 +462,19 @@ class FusionReferenceOrchestrator:
         # contain ``request_id`` itself — the atomic-admission gate withholds
         # any group whose members aren't all present in the waiting queue, and
         # ``request_id`` never has a queue row of its own during the build.
-        # (The calibration rows' own member entries come from the
-        # fusion_siblings enqueue channel and likewise only contain cal rids.)
+        # (Calibration rows skip that gate entirely via
+        # ``fusion_skip_atomic_admission``; this entry is abort-cascade only.)
         self._scheduler._fusion_group_members[request_id] = {
             row.rid for row in cal_rows
         }
 
-    def make_done_callback(self, request_id: str, ref_idx: int) -> Callable[[Any], None]:
+    def make_done_callback(self, request_id: str, fp: str) -> Callable[[Any], None]:
         def _done(req_data: Any) -> None:
-            self.on_internal_done(request_id, ref_idx, req_data)
+            self.on_internal_done(request_id, fp, req_data)
 
         return _done
 
-    def on_internal_done(self, request_id: str, ref_idx: int, req_data: Any) -> None:
+    def on_internal_done(self, request_id: str, fp: str, req_data: Any) -> None:
         """Scheduler-thread callback for a finished calibration row."""
         self._sweep_expired()
         with self._lock:
@@ -428,14 +490,14 @@ class FusionReferenceOrchestrator:
             self._fail(
                 group,
                 RuntimeError(
-                    f"calibration synthesis for reference {ref_idx} produced no codes"
+                    f"calibration synthesis for voice {fp[:8]} produced no codes"
                 ),
             )
             return
 
         delayed = torch.stack(req_data.output_codes, dim=0).to(torch.long).cpu()
-        group.collected[ref_idx] = delayed
-        if group.pending or len(group.collected) < len(group.refs):
+        group.collected[fp] = delayed
+        if group.pending or any(f not in group.collected for f in group.unique_fps):
             return
         self._executor.submit(self._finalize_build, group)
 
@@ -469,51 +531,69 @@ class FusionReferenceOrchestrator:
             )
             self._fail(group, exc)
 
+    def _anchor_f0(self, fp: str, ref: dict[str, Any]) -> float | None:
+        with self._lock:
+            if fp in self._anchor_cache:
+                return self._anchor_cache[fp]
+        anchor_wav = self._delayed_to_wav(
+            torch.tensor(ref["codes_delayed"], dtype=torch.long)
+        )
+        value = median_f0(anchor_wav)
+        with self._lock:
+            self._anchor_cache[fp] = value
+        return value
+
     def _finalize_build_inner(self, group: _BuildGroup) -> None:
         scheduler = self._scheduler
         if group.request_id in scheduler._aborted_request_ids:
             self._drop(group)
             return
 
-        cal_wavs: list[np.ndarray] = []
-        retry_rows: list[tuple[int, int]] = []  # (ref_idx, next_seed_idx)
-        for idx, ref in enumerate(group.refs):
-            cal_wav = self._delayed_to_wav(group.collected[idx])
-            anchor_wav = self._delayed_to_wav(
-                torch.tensor(ref["codes_delayed"], dtype=torch.long)
-            )
+        # Gate + decode once per DISTINCT voice; duplicate slots share it.
+        cal_wav_by_fp: dict[str, np.ndarray] = {}
+        retry_rows: list[tuple[str, int]] = []  # (fp, next_seed_idx)
+        for fp in group.unique_fps:
+            cal_wav = self._delayed_to_wav(group.collected[fp])
             cal_f0 = median_f0(cal_wav)
-            anchor_f0 = median_f0(anchor_wav)
+            anchor_f0 = self._anchor_f0(fp, group.ref_of_fp[fp])
             if cal_f0 is None or anchor_f0 is None:
                 deviation = None
             else:
                 deviation = abs(math.log(cal_f0 / anchor_f0))
             if deviation is None or deviation > _GATE_LOG_RATIO:
-                next_seed = group.seed_used[idx] + 1
+                next_seed = group.seed_used[fp] + 1
                 if next_seed < len(CAL_SEEDS):
-                    retry_rows.append((idx, next_seed))
+                    retry_rows.append((fp, next_seed))
                     logger.warning(
-                        "reference-fusion %s: calibration for ref %d failed the "
-                        "F0 gate (cal=%s anchor=%s), retrying with seed #%d",
+                        "reference-fusion %s: calibration for voice %s failed "
+                        "the F0 gate (cal=%s anchor=%s), retrying with seed #%d",
                         group.request_id,
-                        idx,
+                        fp[:8],
                         cal_f0,
                         anchor_f0,
                         next_seed,
                     )
                     continue
                 raise RuntimeError(
-                    f"calibration for reference {idx} failed the F0 quality "
+                    f"calibration for voice {fp[:8]} failed the F0 quality "
                     f"gate on all {len(CAL_SEEDS)} seeds "
                     f"(last: cal_f0={cal_f0}, anchor_f0={anchor_f0})"
                 )
-            cal_wavs.append(cal_wav)
+            cal_wav_by_fp[fp] = cal_wav
 
         if retry_rows:
             self._enqueue_retries(group, retry_rows)
             return
 
-        hybrid = build_fused_reference(cal_wavs, group.weights)
+        for fp in group.unique_fps:
+            self._cal_cache_put(fp, group.cal_text, group.collected[fp])
+
+        world_by_fp = {fp: world_extract(w) for fp, w in cal_wav_by_fp.items()}
+        entries = [
+            {"world": world_by_fp[fp], "weight": w}
+            for fp, w in zip(group.fp_of_slot, group.weights)
+        ]
+        hybrid = _fuse_world_entries(entries)
         codes_TN = self._codec().encode_reference(
             torch.from_numpy(hybrid), sample_rate=_SAMPLE_RATE
         )
@@ -527,14 +607,16 @@ class FusionReferenceOrchestrator:
         self._drop(group)
         scheduler._enqueue_built_request(group.payload, False, real_req_data)
         logger.info(
-            "reference-fusion %s: hybrid reference built (%d frames), real "
-            "request enqueued",
+            "reference-fusion %s: hybrid reference built (%d frames, %d distinct "
+            "voices over %d slots), real request enqueued",
             group.request_id,
             len(delayed_rows),
+            len(group.unique_fps),
+            len(group.fp_of_slot),
         )
 
     def _enqueue_retries(
-        self, group: _BuildGroup, retry_rows: list[tuple[int, int]]
+        self, group: _BuildGroup, retry_rows: list[tuple[str, int]]
     ) -> None:
         # Import here: request_builders imports this module at load time.
         from sglang_omni.models.higgs_tts.request_builders import (
@@ -543,22 +625,21 @@ class FusionReferenceOrchestrator:
 
         # Register all retries as pending before enqueueing any, so a
         # lightning-fast completion can't observe a half-updated group. Retry
-        # rows get no member entry of their own (a single row is trivially
-        # "complete" for the admission gate); they are only added to the
-        # client-facing abort entry.
+        # rows never enter the atomic-admission registry; they are only added
+        # to the client-facing abort entry.
         pending_requests = []
-        for ref_idx, seed_idx in retry_rows:
-            group.collected.pop(ref_idx, None)
-            group.seed_used[ref_idx] = seed_idx
-            rid = f"{group.request_id}#cal{ref_idx}r{seed_idx}"
-            row = _CalRow(ref_idx=ref_idx, seed_idx=seed_idx, rid=rid)
+        for fp, seed_idx in retry_rows:
+            group.collected.pop(fp, None)
+            group.seed_used[fp] = seed_idx
+            rid = f"{group.request_id}#cal{fp[:8]}r{seed_idx}"
+            row = _CalRow(fp=fp, seed_idx=seed_idx, rid=rid)
             group.pending[rid] = row
             pending_requests.append(
                 build_calibration_request(
-                    ref=group.refs[ref_idx],
+                    ref=group.ref_of_fp[fp],
                     rid=rid,
                     seed=CAL_SEEDS[seed_idx],
-                    done_callback=self.make_done_callback(group.request_id, ref_idx),
+                    done_callback=self.make_done_callback(group.request_id, fp),
                 )
             )
             members = self._scheduler._fusion_group_members.get(group.request_id)
