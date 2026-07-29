@@ -384,6 +384,7 @@ class FusionReferenceOrchestrator:
         # voice's calibration synthesis is only ever paid once per process.
         self._cal_cache: dict[tuple[str, str], torch.Tensor] = {}
         self._anchor_cache: dict[str, float | None] = {}
+        self._codec_device: str | None = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="higgs-ref-fusion"
         )
@@ -505,8 +506,25 @@ class FusionReferenceOrchestrator:
 
     def _codec(self):
         assert self._checkpoint_dir is not None
-        # fp32 CPU codec: the documented-stable decode path; loaded once per
-        # engine process, only ever exercised on cold fusion builds.
+        # GPU codec on the engine's device, in the exact (device, dtype)
+        # configuration the production vocoder/audio_encoder stages already
+        # run — ~1 GB extra VRAM in the engine process, loaded once on the
+        # first cold build. Kernel-level interleaving with AR decode is safe
+        # (shared default stream serializes) and only costs the cold path a
+        # few ms of contention. Falls back to the documented-stable fp32 CPU
+        # path when the GPU load fails (e.g. no VRAM headroom).
+        if self._codec_device is None:
+            try:
+                codec = get_or_load_codec(self._checkpoint_dir, "cuda", "bfloat16")
+                self._codec_device = "cuda"
+                return codec
+            except Exception:
+                logger.exception(
+                    "reference-fusion GPU codec load failed; falling back to CPU fp32"
+                )
+                self._codec_device = "cpu"
+        if self._codec_device == "cuda":
+            return get_or_load_codec(self._checkpoint_dir, "cuda", "bfloat16")
         return get_or_load_codec(self._checkpoint_dir, "cpu", "float32")
 
     def _delayed_to_wav(self, delayed_LN: torch.Tensor) -> np.ndarray:

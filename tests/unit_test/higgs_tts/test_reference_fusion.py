@@ -338,6 +338,25 @@ def test_expired_build_is_swept_with_an_error(monkeypatch):
     assert "req1" not in orch._groups
 
 
+def test_codec_falls_back_to_cpu_when_gpu_load_fails(monkeypatch):
+    orch = fr.FusionReferenceOrchestrator()
+    orch._checkpoint_dir = "/ckpt"
+    calls = []
+
+    def fake_loader(path, device, dtype):
+        calls.append((device, dtype))
+        if device == "cuda":
+            raise RuntimeError("no VRAM headroom")
+        return "cpu-codec"
+
+    monkeypatch.setattr(fr, "get_or_load_codec", fake_loader)
+    assert orch._codec() == "cpu-codec"
+    assert calls == [("cuda", "bfloat16"), ("cpu", "float32")]
+    # sticky: never retries the GPU after the first failure
+    assert orch._codec() == "cpu-codec"
+    assert calls[-1] == ("cpu", "float32") and len(calls) == 3
+
+
 def test_cache_roundtrip_and_eviction():
     orch = fr.FusionReferenceOrchestrator()
     for i in range(fr._CACHE_MAX_ENTRIES + 5):
