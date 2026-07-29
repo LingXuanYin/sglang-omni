@@ -197,8 +197,14 @@ def _build_populate_buffers_runner(bs: int):
 
 def _fake_requests(n: int):
     """``n`` fake sched_req-like objects with default ids r0..r{n-1}; override
-    ``.request_id`` on the returned objects for custom ids."""
+    ``.request_id`` on the returned objects for custom ids. ``req.finished()``
+    mirrors real sglang's semantics off the SAME ``finished_reason`` a test
+    may set later (e.g. via ``_populate_fusion_buffers``'s abort path) — a
+    live closure over ``reqs[i]``, not a snapshot, so it stays correct
+    regardless of when a test mutates ``finished_reason``."""
     reqs = [SimpleNamespace(finished_reason=None) for _ in range(n)]
+    for r in reqs:
+        r.finished = lambda r=r: r.finished_reason is not None
     datas = [SimpleNamespace(req=reqs[i]) for i in range(n)]
     requests = [SimpleNamespace(request_id=f"r{i}", data=datas[i]) for i in range(n)]
     return requests, reqs
