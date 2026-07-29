@@ -59,6 +59,72 @@ import torch
 # instead of zero, rather than propagating inf/nan into the pooled logits.
 _LOG_FLOOR = 1e-30
 
+# Entropy-matching Newton solve (see _solve_entropy_matching_gamma): a fixed,
+# small iteration count is enough in practice (each step roughly doubles the
+# number of correct digits near the root) and keeps the op shape-static/
+# CUDA-Graph-safe — no host-side convergence check. Gamma is clamped to
+# [1/_ENTROPY_MATCH_GAMMA_CLAMP, _ENTROPY_MATCH_GAMMA_CLAMP] so a
+# near-degenerate (near-zero-variance) distribution can't blow up the scale
+# to something numerically wild; the clamp value is a "confidence fine-tunes,
+# blend weight decides" cap, not a tight bound — a member is still allowed to
+# end up noticeably sharper or flatter than its groupmates' average, just not
+# unboundedly so.
+_ENTROPY_MATCH_ITERS = 3
+_ENTROPY_MATCH_GAMMA_CLAMP = 3.0
+
+
+def _solve_entropy_matching_gamma(
+    logits_BNV: torch.Tensor,
+    group_id_B: torch.Tensor,
+    norm_weight_B: torch.Tensor,
+) -> torch.Tensor:
+    """Per-(row, codebook) scale ``gamma`` so that
+    ``H(softmax(gamma · logits))`` matches the row's group's
+    weighted-average entropy — i.e. every member of a fusion group is
+    rescaled to a common confidence level *before* being weighted-summed in
+    :func:`fuse_group_logits`, so the nominal blend weight (not whichever
+    member happened to be more "confident"/peaked) is what actually decides
+    the pooled outcome. See that function's docstring for why this
+    correction is needed: log-linear pooling is precision-weighted, not
+    weight-only, by construction.
+
+    Solved via a fixed ``_ENTROPY_MATCH_ITERS``-step Newton iteration (no
+    host-side convergence check, so this stays a shape-static, CUDA-Graph-safe
+    tensor op) using the closed-form derivative of softmax entropy w.r.t. a
+    uniform logit-scale factor: for ``p(gamma) = softmax(gamma · z)`` and
+    ``H(gamma) = -Σ_v p_v(gamma)·log p_v(gamma)``, standard exponential-family
+    differentiation gives ``dH/dgamma = -gamma · Var_p(z)`` (``Var_p`` is the
+    variance of the *original*, unscaled logits ``z`` under the *current*
+    ``p(gamma)``) — independently re-derivable from
+    ``H(gamma) = -gamma·E_p[z] + logZ(gamma)`` and ``dlogZ/dgamma = E_p[z]``.
+    """
+    B, N, V = logits_BNV.shape
+    device = logits_BNV.device
+    gid = group_id_B
+
+    log_p0 = torch.log_softmax(logits_BNV, dim=-1)
+    base_entropy_BN = -(log_p0.exp() * log_p0).sum(-1)  # [B, N]
+
+    idx_BN = gid.view(B, 1).expand(B, N)
+    target_entropy_gN = torch.zeros(B, N, dtype=torch.float32, device=device)
+    target_entropy_gN.scatter_add_(0, idx_BN, base_entropy_BN * norm_weight_B.view(B, 1))
+    target_entropy_BN = target_entropy_gN.index_select(0, gid)
+
+    gamma_BN = torch.ones(B, N, dtype=torch.float32, device=device)
+    for _ in range(_ENTROPY_MATCH_ITERS):
+        z = logits_BNV * gamma_BN.unsqueeze(-1)
+        log_p = torch.log_softmax(z, dim=-1)
+        p = log_p.exp()
+        entropy_BN = -(p * log_p).sum(-1)
+        mean_z = (p * logits_BNV).sum(-1)
+        mean_z2 = (p * logits_BNV.square()).sum(-1)
+        var_z = (mean_z2 - mean_z.square()).clamp_min(1e-6)
+        dH_dgamma = (-gamma_BN * var_z).clamp(max=-1e-6)
+        gamma_BN = gamma_BN - (entropy_BN - target_entropy_BN) / dH_dgamma
+        gamma_BN = gamma_BN.clamp(1.0 / _ENTROPY_MATCH_GAMMA_CLAMP, _ENTROPY_MATCH_GAMMA_CLAMP)
+
+    return gamma_BN
+
 
 class FusionRegistry:
     """Thread-safe registry of which in-flight requests belong to which
@@ -296,7 +362,20 @@ def fuse_group_logits(
     # total, so the pooled log-distribution stays a properly weighted mean.
     norm_w = w / group_weight_sum[gid].clamp_min(_LOG_FLOOR)  # [B]
 
-    weighted = logits * norm_w.view(B, 1, 1)  # [B, N, V]
+    # Entropy-matched rescaling: log-linear pooling is precision-weighted, not
+    # weight-only — a member whose (temperature-scaled) distribution happens
+    # to be sharper (lower entropy) than its groupmates' pulls the pooled
+    # result toward itself regardless of the nominal blend weight (confirmed
+    # via live inference: two distinct reference voices at nominal 0.5/0.5
+    # still landed close to whichever one had the sharper per-step
+    # distribution in 7/8 independent runs, not a stable 50/50 compromise).
+    # Rescale each member's logits by a per-(row, codebook) factor so every
+    # member enters the pool at its GROUP's weighted-average entropy first —
+    # only then does the nominal weight decide the outcome, as intended.
+    gamma = _solve_entropy_matching_gamma(logits, gid, norm_w)
+    matched_logits = logits * gamma.unsqueeze(-1)
+
+    weighted = matched_logits * norm_w.view(B, 1, 1)  # [B, N, V]
     idx = gid.view(B, 1, 1).expand(B, N, V)
     fused = torch.zeros_like(logits)
     fused.scatter_add_(0, idx, weighted)  # group g accumulates its members

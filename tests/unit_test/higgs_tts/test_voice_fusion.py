@@ -6,6 +6,7 @@ import torch
 
 from sglang_omni.models.higgs_tts.fusion import (
     FusionRegistry,
+    _solve_entropy_matching_gamma,
     fuse_group_generation_done,
     fuse_group_logits,
 )
@@ -13,6 +14,24 @@ from sglang_omni.models.higgs_tts.fusion import (
 
 def _singleton_groups(B):
     return torch.arange(B, dtype=torch.long), torch.ones(B, dtype=torch.float32)
+
+
+def _entropy(logits_NV):
+    log_p = torch.log_softmax(logits_NV, dim=-1)
+    return -(log_p.exp() * log_p).sum(-1)
+
+
+def _permuted_same_entropy(logits_NV, seed):
+    """A same-shape logits tensor with independently-assigned values but
+    IDENTICAL per-row entropy to ``logits_NV`` (permuting the vocab axis
+    leaves each row's entropy exactly unchanged) — lets a test isolate "is
+    the pooling formula correct" from entropy-matching's rescaling (which is
+    a no-op, gamma == 1, only when group members already share one entropy).
+    """
+    V = logits_NV.shape[-1]
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(V, generator=g)
+    return logits_NV[:, perm]
 
 
 def test_singleton_is_sampling_identity():
@@ -94,10 +113,17 @@ def test_two_member_equal_weight_is_geometric_mean():
     into "sounds like A" / "sounds like B" across random seeds, never
     intermediate). Log-linear pooling concentrates mass on tokens BOTH
     references find plausible instead.
+
+    Both rows are constructed to share one entropy (see
+    ``_permuted_same_entropy``) so entropy-matching is a no-op (gamma == 1)
+    here and this test isolates the pooling formula itself; entropy-matching's
+    own rescaling behavior is covered separately below.
     """
     torch.manual_seed(1)
     N, V = 8, 1026
-    logits = torch.randn(2, N, V)
+    row0 = torch.randn(N, V)
+    row1 = _permuted_same_entropy(row0, seed=101)
+    logits = torch.stack([row0, row1])
     gid = torch.tensor([0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.5], dtype=torch.float32)
     out, is_grouped = fuse_group_logits(logits, gid, w)
@@ -114,12 +140,111 @@ def test_two_member_equal_weight_is_geometric_mean():
     assert not torch.allclose(out[0].softmax(-1), arithmetic_mean, atol=1e-3)
 
 
+# --------------------------------------------------------------------------- #
+# _solve_entropy_matching_gamma — log-linear pooling is precision-weighted,
+# not weight-only (a real, measured failure: two distinct reference voices at
+# NOMINAL 0.5/0.5 landed close to whichever one had the sharper per-step
+# distribution in 7/8 independent live-inference runs, not a stable
+# compromise). This rescales each group member to its group's
+# weighted-average entropy BEFORE pooling, so the nominal weight is what
+# actually decides the outcome.
+# --------------------------------------------------------------------------- #
+def test_entropy_matching_is_near_identity_for_already_matched_entropy():
+    """Two rows that already share one entropy need no correction: gamma
+    should solve to (very close to) 1 for both."""
+    torch.manual_seed(20)
+    N, V = 8, 1026
+    row0 = torch.randn(N, V)
+    row1 = _permuted_same_entropy(row0, seed=201)
+    logits = torch.stack([row0, row1])
+    gid = torch.tensor([0, 0], dtype=torch.long)
+    norm_w = torch.tensor([0.5, 0.5], dtype=torch.float32)
+    gamma = _solve_entropy_matching_gamma(logits, gid, norm_w)
+    torch.testing.assert_close(gamma, torch.ones_like(gamma), atol=0.02, rtol=0)
+
+
+def test_entropy_matching_sharpens_the_flatter_member_toward_the_target():
+    """A flatter (higher-entropy) member gets a gamma > 1 correction
+    (sharpened up toward the group's weighted-average entropy) — the
+    mechanism that stops a flatter voice from being drowned out by a
+    groupmate's naturally sharper distribution regardless of nominal weight.
+
+    Scale ratio (1.4x) is modeled on the live-inference finding that even a
+    mild sharpness asymmetry (~1.25x logit amplitude) is enough to flip which
+    reference dominates an equal-weight pool — this is the realistic
+    magnitude the fixed 3-iteration Newton solve needs to handle well, not an
+    adversarially extreme case (see the separate clamp test for that).
+    """
+    torch.manual_seed(21)
+    N, V = 8, 1026
+    sharp = torch.randn(N, V) * 1.4  # larger logit spread -> lower entropy
+    flat = torch.randn(N, V) * 1.0
+    logits = torch.stack([sharp, flat])
+    gid = torch.tensor([0, 0], dtype=torch.long)
+    norm_w = torch.tensor([0.5, 0.5], dtype=torch.float32)
+
+    assert (_entropy(sharp) < _entropy(flat)).all()
+
+    gamma = _solve_entropy_matching_gamma(logits, gid, norm_w)
+    # sharp member (index 0) should be relaxed toward the target (gamma < 1);
+    # flat member (index 1) should be sharpened up (gamma > 1).
+    assert (gamma[0] < 1.0).all()
+    assert (gamma[1] > 1.0).all()
+
+    # after applying gamma, the two members' entropies should converge much
+    # closer together than they started (not necessarily exact in 3 Newton
+    # steps, but the gap should shrink substantially for a realistic
+    # asymmetry magnitude).
+    pre_gap = (_entropy(sharp) - _entropy(flat)).abs()
+    post_sharp = _entropy(sharp * gamma[0].unsqueeze(-1))
+    post_flat = _entropy(flat * gamma[1].unsqueeze(-1))
+    post_gap = (post_sharp - post_flat).abs()
+    assert bool((post_gap < pre_gap * 0.15).all())
+
+
+def test_entropy_matching_respects_group_boundaries():
+    """A row's gamma only depends on its OWN group's target entropy, not on
+    unrelated rows/groups in the same batch."""
+    torch.manual_seed(22)
+    N, V = 8, 1026
+    a = torch.randn(N, V) * 4.0
+    b = torch.randn(N, V) * 0.25
+    c = torch.randn(N, V) * 4.0  # same scale as `a`, different (unrelated) group
+    logits = torch.stack([a, b, c])
+    gid = torch.tensor([0, 0, 1], dtype=torch.long)  # a,b grouped; c its own group
+    norm_w = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32)
+    gamma = _solve_entropy_matching_gamma(logits, gid, norm_w)
+    # c is a singleton group -> its own target IS its own entropy -> no-op.
+    torch.testing.assert_close(gamma[2], torch.ones_like(gamma[2]), atol=0.02, rtol=0)
+
+
+def test_entropy_matching_gamma_stays_within_clamp_for_extreme_asymmetry():
+    """An extreme sharpness mismatch must not blow up gamma to something
+    numerically wild — it's bounded by the documented clamp."""
+    torch.manual_seed(23)
+    N, V = 8, 1026
+    extremely_sharp = torch.randn(N, V) * 50.0
+    extremely_flat = torch.randn(N, V) * 0.01
+    logits = torch.stack([extremely_sharp, extremely_flat])
+    gid = torch.tensor([0, 0], dtype=torch.long)
+    norm_w = torch.tensor([0.5, 0.5], dtype=torch.float32)
+    gamma = _solve_entropy_matching_gamma(logits, gid, norm_w)
+    assert torch.isfinite(gamma).all()
+    assert bool((gamma >= 1.0 / 3.0 - 1e-6).all())
+    assert bool((gamma <= 3.0 + 1e-6).all())
+
+
 def test_three_member_group_is_weighted_geometric_mean():
     """The log-linear pool generalizes to N > 2 members with arbitrary
-    weights, not just the equal-weight 2-member case."""
+    weights, not just the equal-weight 2-member case. All three rows share
+    one entropy (see ``_permuted_same_entropy``) so entropy-matching is a
+    no-op here, isolating the pooling formula."""
     torch.manual_seed(9)
     N, V = 8, 1026
-    logits = torch.randn(3, N, V)
+    row0 = torch.randn(N, V)
+    row1 = _permuted_same_entropy(row0, seed=102)
+    row2 = _permuted_same_entropy(row0, seed=103)
+    logits = torch.stack([row0, row1, row2])
     gid = torch.tensor([0, 0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float32)
     out, is_grouped = fuse_group_logits(logits, gid, w)
@@ -161,10 +286,14 @@ def test_fused_rows_sample_identically_with_shared_seed():
 
 
 def test_mixed_batch_groups_and_singletons():
-    """A batch mixing a 2-row group and a singleton blends only within group."""
+    """A batch mixing a 2-row group and a singleton blends only within group.
+    Rows 0,1 share one entropy so entropy-matching is a no-op here."""
     torch.manual_seed(4)
     N, V = 8, 1026
-    logits = torch.randn(3, N, V)
+    row0 = torch.randn(N, V)
+    row1 = _permuted_same_entropy(row0, seed=104)
+    row2 = torch.randn(N, V)
+    logits = torch.stack([row0, row1, row2])
     gid = torch.tensor([0, 0, 2], dtype=torch.long)  # rows 0,1 grouped; row 2 alone
     w = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32)
     out, is_grouped = fuse_group_logits(logits, gid, w)
@@ -192,10 +321,14 @@ def test_generation_done_singletons_identity():
 
 
 def test_temperature_applied_before_blend():
-    """temperature_B scales each row's logits before the log-linear pool."""
+    """temperature_B scales each row's logits before the log-linear pool.
+    Rows share one entropy (post temperature-scaling) so entropy-matching is
+    a no-op here, isolating the temperature/pooling interaction."""
     torch.manual_seed(5)
     N, V = 8, 1026
-    logits = torch.randn(2, N, V)
+    row0 = torch.randn(N, V)
+    row1 = _permuted_same_entropy(row0, seed=105)
+    logits = torch.stack([row0, row1])
     gid = torch.tensor([0, 0], dtype=torch.long)
     w = torch.tensor([0.5, 0.5])
     temp = torch.tensor([2.0, 2.0])
