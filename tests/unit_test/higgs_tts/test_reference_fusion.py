@@ -194,6 +194,35 @@ def test_happy_path_builds_and_enqueues_real_request(monkeypatch):
     assert "req1" not in sched._fusion_group_members
 
 
+def test_short_real_reference_passes_the_length_floor(monkeypatch):
+    """A legitimate ~2 s reference is only ~50 frames at the codec's real
+    25 Hz rate — the length floor must reject garbage, not short references.
+    (Regression: an erroneous 75-frame floor rejected real 53-frame refs.)"""
+    orch, sched = _bound_orchestrator(monkeypatch)
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(
+        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+    )
+    refs = _refs(seed=11, n=2, frames=53)
+    built = {}
+    rows = [fr._CalRow(ref_idx=i, seed_idx=0, rid=f"req2#cal{i}r0") for i in range(2)]
+    orch.register_group(
+        request_id="req2",
+        payload=SimpleNamespace(request_id="req2"),
+        cache_key="key-req2",
+        refs=refs,
+        weights=[0.5, 0.5],
+        cal_text="cal",
+        make_real_request=lambda rows_: built.setdefault("rows", rows_)
+        or SimpleNamespace(req=SimpleNamespace(rid="req2"), real=True),
+        cal_rows=rows,
+    )
+    orch.on_internal_done("req2", 0, _cal_row_result(rows[0].rid, frames=53))
+    orch.on_internal_done("req2", 1, _cal_row_result(rows[1].rid, frames=53))
+    assert built.get("rows"), "53-frame references must build successfully"
+    assert not sched.errors
+
+
 def test_member_registration_excludes_client_facing_id(monkeypatch):
     """The admission gate withholds groups whose members aren't all queued;
     ``request_id`` never has a queue row, so it must not be a member."""

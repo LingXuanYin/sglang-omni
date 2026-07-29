@@ -73,7 +73,7 @@ CAL_SEEDS = (1234, 5678, 424242)
 CAL_TEMPERATURE = 0.8
 CAL_TOP_P = 0.8
 CAL_TOP_K = 30
-CAL_MAX_NEW_TOKENS = 1600  # codec is 75 Hz → ~21 s cap; calibration reads are ~8 s
+CAL_MAX_NEW_TOKENS = 768  # codec is 25 Hz → ~30 s cap; calibration reads are ~8 s
 
 # F0 quality gate: a calibration clone must sit within x1.35 of its own
 # reference voice's F0 median, else retry with the next seed.
@@ -450,7 +450,11 @@ class FusionReferenceOrchestrator:
     def _delayed_to_wav(self, delayed_LN: torch.Tensor) -> np.ndarray:
         raw = reverse_delay_pattern(delayed_LN, allow_short=True)
         raw = raw[(raw < 1024).all(dim=1)]
-        if raw.shape[0] < 75:  # < 1 s of frames (codec runs at 75 Hz)
+        # Sanity floor only — reject empty/garbage sequences, not short-but-real
+        # references. The codec runs at 25 Hz (hop 960 @ 24 kHz; the "75 Hz"
+        # note elsewhere in this package is a conservative cap, not the real
+        # rate), so a legitimate ~2 s reference is only ~50 frames.
+        if raw.shape[0] < 20:
             raise RuntimeError(
                 f"decoded reference is too short ({raw.shape[0]} frames)"
             )
