@@ -538,7 +538,8 @@ class FusionReferenceOrchestrator:
             raise RuntimeError(
                 f"decoded reference is too short ({raw.shape[0]} frames)"
             )
-        return self._codec().decode(raw).numpy().astype(np.float64)
+        # .float(): the GPU codec decodes in bf16, which numpy can't represent.
+        return self._codec().decode(raw).float().numpy().astype(np.float64)
 
     def _finalize_build(self, group: _BuildGroup) -> None:
         try:
