@@ -63,6 +63,7 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.total_gpu_memory_fraction = total_gpu_memory_fraction
         self.model: Any | None = None
+        self.checkpoint_dir: str | None = None
 
     def generation_defaults(
         self,
@@ -122,7 +123,8 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
         gpu_id: int,
         server_args: Any,
     ) -> None:
-        del checkpoint_dir, device, gpu_id, server_args
+        del device, gpu_id, server_args
+        self.checkpoint_dir = checkpoint_dir
         self.model = model_worker.model_runner.model
         higgs_utils.truncate_rope_to_bf16(self.model)
 
@@ -163,3 +165,12 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
 
     def post_scheduler_setup(self, scheduler: Any, model_runner: Any) -> None:
         model_runner.set_stream_outbox(scheduler.outbox)
+        # Reference-space fusion: the orchestrator needs the scheduler (to
+        # enqueue calibration retries + the real request) and the checkpoint
+        # dir (to lazily load the CPU codec used on cold builds).
+        from sglang_omni.models.higgs_tts import fusion_reference
+
+        assert self.model is not None
+        fusion_reference.get_orchestrator(self.model).bind(
+            scheduler, self.checkpoint_dir
+        )

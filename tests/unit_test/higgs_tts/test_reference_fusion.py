@@ -1,0 +1,325 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for reference-space voice fusion (``fusion_reference.py``).
+
+Pure CPU. WORLD-morph math tests run only where pyworld is installed
+(``pytest.importorskip``); the orchestrator state machine is tested against a
+mock scheduler with the codec/morph heavy path patched out, and never imports
+the sglang-dependent ``request_builders`` module (its lazy import inside the
+retry path is satisfied with a stub module).
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+import types
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from sglang_omni.models.higgs_tts import fusion_reference as fr
+from sglang_omni.models.higgs_tts.text_tokenizer import (
+    AUDIO_PLACEHOLDER_ID,
+    HiggsTokenizerAdapter,
+)
+from sglang_omni.models.higgs_tts.utils import apply_delay_pattern
+
+
+# --- cache key ---------------------------------------------------------------
+
+
+def _refs(seed=0, n=2, frames=90):
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for _ in range(n):
+        raw = torch.randint(0, 1024, (frames, 8), generator=g)
+        out.append({"codes_delayed": apply_delay_pattern(raw).tolist()})
+    return out
+
+
+def test_cache_key_is_stable_and_input_sensitive():
+    refs = _refs(seed=1)
+    k1 = fr.fused_reference_cache_key(refs, [0.5, 0.5], "cal")
+    assert k1 == fr.fused_reference_cache_key(refs, [0.5, 0.5], "cal")
+    assert k1 != fr.fused_reference_cache_key(refs, [0.6, 0.4], "cal")
+    assert k1 != fr.fused_reference_cache_key(refs, [0.5, 0.5], "other cal")
+    assert k1 != fr.fused_reference_cache_key(_refs(seed=2), [0.5, 0.5], "cal")
+    assert k1 != fr.fused_reference_cache_key(list(reversed(refs)), [0.5, 0.5], "cal")
+
+
+# --- DTW ---------------------------------------------------------------------
+
+
+def test_dtw_map_identity_for_identical_sequences():
+    feats = np.random.default_rng(0).normal(size=(40, 8))
+    out = fr.dtw_map(feats, feats)
+    assert out.shape == (40,)
+    assert (out == np.arange(40)).all()
+
+
+def test_dtw_map_monotonic_for_stretched_sequence():
+    rng = np.random.default_rng(1)
+    base = rng.normal(size=(30, 8))
+    stretched = np.repeat(base, 2, axis=0)  # B is A at half speed
+    out = fr.dtw_map(base, stretched)
+    assert (np.diff(out) >= 0).all()
+    assert out[0] <= 1 and out[-1] >= stretched.shape[0] - 2
+
+
+# --- prompt parts ------------------------------------------------------------
+
+
+class _StubTok:
+    def get_added_vocab(self):
+        return {
+            "<|tts|>": 1,
+            "<|ref_audio|>": 2,
+            "<|text|>": 3,
+            "<|audio|>": 4,
+            "<|ref_text|>": 5,
+        }
+
+    def encode(self, text, add_special_tokens=False):
+        return [100 + (ord(c) % 50) for c in text]
+
+
+@pytest.mark.parametrize("reference_text", [None, "校准句"])
+@pytest.mark.parametrize("num_ref_tokens", [1, 7, 300])
+def test_prompt_parts_reassemble_to_build_prompt(reference_text, num_ref_tokens):
+    adapter = HiggsTokenizerAdapter(_StubTok())
+    prefix, suffix = adapter.build_prompt_parts(
+        "目标文本", reference_text=reference_text
+    )
+    assembled = prefix + [AUDIO_PLACEHOLDER_ID] * num_ref_tokens + suffix
+    assert assembled == adapter.build_prompt(
+        "目标文本", num_ref_tokens=num_ref_tokens, reference_text=reference_text
+    )
+
+
+# --- orchestrator state machine ---------------------------------------------
+
+
+class _MockScheduler:
+    def __init__(self):
+        self._fusion_group_members = {}
+        self._aborted_request_ids = set()
+        self.enqueued = []
+        self.errors = []
+        self.aborted = []
+
+    def _enqueue_built_request(self, payload, pending_stream_done, req_data):
+        self.enqueued.append(req_data)
+
+    def _emit_request_error(self, request_id, error):
+        self.errors.append((request_id, error))
+
+    def abort(self, request_id):
+        self.aborted.append(request_id)
+
+
+class _FakeCodec:
+    def decode(self, raw_TN):
+        return torch.zeros(raw_TN.shape[0] * 320, dtype=torch.float32)
+
+    def encode_reference(self, wav, sample_rate=24000):
+        return torch.randint(0, 1024, (80, 8))
+
+
+def _cal_row_result(rid, frames=90, finish="stop"):
+    g = torch.Generator().manual_seed(hash(rid) % (2**31))
+    delayed = apply_delay_pattern(torch.randint(0, 1024, (frames, 8), generator=g))
+    return SimpleNamespace(
+        req=SimpleNamespace(rid=rid),
+        finish_reason=finish,
+        output_codes=[delayed[i] for i in range(delayed.shape[0])],
+    )
+
+
+def _bound_orchestrator(monkeypatch):
+    orch = fr.FusionReferenceOrchestrator()
+    sched = _MockScheduler()
+    orch.bind(sched, "/nonexistent/ckpt")
+    monkeypatch.setattr(orch, "_codec", lambda: _FakeCodec())
+    # Run the worker path inline so tests are deterministic.
+    monkeypatch.setattr(
+        orch._executor, "submit", lambda fn, *a, **k: fn(*a, **k)
+    )
+    return orch, sched
+
+
+def _register(orch, request_id="req1", n=2):
+    refs = _refs(seed=7, n=n)
+    built = {}
+
+    def make_real(delayed_rows):
+        built["rows"] = delayed_rows
+        return SimpleNamespace(req=SimpleNamespace(rid=request_id), real=True)
+
+    rows = [
+        fr._CalRow(ref_idx=i, seed_idx=0, rid=f"{request_id}#cal{i}r0")
+        for i in range(n)
+    ]
+    orch.register_group(
+        request_id=request_id,
+        payload=SimpleNamespace(request_id=request_id),
+        cache_key="key-" + request_id,
+        refs=refs,
+        weights=[1.0 / n] * n,
+        cal_text="cal",
+        make_real_request=make_real,
+        cal_rows=rows,
+    )
+    return rows, built
+
+
+def test_happy_path_builds_and_enqueues_real_request(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(
+        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+    )
+    rows, built = _register(orch)
+
+    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
+    assert not sched.enqueued  # one calibration row is not enough
+    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+
+    assert built["rows"], "hybrid delayed rows must reach make_real_request"
+    assert len(sched.enqueued) == 1 and getattr(sched.enqueued[0], "real", False)
+    assert not sched.errors
+    # group + abort entry fully cleaned up
+    assert "req1" not in orch._groups
+    assert "req1" not in sched._fusion_group_members
+
+
+def test_member_registration_excludes_client_facing_id(monkeypatch):
+    """The admission gate withholds groups whose members aren't all queued;
+    ``request_id`` never has a queue row, so it must not be a member."""
+    orch, sched = _bound_orchestrator(monkeypatch)
+    rows, _ = _register(orch)
+    members = sched._fusion_group_members["req1"]
+    assert members == {r.rid for r in rows}
+    assert "req1" not in members
+
+
+def test_aborted_calibration_row_fails_group_without_client_error(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    rows, built = _register(orch)
+    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid, finish="abort"))
+    assert "rows" not in built
+    assert not sched.enqueued
+    assert not sched.errors  # abort came from the client; no extra error
+    assert rows[1].rid in sched.aborted  # sibling cascade
+    assert "req1" not in orch._groups
+
+
+def test_empty_calibration_output_emits_error(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    rows, _ = _register(orch)
+    result = _cal_row_result(rows[0].rid)
+    result.output_codes = []
+    orch.on_internal_done("req1", 0, result)
+    assert sched.errors and sched.errors[0][0] == "req1"
+    assert not sched.enqueued
+
+
+def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    # ref0's calibration comes back an octave off its anchor once, then fine.
+    # (Every finalize pass re-measures cal+anchor for every ref: 4 calls in
+    # round one, then 4 more after the retry lands.)
+    f0_values = iter([300.0, 100.0] + [100.0] * 10)
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: next(f0_values))
+    monkeypatch.setattr(
+        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+    )
+    retry_builds = []
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.models.higgs_tts.request_builders",
+        types.SimpleNamespace(
+            build_calibration_request=lambda **kw: (
+                retry_builds.append(kw),
+                SimpleNamespace(req=SimpleNamespace(rid=kw["rid"]), retry=True),
+            )[1]
+        ),
+    )
+    rows, built = _register(orch)
+    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+
+    assert retry_builds and retry_builds[0]["seed"] == fr.CAL_SEEDS[1]
+    assert len(sched.enqueued) == 1 and getattr(sched.enqueued[0], "retry", False)
+    retry_rid = retry_builds[0]["rid"]
+    assert retry_rid in sched._fusion_group_members["req1"]
+
+    orch.on_internal_done("req1", 0, _cal_row_result(retry_rid))
+    assert built["rows"]
+    assert any(getattr(r, "real", False) for r in sched.enqueued)
+
+
+def test_client_abort_before_finalize_drops_the_build(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
+    monkeypatch.setattr(
+        fr, "build_fused_reference", lambda wavs, weights, fs=24000: np.zeros(24000)
+    )
+    rows, built = _register(orch)
+    sched._aborted_request_ids.add("req1")
+    orch.on_internal_done("req1", 0, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req1", 1, _cal_row_result(rows[1].rid))
+    assert not sched.enqueued
+    assert "req1" not in orch._groups
+
+
+def test_expired_build_is_swept_with_an_error(monkeypatch):
+    orch, sched = _bound_orchestrator(monkeypatch)
+    rows, _ = _register(orch)
+    with orch._lock:
+        orch._groups["req1"].deadline = time.monotonic() - 1
+    orch._sweep_expired()
+    assert sched.errors and sched.errors[0][0] == "req1"
+    assert "req1" not in orch._groups
+
+
+def test_cache_roundtrip_and_eviction():
+    orch = fr.FusionReferenceOrchestrator()
+    for i in range(fr._CACHE_MAX_ENTRIES + 5):
+        orch._cache_put(f"k{i}", [[i]])
+    assert orch.cache_get("k0") is None  # evicted
+    newest = f"k{fr._CACHE_MAX_ENTRIES + 4}"
+    assert orch.cache_get(newest) == [[fr._CACHE_MAX_ENTRIES + 4]]
+
+
+# --- WORLD morph math (requires pyworld) ------------------------------------
+
+
+def _voiced_tone(f0_hz, seconds=1.2, fs=24000):
+    t = np.arange(int(seconds * fs)) / fs
+    # A pulse-ish periodic signal with harmonics so WORLD tracks it robustly.
+    x = np.zeros_like(t)
+    for k in (1, 2, 3, 4):
+        x += (0.5 / k) * np.sin(2 * np.pi * f0_hz * k * t)
+    return (x * 0.5).astype(np.float64)
+
+
+def test_morph_f0_lands_at_log_weighted_point():
+    pytest.importorskip("pyworld")
+    low, high = _voiced_tone(100.0), _voiced_tone(200.0)
+    for alpha, expect in ((0.0, 100.0), (0.5, 141.4), (1.0, 200.0)):
+        hybrid = fr.build_fused_reference([low, high], [1 - alpha, alpha])
+        f0 = fr.median_f0(hybrid.astype(np.float64))
+        assert f0 is not None
+        assert abs(np.log(f0 / expect)) < np.log(1.08), (alpha, f0)
+
+
+def test_morph_weight_monotonicity():
+    pytest.importorskip("pyworld")
+    low, high = _voiced_tone(100.0), _voiced_tone(200.0)
+    f0s = []
+    for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
+        hybrid = fr.build_fused_reference([low, high], [1 - alpha, alpha])
+        f0s.append(fr.median_f0(hybrid.astype(np.float64)))
+    assert all(a < b for a, b in zip(f0s, f0s[1:])), f0s

@@ -1687,6 +1687,34 @@ class OmniScheduler:
                 _detach_request_data(req)
                 continue
 
+            # Engine-internal requests (e.g. reference-fusion calibration
+            # synthesis) carry a completion callback instead of a client-facing
+            # result: fill in the finish reason, release the engine slot, and
+            # hand the finished row to its orchestrator. Never emitted
+            # downstream; the client-facing request id only resolves when the
+            # orchestrator's real request finishes. No existing adapter sets
+            # this attribute, so ordinary traffic is untouched.
+            internal_done = getattr(data, "internal_done_callback", None)
+            if internal_done is not None:
+                finished_reason = req.finished_reason
+                data.finish_reason = (
+                    finished_reason.to_json().get("type")
+                    if finished_reason is not None
+                    else None
+                )
+                self._first_emit_done.discard(rid)
+                self._prefill_start_done.discard(rid)
+                self._cascade_abort_split_fusion_group(rid, req, finishing_rids)
+                if self._abort_callback is not None:
+                    self._abort_callback(rid)
+                try:
+                    internal_done(data)
+                except Exception:
+                    logger.exception(
+                        "internal-request completion callback failed for %s", rid
+                    )
+                continue
+
             # Voice-fusion followers produce no standalone result: their decoded
             # codes duplicate the leader's (shared fused distribution + shared
             # seed) and were never emitted as audio. On finish, just release the

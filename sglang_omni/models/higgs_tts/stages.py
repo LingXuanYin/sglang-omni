@@ -33,6 +33,7 @@ import torchaudio.functional as F_audio
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
+from sglang_omni.models.higgs_tts import fusion_reference
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.text_tokenizer import HiggsTokenizerAdapter
 from sglang_omni.models.higgs_tts.utils import (
@@ -322,9 +323,17 @@ def create_preprocessing_executor(
 
         Pre-encoded entries are delayed + prompt-built here; raw-audio entries
         carry their waveform forward (``codes_delayed`` stays None) for the
-        audio_encoder GPU stage to encode. The request builder later fans these
-        out into sibling rows that blend at sampling time.
+        audio_encoder GPU stage to encode.
+
+        Mode "reference" (default): each ref additionally gets a calibration
+        prompt (its voice reading the fixed calibration sentence) and the
+        state carries ``fusion_build`` — the final request's prompt parts,
+        assembled around the hybrid reference inside the engine stage. Mode
+        "logits" keeps only the legacy sibling prompts.
         """
+        reference_mode = fusion_reference.fusion_mode() == "reference"
+        cal_text = fusion_reference.calibration_text() if reference_mode else None
+
         fusion_refs: list[dict[str, Any]] = []
         for i, spec in enumerate(specs):
             entry: dict[str, Any] = {
@@ -332,6 +341,7 @@ def create_preprocessing_executor(
                 "reference_text": spec.get("reference_text"),
                 "codes_delayed": None,
                 "prompt_token_ids": None,
+                "cal_prompt_token_ids": None,
                 "waveform": None,
             }
             codes = spec.get("codes")
@@ -351,13 +361,33 @@ def create_preprocessing_executor(
                     num_ref_tokens=delayed.shape[0],
                     reference_text=spec.get("reference_text"),
                 )
+                if reference_mode:
+                    entry["cal_prompt_token_ids"] = adapter.build_prompt(
+                        cal_text,
+                        num_ref_tokens=delayed.shape[0],
+                        reference_text=spec.get("reference_text"),
+                    )
             else:
                 entry["waveform"] = _load_fusion_waveform(spec["audio"])
             fusion_refs.append(entry)
 
+        fusion_build = None
+        if reference_mode:
+            # The hybrid reference reads the calibration sentence, so it IS
+            # the final request's reference transcript.
+            prefix, suffix = adapter.build_prompt_parts(
+                text, reference_text=cal_text
+            )
+            fusion_build = {
+                "cal_text": cal_text,
+                "final_prompt_prefix": prefix,
+                "final_prompt_suffix": suffix,
+            }
+
         return HiggsTtsState(
             prompt_token_ids=[],
             fusion_refs=fusion_refs,
+            fusion_build=fusion_build,
             target_text=text,
             num_codebooks=num_codebooks,
             codebook_size=codebook_size,
@@ -567,10 +597,13 @@ def create_audio_encoder_executor(
         state = HiggsTtsState.from_dict(payload.data)
 
         # Voice fusion: encode each reference that preprocessing left as a raw
-        # waveform, delay it, and prebuild that sibling's prompt. Pre-encoded
-        # refs already carry ``codes_delayed`` + ``prompt_token_ids`` and pass
-        # through untouched. The request builder fans these out into N siblings.
+        # waveform, delay it, and prebuild that sibling's prompt (mode
+        # "logits") plus its calibration prompt (mode "reference", where the
+        # engine clones each voice reading the calibration sentence before
+        # morphing them into one hybrid reference). Pre-encoded refs already
+        # carry their prompts and pass through untouched.
         if state.fusion_refs:
+            cal_text = (state.fusion_build or {}).get("cal_text")
             for ref in state.fusion_refs:
                 if ref.get("codes_delayed") is not None:
                     continue
@@ -588,6 +621,12 @@ def create_audio_encoder_executor(
                     num_ref_tokens=len(delayed_rows),
                     reference_text=ref.get("reference_text"),
                 )
+                if cal_text:
+                    ref["cal_prompt_token_ids"] = adapter.build_prompt(
+                        cal_text,
+                        num_ref_tokens=len(delayed_rows),
+                        reference_text=ref.get("reference_text"),
+                    )
             state.target_text = None
             payload.data = state.to_dict()
             return payload

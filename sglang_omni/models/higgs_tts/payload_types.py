@@ -39,6 +39,14 @@ class HiggsTtsState(DeclarativeStateBase):
     # sibling carries its own slice). ``None``/len<2 → ordinary single-voice path.
     fusion_refs: list[dict[str, Any]] | None = None
 
+    # Reference-space fusion build parameters (mode "reference", the default):
+    # ``{"cal_text": str, "final_prompt_prefix": list[int],
+    # "final_prompt_suffix": list[int]}``. The engine assembles the real
+    # request's prompt as ``prefix + [-100] * len(hybrid_ref) + suffix`` once
+    # the hybrid reference exists (its frame count is unknown before then).
+    # ``None`` in the legacy "logits" sibling-blend mode.
+    fusion_build: dict[str, Any] | None = None
+
     num_codebooks: int = 8
     codebook_size: int = 1026  # 1024 data + <|boc|> + <|eoc|>
 

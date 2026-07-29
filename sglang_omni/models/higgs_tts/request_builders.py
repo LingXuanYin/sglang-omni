@@ -12,8 +12,10 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+from sglang_omni.models.higgs_tts import fusion_reference
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.rollout_trace import build_omni_rollout_trace
+from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -60,6 +62,12 @@ class HiggsSGLangRequestData(SGLangARRequestData):
     fusion_weight: float = 1.0
     fusion_is_leader: bool = True
     fusion_siblings: list["HiggsSGLangRequestData"] | None = None
+
+    # Engine-internal requests (reference-fusion calibration synthesis): when
+    # set, the finished row is handed to this callback by the scheduler's
+    # ``stream_output`` instead of being emitted downstream. Such rows are
+    # invisible to the client and never produce a stage result.
+    internal_done_callback: Callable[["HiggsSGLangRequestData"], None] | None = None
 
 
 class _ResettableHiggsModel(Protocol):
@@ -290,6 +298,131 @@ def build_fusion_sibling_requests(
     return leader
 
 
+def build_calibration_request(
+    *,
+    ref: dict[str, Any],
+    rid: str,
+    seed: int,
+    done_callback: Callable[[HiggsSGLangRequestData], None],
+) -> HiggsSGLangRequestData:
+    """One engine-internal calibration row: clone ``ref``'s voice reading the
+    calibration sentence (prompt prebuilt upstream as ``cal_prompt_token_ids``).
+
+    Fixed sampling parameters — calibration output identity is part of the
+    fused-reference cache key, so it must not vary with user request params.
+    """
+    prompt_ids = ref.get("cal_prompt_token_ids")
+    if not prompt_ids:
+        raise ValueError("fusion ref has no cal_prompt_token_ids")
+    data = _build_one_higgs_request(
+        prompt_token_ids=prompt_ids,
+        reference_codes_delayed=ref["codes_delayed"],
+        num_codebooks=len(ref["codes_delayed"][0]),
+        codebook_size=1026,
+        max_new_tokens=fusion_reference.CAL_MAX_NEW_TOKENS,
+        temperature=fusion_reference.CAL_TEMPERATURE,
+        top_p=fusion_reference.CAL_TOP_P,
+        top_k=fusion_reference.CAL_TOP_K,
+        seed=seed,
+        request_id=rid,
+    )
+    data.internal_done_callback = done_callback
+    data.engine_start_s = _perf_counter()
+    return data
+
+
+def build_reference_fusion_requests(
+    state: HiggsTtsState,
+    *,
+    payload: StagePayload,
+    orchestrator: "fusion_reference.FusionReferenceOrchestrator",
+    finalize: Callable[[HiggsSGLangRequestData, StagePayload], HiggsSGLangRequestData],
+) -> HiggsSGLangRequestData:
+    """Reference-space fusion entry: serve from the fused-reference cache when
+    possible, else fan out N engine-internal calibration rows and register the
+    build with the orchestrator (which later enqueues the real request).
+
+    The returned leader is a calibration row on the cold path — the client's
+    ``request_id`` gets its result only when the orchestrator's real request
+    finishes; calibration rows themselves are intercepted in ``stream_output``
+    via ``internal_done_callback`` and never emitted.
+    """
+    request_id = payload.request_id
+    refs = state.fusion_refs or []
+    build = state.fusion_build or {}
+    prefix = build.get("final_prompt_prefix")
+    suffix = build.get("final_prompt_suffix")
+    cal_text = build.get("cal_text")
+    if not prefix or not suffix or not cal_text:
+        raise ValueError(
+            "reference-fusion request is missing fusion_build prompt parts; "
+            "preprocessing/audio_encoder must populate them"
+        )
+    if not orchestrator.is_bound:
+        raise RuntimeError(
+            "FusionReferenceOrchestrator is not bound to a scheduler; "
+            "post_scheduler_setup did not run"
+        )
+    weights = _coerce_fusion_weights(refs)
+
+    def _make_real_request(delayed_rows: list[list[int]]) -> HiggsSGLangRequestData:
+        prompt_ids = list(prefix) + [AUDIO_PLACEHOLDER_ID] * len(delayed_rows) + list(
+            suffix
+        )
+        data = _build_one_higgs_request(
+            prompt_token_ids=prompt_ids,
+            reference_codes_delayed=delayed_rows,
+            num_codebooks=int(state.num_codebooks),
+            codebook_size=int(state.codebook_size),
+            max_new_tokens=int(state.max_new_tokens),
+            temperature=float(state.temperature),
+            top_p=state.top_p,
+            top_k=state.top_k,
+            seed=state.seed,
+            request_id=request_id,
+            return_logprob=bool(state.return_logprob),
+            return_omni_rollout=bool(state.return_omni_rollout),
+        )
+        return finalize(data, payload)
+
+    cache_key = fusion_reference.fused_reference_cache_key(refs, weights, cal_text)
+    cached_rows = orchestrator.cache_get(cache_key)
+    if cached_rows is not None:
+        return _make_real_request(cached_rows)
+
+    cal_rows: list[fusion_reference._CalRow] = []
+    requests: list[HiggsSGLangRequestData] = []
+    for i, ref in enumerate(refs):
+        rid = f"{request_id}#cal{i}r0"
+        row = fusion_reference._CalRow(ref_idx=i, seed_idx=0, rid=rid)
+        cal_rows.append(row)
+        requests.append(
+            build_calibration_request(
+                ref=ref,
+                rid=rid,
+                seed=fusion_reference.CAL_SEEDS[0],
+                done_callback=orchestrator.make_done_callback(request_id, i),
+            )
+        )
+    orchestrator.register_group(
+        request_id=request_id,
+        payload=payload,
+        cache_key=cache_key,
+        refs=refs,
+        weights=weights,
+        cal_text=cal_text,
+        make_real_request=_make_real_request,
+        cal_rows=cal_rows,
+    )
+    leader = requests[0]
+    # The sibling side-channel is reused purely as "enqueue these adjacent
+    # rows"; it also registers {cal rids} as an abort group, which
+    # ``register_group`` has already superseded with {request_id + cal rids}
+    # under the client-facing id — both mappings cascade correctly.
+    leader.fusion_siblings = requests[1:]
+    return leader
+
+
 def build_higgs_stream_metadata(
     payload: StagePayload,
     data: HiggsSGLangRequestData,
@@ -407,11 +540,23 @@ def make_higgs_scheduler_adapters(
                 int(max_new_tokens_cap),
             )
 
-        # Voice fusion: >= 2 references → fan out into N sibling rows that share
-        # a fusion group id + one concrete seed. The leader carries the followers
-        # as ``fusion_siblings``; the scheduler enqueues the siblings adjacently
-        # (not a guarantee they land in the same batch — see design doc).
+        # Voice fusion, >= 2 weighted references. Default mode "reference":
+        # build ONE hybrid-timbre reference (engine-internal calibration
+        # synthesis + WORLD morph, cached per refs+weights) and serve the
+        # request as an ordinary single-reference clone — see
+        # fusion_reference.py. Mode "logits" keeps the legacy sibling fan-out
+        # that blends per-step output distributions (research/contrast mode).
         if state.fusion_refs and len(state.fusion_refs) >= 2:
+            if (
+                fusion_reference.fusion_mode() == "reference"
+                and state.fusion_build is not None
+            ):
+                return build_reference_fusion_requests(
+                    state,
+                    payload=payload,
+                    orchestrator=fusion_reference.get_orchestrator(model),
+                    finalize=_finalize,
+                )
             leader = build_fusion_sibling_requests(state, request_id=payload.request_id)
             followers = leader.fusion_siblings or []
             _register_fusion_group([leader, *followers])
@@ -447,7 +592,9 @@ __all__ = [
     "HiggsSGLangRequestData",
     "INITIAL_CODEC_CHUNK_FRAMES_PARAM",
     "apply_higgs_result",
+    "build_calibration_request",
     "build_higgs_stream_metadata",
+    "build_reference_fusion_requests",
     "build_sglang_higgs_request",
     "make_higgs_scheduler_adapters",
 ]

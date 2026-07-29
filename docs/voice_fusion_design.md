@@ -604,16 +604,47 @@ morph α∈{0.25, 0.5, 0.75}(α = B 的份额);每个混合参考做独立采样
 - 已知的系统性小偏移:克隆输出相对参考自身 F0 普遍略有上移/向先验漂移(cal_A recycle
   +13.7%、α=0.5 +4.3%),这是 zero-shot 克隆的基线保真特性,不是融合机制引入的。
 
-### 工程集成蓝图(尚未实施)
+### 工程集成(已实施,全部收敛在 higgs 推理管线内部)
 
-- 落点:serve 层准备阶段(或 preprocessing `_build_fusion_state`)检测融合请求 →
-  查 speaker artifact cache(key = 各参考波形指纹 + 归一化权重 + 算法版本)→ 未命中则
-  执行构造管线(2×N 次内部校准合成 + CPU WORLD morph),产物以 raw waveform + 转录 S
-  的形式回填为普通单参考请求。冷启动约十几秒,命中后与普通请求同成本。
-- 质量闸不过时降级:取权重最大的参考做单克隆,响应 metadata 标记 fusion_fallback。
-- sibling/logit 融合整套机制降级为研究对照(`HIGGS_FUSION_MODE=logits`),默认走
-  reference 模式;调度器的原子准入、共享种子、级联 abort 等基础设施保留但不再是主路径。
+约束:不改上层调用方(API 仍是 `references: [{audio|codes, text?, weight}]`),不做
+serve 层编排;构造管线完整地活在 higgs 自己的 stage 代码 + engine 进程里。实际架构:
+
+- **preprocessing**(`stages.py`):融合请求初始化 `state.fusion_build`(校准文本 +
+  最终请求的 prompt 拼接零件 `build_prompt_parts`,见 `text_tokenizer.py`——最终 prompt
+  的 `-100` 占位数取决于混合参考帧数,在引擎侧才可知,所以只能传"前后件");pre-encoded
+  参考在此补校准 prompt。
+- **audio_encoder**(`stages.py`):raw-audio 参考照旧 codec encode,并为每个参考补
+  校准 prompt(其音色朗读校准句)。
+- **tts_engine**(核心,新模块 `fusion_reference.py`):
+  - `request_builder`(`request_builders.build_reference_fusion_requests`)先查
+    engine 进程内的混合参考缓存(key = 各参考 codes 指纹 + 归一化权重 + 校准文本 +
+    算法版本):命中 → 直接构造普通单参考请求,零额外成本;未命中 → 借用
+    `fusion_siblings` 入队通道发出 N 条**引擎内部校准行**(固定种子/采样参数,
+    `internal_done_callback` 标记),并向 `FusionReferenceOrchestrator` 注册构造组。
+  - `OmniScheduler.stream_output` 新增一个通用的 internal-request 短路(共享文件唯一
+    改动,约 20 行):带 `internal_done_callback` 的行完成时填好 finish_reason、释放
+    引擎槽位、回调编排器,**永不外发**——客户端只订阅 `request_id`,它在真请求完成时
+    才收到结果。
+  - 编排器(engine 进程单例,挂在 model 上,`post_scheduler_setup` 里绑定 scheduler):
+    scheduler 线程回调只收集 codes 与推进状态机;单工作线程执行重活——undelay →
+    CPU codec(fp32,懒加载)decode 校准音频与各参考原声 → F0 质量闸(不过则用下一个
+    固定种子补发重试行,上限 3 个种子)→ WORLD morph(N>2 按权重两两哈夫曼式归约,
+    每步都是 E1 验证过的二元 morph)→ CPU codec encode → 混合参考 codes → 写缓存 →
+    `prefix + [-100]×T + suffix` 拼出最终 prompt → 把真请求(用户原始采样参数 + 流式
+    元数据)入队。真请求此后与任何普通单参考请求完全同构,vocoder/流式零感知。
+  - abort/超时:`_fusion_group_members` 里注册 `request_id → {校准行 rids}`(成员集合
+    刻意**不含** `request_id` 本身——原子准入门控按"组员是否都在队列"判定,而
+    `request_id` 在构造期没有队列行,含入会被无限扣留);client abort 经现有级联通道
+    杀掉在途校准行;编排器另有 300s deadline 扫除兜底(覆盖"行在等待队列里被摘除、
+    永远到不了 stream_output"的路径)。
+- **模式开关**:`HIGGS_FUSION_MODE=reference`(默认)| `logits`(旧 sibling 逐步
+  logit 融合,保留作研究对照;其原子准入/共享种子/级联 abort 基础设施全部保留)。
+  校准文本可用 `HIGGS_FUSION_CAL_TEXT` 覆盖(进缓存 key)。
 - 新增依赖:pyworld(BSD;WORLD 分解/合成),DTW 为自实现 numpy,无其它新依赖。
+- 单测:`test_reference_fusion.py`(19 项:缓存 key、DTW、prompt 零件重组、编排器
+  状态机 happy/abort/空输出/质量闸重试/abort 竞态/超时扫除/缓存淘汰、WORLD morph 的
+  log 加权落点与权重单调性),不依赖 sglang,纯 CPU 可跑;旧 `test_voice_fusion.py`
+  44 项回归通过(logits 对照模式未受影响)。
 
 ### 遗留风险(E1 未覆盖,集成前需补验证)
 
