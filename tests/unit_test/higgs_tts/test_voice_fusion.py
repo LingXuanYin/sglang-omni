@@ -83,8 +83,18 @@ def test_mixed_batch_singleton_rows_byte_identical_to_raw_logits():
     assert not torch.equal(out[0], logits[0].float())
 
 
-def test_two_member_equal_weight_is_prob_average():
-    """A 2-row group at 0.5/0.5 yields the arithmetic mean of the two softmaxes."""
+def test_two_member_equal_weight_is_geometric_mean():
+    """A 2-row group at 0.5/0.5 yields the weighted geometric mean (product-of-
+    experts / log-linear pool) of the two softmaxes, NOT their arithmetic mean.
+
+    This is the fix for a real, measured bug: pooling in probability space
+    (arithmetic mean) is bimodal whenever the two references disagree, so
+    autoregressive sampling from it locks onto one reference or the other
+    (confirmed live: equal-weight fusion of two distinct voices split cleanly
+    into "sounds like A" / "sounds like B" across random seeds, never
+    intermediate). Log-linear pooling concentrates mass on tokens BOTH
+    references find plausible instead.
+    """
     torch.manual_seed(1)
     N, V = 8, 1026
     logits = torch.randn(2, N, V)
@@ -92,10 +102,35 @@ def test_two_member_equal_weight_is_prob_average():
     w = torch.tensor([0.5, 0.5], dtype=torch.float32)
     out, is_grouped = fuse_group_logits(logits, gid, w)
     assert is_grouped.all()
-    expected = 0.5 * logits[0].softmax(-1) + 0.5 * logits[1].softmax(-1)
-    # both rows carry the same fused distribution
-    torch.testing.assert_close(out[0].softmax(-1), expected, atol=1e-5, rtol=1e-4)
+
+    geometric_mean = (logits[0].softmax(-1) ** 0.5) * (logits[1].softmax(-1) ** 0.5)
+    geometric_mean = geometric_mean / geometric_mean.sum(-1, keepdim=True)
+    arithmetic_mean = 0.5 * logits[0].softmax(-1) + 0.5 * logits[1].softmax(-1)
+
+    # both rows carry the same pooled distribution
+    torch.testing.assert_close(out[0].softmax(-1), geometric_mean, atol=1e-4, rtol=1e-3)
     torch.testing.assert_close(out[1].softmax(-1), out[0].softmax(-1))
+    # and it must NOT be the old (buggy) arithmetic mean
+    assert not torch.allclose(out[0].softmax(-1), arithmetic_mean, atol=1e-3)
+
+
+def test_three_member_group_is_weighted_geometric_mean():
+    """The log-linear pool generalizes to N > 2 members with arbitrary
+    weights, not just the equal-weight 2-member case."""
+    torch.manual_seed(9)
+    N, V = 8, 1026
+    logits = torch.randn(3, N, V)
+    gid = torch.tensor([0, 0, 0], dtype=torch.long)
+    w = torch.tensor([0.5, 0.3, 0.2], dtype=torch.float32)
+    out, is_grouped = fuse_group_logits(logits, gid, w)
+    assert is_grouped.all()
+
+    probs = [logits[i].softmax(-1) for i in range(3)]
+    weights = [0.5, 0.3, 0.2]
+    expected = probs[0] ** weights[0] * probs[1] ** weights[1] * probs[2] ** weights[2]
+    expected = expected / expected.sum(-1, keepdim=True)
+    for i in range(3):
+        torch.testing.assert_close(out[i].softmax(-1), expected, atol=1e-4, rtol=1e-3)
 
 
 def test_weight_ratio_only():
@@ -134,9 +169,10 @@ def test_mixed_batch_groups_and_singletons():
     w = torch.tensor([0.5, 0.5, 1.0], dtype=torch.float32)
     out, is_grouped = fuse_group_logits(logits, gid, w)
     assert is_grouped.tolist() == [True, True, False]
-    expected01 = 0.5 * logits[0].softmax(-1) + 0.5 * logits[1].softmax(-1)
-    torch.testing.assert_close(out[0].softmax(-1), expected01, atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(out[1].softmax(-1), expected01, atol=1e-5, rtol=1e-4)
+    expected01 = (logits[0].softmax(-1) ** 0.5) * (logits[1].softmax(-1) ** 0.5)
+    expected01 = expected01 / expected01.sum(-1, keepdim=True)
+    torch.testing.assert_close(out[0].softmax(-1), expected01, atol=1e-4, rtol=1e-3)
+    torch.testing.assert_close(out[1].softmax(-1), expected01, atol=1e-4, rtol=1e-3)
     # singleton untouched (sample-equivalent)
     assert torch.equal(out[2].argmax(-1), logits[2].argmax(-1))
 
@@ -156,7 +192,7 @@ def test_generation_done_singletons_identity():
 
 
 def test_temperature_applied_before_blend():
-    """temperature_B scales each row's logits before the softmax-blend."""
+    """temperature_B scales each row's logits before the log-linear pool."""
     torch.manual_seed(5)
     N, V = 8, 1026
     logits = torch.randn(2, N, V)
@@ -164,8 +200,11 @@ def test_temperature_applied_before_blend():
     w = torch.tensor([0.5, 0.5])
     temp = torch.tensor([2.0, 2.0])
     out, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
-    expected = 0.5 * (logits[0] / 2.0).softmax(-1) + 0.5 * (logits[1] / 2.0).softmax(-1)
-    torch.testing.assert_close(out[0].softmax(-1), expected, atol=1e-5, rtol=1e-4)
+    p0 = (logits[0] / 2.0).softmax(-1)
+    p1 = (logits[1] / 2.0).softmax(-1)
+    expected = (p0 ** 0.5) * (p1 ** 0.5)
+    expected = expected / expected.sum(-1, keepdim=True)
+    torch.testing.assert_close(out[0].softmax(-1), expected, atol=1e-4, rtol=1e-3)
 
 
 # --------------------------------------------------------------------------- #

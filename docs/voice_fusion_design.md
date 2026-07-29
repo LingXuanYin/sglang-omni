@@ -25,22 +25,52 @@
 | 异步 lookahead 规避 | `model_runner.py::HiggsTTSModelRunner.lookahead_eligible`:只要有任何融合请求注册,强制走同步解码路径,避免这个仓库自建的 one-step-lookahead 把 launch 阶段设置的 FINISH_ABORT 误判成"上一步的过期行"而丢弃 |
 
 ## 核心算法
-`fuse_group_logits`(见 `fusion.py` 完整 docstring)对同组 N 行做加权 softmax 归约再转回
-log 空间喂给标准 sampler;单行组(非融合请求)原样返回**未经任何处理的原始 logits**——
-不预先除以温度。返回值额外带一个 `is_grouped_B` 掩码,调用方必须据此决定每行喂给 sampler
-的温度——只有真正被分组的行才在归约时把温度折叠进去、随后以 `temperature=1` 采样;单行组
-必须保持自己的真实温度并且只被除一次,否则会有两个后果:(a) 破坏 sampler 的 greedy 短路
-(`temperature<=阈值` 时不经过 `multinomial`,直接 `argmax`);(b) 即便没有触发 greedy
-短路,普通(非融合)请求也会被采样两次温度(`T²`)而不是一次——曾经真实出现过的 bug:
-`fuse_group_logits` 内部为了在温度缩放后的空间里做融合,会把*所有*行(含单行组)都先除以
-温度,如果连返回值也保留这个已经除过的版本,调用方再按 `is_grouped_B` 选择"单行组用真实温度
-采样"时就会在已经除过一次的 logits 上再除一次——argmax 具有尺度不变性,所以 (a) 的回归测试
-测不出这个问题,只有直接比较采样得到的*概率分布*才能测出来。现在的写法只在内部计算融合概率
-时用温度缩放后的 logits,最终返回给单行组的仍是完全原始的 `logits_BNV`,调用方的那一次真实
-温度除法就是唯一一次。这一契约由 `test_voice_fusion.py` 的两组回归测试共同守护:greedy 场景
-验证 RNG 消耗量而非采样概率巧合(`test_singleton_greedy_sampling_matches_baseline_...`),
-非 greedy 场景直接比较采样分布是否与不融合时的 baseline 一致
+
+`fuse_group_logits`(见 `fusion.py` 完整 docstring)对同组 N 行做**加权 log-linear 归约**
+(product-of-experts / 加权几何平均,不是概率空间的算术平均)喂给标准 sampler;单行组(非
+融合请求)原样返回**未经任何处理的原始 logits**——不预先除以温度。返回值额外带一个
+`is_grouped_B` 掩码,调用方必须据此决定每行喂给 sampler 的温度——只有真正被分组的行才在
+归约时把温度折叠进去、随后以 `temperature=1` 采样;单行组必须保持自己的真实温度并且只被
+除一次,否则会有两个后果:(a) 破坏 sampler 的 greedy 短路(`temperature<=阈值` 时不经过
+`multinomial`,直接 `argmax`);(b) 即便没有触发 greedy 短路,普通(非融合)请求也会被
+采样两次温度(`T²`)而不是一次。这一契约由 `test_voice_fusion.py` 的两组回归测试共同守护:
+greedy 场景验证 RNG 消耗量而非采样概率巧合
+(`test_singleton_greedy_sampling_matches_baseline_...`),非 greedy 场景直接比较采样分布
+是否与不融合时的 baseline 一致
 (`test_singleton_nongreedy_sampling_is_not_scaled_by_temperature_twice`)。
+
+**为什么是 log-linear 归约,不是概率空间算术平均(真实 bug,已修复)**:v1 实现在概率空间
+做加权算术平均——`blended = Σ w_i · softmax(logits_i/T)`,再取 log 喂给 sampler。这个版本
+上线后被实测证实有一个严重问题:两个明显不同的参考音色、权重打平(0.5/0.5)时,连续 8 次
+独立生成(不同随机种子)的结果按音高中位数聚成两簇——4 次贴近参考 A 单独克隆的音高、4 次
+贴近参考 B,没有一次落在两者中间;而权重悬殊(0.9/0.1)时 8 次全部稳定贴近权重更大的那一方,
+完全没有跳变。这排除了"权重没被正确应用"这个假设(否则悬殊权重也该乱跳),精确定位到:
+**只有势均力敌时才会两极分化**。机制上的原因是:两个差异较大的音色各自的 softmax 分布,
+算术平均出来是双峰的——几乎没有落在"两者都说得通"的中间 token 上的概率质量,所以每一步
+从这个混合分布采样,采到的要么是偏 A 的 token,要么是偏 B 的 token,从来不是中间的。而
+自回归解码里,一旦前几步(建立音高/音区的关键步)偶然采到了偏向某一方,后续步里那一方自己
+的条件概率会因为"上文更像自己会说的话"而更自信、在混合里占比越滚越大,雪崩式锁死成单一
+音色——这不是低概率的采样噪声,是双峰分布结构性地不给"中间地带"分配质量。
+
+修法:把归约挪到 **log 空间**(logits 层面加权求和:`blended_logits = Σ w_i · (logits_i/T)`),
+而不是概率空间。`softmax(Σ w_i · logits_i/T)` 在数学上*精确*正比于
+`Π softmax(logits_i/T)^{w_i}`(加权几何平均),两者只差一个不随 vocab 变化的可加常数,
+`softmax`/`argmax`/top-k/top-p 都不受这个常数影响——所以直接对温度缩放后的 logits 做加权
+求和,和"先分别 softmax、加权几何平均、再取 log"完全等价,而且更简单(不需要 `softmax`
+/`log` 往返,也不需要给融合概率加 `_LOG_FLOOR`,原来的 `_LOG_FLOOR` 只用来保护
+`group_weight_sum` 的除零)。几何平均(product-of-experts / AND)不像算术平均(mixture-
+of-experts / OR)那样是双峰的——它把概率质量集中在"两个参考音色都觉得说得通"的 token 上,
+这才是"融合音色的一帧"应该有的样子。这个修法已经用真实推理复现验证(见"仍需真实引擎验证的
+项"),单测已更新(`test_two_member_equal_weight_is_geometric_mean` 替代旧的
+`test_two_member_equal_weight_is_prob_average`,并新增
+`test_three_member_group_is_weighted_geometric_mean` 覆盖 N>2 的一般情形)。
+
+这个修法和"CFG 外推留作 follow-up"(见下文已知限制)是同一个方向但不是同一件事:CFG 本身是
+"把已有分布往条件方向外推、锐化"(`z_out = z_uncond + s·(z_cond - z_uncond)`,权重可以在单纯形
+之外),解决的是"生成结果不够贴近参考音色"这个问题——直接套在旧的概率空间算术平均上,只会让
+双峰分布的两个峰都更尖锐,加速锁死,并不能解决势均力敌时的两极分化。但 log-linear 归约把 CFG
+真正需要的底层运算(log 空间线性组合)已经就位了——后续如果要做 CFG 外推,是在现在这个
+log-linear 骨架上加一个无条件(无参考音色)的额外 sibling 行、给它负权重,而不是另起一套机制。
 
 `fuse_group_generation_done` 做"组内任一成员 done ⇒ 全部 done"的屏障,让共享 seed 的
 sibling 行在同一步终止,不会有的先跑完、有的还在解码的错位。
@@ -326,3 +356,11 @@ prompt 长度,但那里目前拿不到活的 `chunked_prefill_size`(一个 serve
    取消、真实 GIL 调度)下跑过。`_MAX_FUSION_WITHHOLD_TICKS=200` 这个放弃阈值也是拍的,没有
    基于真实引擎下"正常场景最多暂扣几个 tick 就该放行"的数据标定过,过小可能在正常波动下就误杀
    本该等等就成的组,过大则放大"客户端要等很久才会等到最终失败"的体感延迟。
+8. **log-linear 归约修法的真实引擎复现验证**:`fuse_group_logits` 改概率空间算术平均为
+   log 空间加权求和(见"核心算法"一节)这一修法本身有 `test_voice_fusion.py` 的纯 torch 单测
+   守护数学正确性,但"两极分化是否真的消失"只能靠真实引擎实测——用同样的 A/B 对照协议(不同
+   随机种子重复生成、按参考音色单独克隆的音高中位数做锚点)在真实 GPU 上重新跑一遍权重
+   {0/1, 0.25/0.75, 0.5/0.5, 0.75/0.25, 1/0} 的组合,确认 0.5/0.5 时音高不再双峰分布、而是
+   稳定集中在两个参考音色的(对数尺度)中间值附近,且方差和单一音色克隆时相当。另外需要留意
+   "两个参考音色的分布在某一步完全不重叠"这种边界情况下几何平均可能采到质量很薄的尾部 token、
+   产生音质瑕疵(粗糙/破音)——真实引擎上应该用差异较大的音色对专门听一遍这种情况。

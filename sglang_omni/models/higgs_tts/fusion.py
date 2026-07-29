@@ -11,10 +11,15 @@ lock-step and decode the same audio; only the group *leader* row is emitted.
 This module holds the pure, ``sgl_kernel``-free pieces of the mechanism — no
 torch/sglang engine dependency, so they are unit-testable standalone:
 
-- :func:`fuse_group_logits` — weighted probability average across group members,
-  returned as log-probs ready to feed the standard sampler, plus a per-row
-  ``is_grouped`` mask the caller MUST use to keep singleton rows sampling at
-  their real (unfolded) temperature — see the "greedy" warning below.
+- :func:`fuse_group_logits` — weighted **log-linear pool** (product-of-experts
+  / weighted geometric mean, not a probability-space arithmetic mean — see
+  that function's docstring for why the arithmetic-mean version this module
+  shipped with first caused a real, measured bimodal "randomly sounds like
+  just one reference voice" failure at near-equal blend weights) across group
+  members, returned as logits ready to feed the standard sampler, plus a
+  per-row ``is_grouped`` mask the caller MUST use to keep singleton rows
+  sampling at their real (unfolded) temperature — see the "greedy" warning
+  below.
 - :func:`fuse_group_generation_done` — "any sibling done ⇒ all done" barrier so
   group members terminate on the same step.
 - :class:`FusionRegistry` — thread-safe bookkeeping of which requests belong to
@@ -49,8 +54,9 @@ import threading
 
 import torch
 
-# Floor added before ``log`` so a zeroed fused-prob row can't produce ``-inf``
-# that poisons the downstream softmax. ~1e-30 is well below any real codec prob.
+# Floor for the per-group weight-sum denominator so an all-zero-weight group
+# (a caller bug, never a real weight config) divides by a tiny positive number
+# instead of zero, rather than propagating inf/nan into the pooled logits.
 _LOG_FLOOR = 1e-30
 
 
@@ -223,21 +229,47 @@ def fuse_group_logits(
           unconditionally defeats the sampler's greedy short-circuit for
           ordinary (non-fusion) requests. See the module docstring.
 
-    The blend is ``log(Σ_g w_i · softmax(logits_i / T))`` over members ``i`` of
-    each group ``g``, with group weights renormalized to sum to 1. Because
-    group membership is expressed purely through ``scatter_add_`` + advanced
-    indexing, the op is shape-static and safe inside a captured CUDA graph.
+    The blend is a weighted **log-linear pool** (product-of-experts / weighted
+    geometric mean) over members ``i`` of each group ``g``:
+    ``blended_logits_g = Σ_i w_i · (logits_i / T)``, group weights renormalized
+    to sum to 1. Because group membership is expressed purely through
+    ``scatter_add_`` + advanced indexing, the op is shape-static and safe
+    inside a captured CUDA graph.
+
+    Why log-linear (product-of-experts / AND) and not probability-space
+    arithmetic averaging (mixture-of-experts / OR): an arithmetic mean of two
+    reference voices' ``softmax`` distributions is bimodal whenever the voices
+    disagree (it has almost no mass on tokens *neither* voice individually
+    favors), so at each decode step sampling from it can only pick a
+    voice-A-like or voice-B-like token, never something acoustically between
+    the two. Autoregressive coherence then makes whichever mode gets sampled
+    at the first few (register-establishing) steps self-reinforcing for the
+    rest of the utterance — confirmed by live-inference measurement, not just
+    theory: two references at equal weight and independent random seeds
+    produced a clean **bimodal** split (every run landed close to voice A's or
+    voice B's own pitch, none intermediate), while a heavily skewed weight
+    (e.g. 0.9/0.1) was stable and consistent across seeds — ruling out "weight
+    is ignored" and pointing squarely at probability-space averaging being
+    unable to represent a compromise token in the first place. A weighted
+    geometric mean does not have this failure mode: it concentrates mass
+    exactly on tokens *both* experts assign reasonable probability to, which
+    is what a blended-timbre frame actually is.
+    ``softmax(Σ_i w_i · logits_i/T)`` is *exactly* proportional to
+    ``Π_i softmax(logits_i/T)^{w_i}`` (the weighted geometric mean of the
+    per-member distributions) — the two differ only by a per-group additive
+    log-constant that ``softmax``/``argmax``/top-k/top-p are all invariant to
+    — so pooling the temperature-scaled logits directly is both mathematically
+    exact and simpler than the old probability-space route (no ``softmax`` /
+    ``log`` round-trip, no ``_LOG_FLOOR`` needed on the grouped path).
 
     Singleton-group rows (the entire non-fusion batch) are returned as
     ``logits_BNV`` **unchanged** — bit-identical to what the sampler would
-    have received without fusion — rather than routed through
-    ``log(softmax(...))``, whose ``exp``/``log`` round-trip and ``_LOG_FLOOR``
-    would perturb the distribution tail, and rather than pre-divided by
-    temperature, which the caller already does downstream (dividing twice
-    would silently sharpen/dull every ordinary request's sampling — this was
-    a real bug caught in review, not a hypothetical). The singleton-vs-blended
-    choice is a per-row ``torch.where`` (tensor op, no host branch), so it
-    stays CUDA-Graph-safe in a mixed fusion/non-fusion batch.
+    have received without fusion — rather than pre-divided by temperature,
+    which the caller already does downstream (dividing twice would silently
+    sharpen/dull every ordinary request's sampling — this was a real bug
+    caught in review, not a hypothetical). The singleton-vs-blended choice is
+    a per-row ``torch.where`` (tensor op, no host branch), so it stays
+    CUDA-Graph-safe in a mixed fusion/non-fusion batch.
     """
     if logits_BNV.ndim != 3:
         raise ValueError(f"logits_BNV must be [B, N, V], got {tuple(logits_BNV.shape)}")
@@ -249,7 +281,6 @@ def fuse_group_logits(
     if temperature_B is not None:
         safe_temp = temperature_B.to(device).clamp_min(1e-5).view(B, 1, 1)
         logits = logits / safe_temp
-    probs_BNV = logits.softmax(dim=-1)
 
     gid = group_id_B.to(device=device, dtype=torch.long)
     w = weight_B.to(device=device, dtype=torch.float32)
@@ -262,18 +293,16 @@ def fuse_group_logits(
     group_weight_sum.scatter_add_(0, gid, w)
 
     # Per-group weight normalization: divide each row's weight by its group's
-    # total, so blended probabilities stay a valid distribution.
+    # total, so the pooled log-distribution stays a properly weighted mean.
     norm_w = w / group_weight_sum[gid].clamp_min(_LOG_FLOOR)  # [B]
 
-    weighted = probs_BNV * norm_w.view(B, 1, 1)  # [B, N, V]
+    weighted = logits * norm_w.view(B, 1, 1)  # [B, N, V]
     idx = gid.view(B, 1, 1).expand(B, N, V)
-    fused = torch.zeros_like(probs_BNV)
+    fused = torch.zeros_like(logits)
     fused.scatter_add_(0, idx, weighted)  # group g accumulates its members
 
-    # Broadcast each group's fused distribution back onto all its member rows,
-    # then take log so the result feeds the sampler as logits.
-    fused_BNV = fused.index_select(0, gid)
-    blended_logits = (fused_BNV + _LOG_FLOOR).log()
+    # Broadcast each group's pooled logits back onto all its member rows.
+    blended_logits = fused.index_select(0, gid)
 
     # Rows in a real (size > 1) group get the blended log-probs (temperature
     # already folded in); singleton rows get their exact RAW logits back —
