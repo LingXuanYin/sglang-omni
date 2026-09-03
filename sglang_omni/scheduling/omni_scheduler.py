@@ -2800,7 +2800,9 @@ class OmniScheduler:
 
             chunked_req_in_flight = self.chunked_req is not None
             available = (
-                0 if chunked_req_in_flight else self._estimate_available_prefill_tokens()
+                0
+                if chunked_req_in_flight
+                else self._estimate_available_prefill_tokens()
             )
             allocatable_slots = (
                 0

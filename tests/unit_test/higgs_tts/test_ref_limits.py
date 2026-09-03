@@ -21,7 +21,6 @@ import torch
 from sglang_omni.models.higgs_tts import fusion_reference as fr
 from sglang_omni.models.higgs_tts import utils as higgs_utils
 
-
 # --- to_codes_TN value-range validation --------------------------------------
 
 
@@ -54,9 +53,7 @@ def test_fusion_ref_fingerprint_matches_legacy_loop():
 
 def test_request_builders_fingerprint_matches_legacy_loop():
     pytest.importorskip("sglang")
-    from sglang_omni.models.higgs_tts.request_builders import (
-        _ref_audio_fingerprint,
-    )
+    from sglang_omni.models.higgs_tts.request_builders import _ref_audio_fingerprint
 
     buf = bytearray(2 * sum(len(r) for r in _BOUNDARY_ROWS))
     i = 0
@@ -150,9 +147,7 @@ class _StubConnection:
 def _capped_client(monkeypatch, handler, cap):
     httpx = pytest.importorskip("httpx")
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    monkeypatch.setattr(
-        higgs_utils, "global_http_connection", _StubConnection(client)
-    )
+    monkeypatch.setattr(higgs_utils, "global_http_connection", _StubConnection(client))
     monkeypatch.setattr(higgs_utils, "_MAX_REF_DOWNLOAD_BYTES", cap)
 
 
@@ -414,12 +409,10 @@ def test_budget_constants_track_engine_config():
     from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
     from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
 
-    assert (
-        stages._ENGINE_CONTEXT_BUDGET == HiggsTtsEngineBuilder.context_length - 1
-    )
+    assert stages._ENGINE_CONTEXT_BUDGET == HiggsTtsEngineBuilder.context_length - 1
     tts_engine = next(
         stage
         for stage in HiggsTtsPipelineConfig.model_fields["stages"].default
         if stage.name == "tts_engine"
     )
-    assert stages._MAX_NEW_TOKENS_CAP == tts_engine.factory_args["max_new_tokens"]
+    assert stages._MAX_NEW_TOKENS_CAP == tts_engine.factory.max_new_tokens

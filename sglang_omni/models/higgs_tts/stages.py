@@ -102,6 +102,7 @@ _MAX_NEW_TOKENS_CAP = 2048
 def _effective_max_new_tokens(requested: Any) -> int:
     return min(int(requested), _MAX_NEW_TOKENS_CAP)
 
+
 # Per-window/segment target for over-long raw references: the crop length in
 # "trim" mode, the per-segment length in "split_fuse" mode. <= 0 disables
 # long-reference handling entirely and restores the hard _MAX_REF_AUDIO_SEC
@@ -119,9 +120,7 @@ _REF_TRIM_SECONDS = float(os.environ.get("HIGGS_REF_TRIM_SECONDS", "30"))
 #       extra cost; no calibration synthesis on first use).
 # Falls back to "trim" when the legacy "logits" fusion mode is active
 # (fanning one voice out into K sibling rows costs K× KV for nothing).
-_REF_LONG_MODE = (
-    os.environ.get("HIGGS_REF_LONG_MODE", "split_fuse").strip().lower()
-)
+_REF_LONG_MODE = os.environ.get("HIGGS_REF_LONG_MODE", "split_fuse").strip().lower()
 if _REF_LONG_MODE not in ("split_fuse", "trim"):
     raise ValueError(
         f"HIGGS_REF_LONG_MODE must be 'split_fuse' or 'trim', "
@@ -137,12 +136,11 @@ _SPLIT_FUSE_MIN_ACTIVE_RATIO = 0.15
 def _long_reference_mode() -> str:
     if _REF_TRIM_SECONDS <= 0:
         return "trim"  # long-reference handling disabled -> hard cap applies
-    if (
-        _REF_LONG_MODE == "split_fuse"
-        and fusion_reference.fusion_mode() != "reference"
-    ):
+    if _REF_LONG_MODE == "split_fuse" and fusion_reference.fusion_mode() != "reference":
         return "trim"
     return _REF_LONG_MODE
+
+
 _REF_CODE_CACHE_MAX_ITEMS = 256
 _REF_CODE_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _REF_WAVEFORM_CACHE_MAX_ITEMS = 256
@@ -273,9 +271,7 @@ def _split_reference_for_fusion(wav: torch.Tensor) -> list[torch.Tensor] | None:
     return kept
 
 
-def _check_prompt_budget(
-    prompt_len: int, max_new_tokens: int, *, what: str
-) -> None:
+def _check_prompt_budget(prompt_len: int, max_new_tokens: int, *, what: str) -> None:
     """Reject a request the engine is guaranteed to reject, before it pays
     for encode/prefill — and say why in terms the caller can act on."""
     total = prompt_len + max_new_tokens
@@ -572,9 +568,7 @@ def create_preprocessing_executor(
                     # bound checked once below).
                     _check_prompt_budget(
                         len(entry["prompt_token_ids"]),
-                        _effective_max_new_tokens(
-                            params.get("max_new_tokens", 2048)
-                        ),
+                        _effective_max_new_tokens(params.get("max_new_tokens", 2048)),
                         what=f"fusion references[{i}]",
                     )
                 if reference_mode:
@@ -599,9 +593,7 @@ def create_preprocessing_executor(
         if reference_mode:
             # The hybrid reference reads the calibration sentence, so it IS
             # the final request's reference transcript.
-            prefix, suffix = adapter.build_prompt_parts(
-                text, reference_text=cal_text
-            )
+            prefix, suffix = adapter.build_prompt_parts(text, reference_text=cal_text)
             fusion_build = {
                 "cal_text": cal_text,
                 "final_prompt_prefix": prefix,
@@ -675,10 +667,7 @@ def create_preprocessing_executor(
         text = inputs.get("input") or inputs.get("text") or ""
         reference_text = inputs.get("reference_text") or None
         ref_codes_TN = to_codes_TN(inputs.get("reference_codes"), num_codebooks)
-        if (
-            ref_codes_TN is not None
-            and ref_codes_TN.shape[0] > _ENGINE_CONTEXT_BUDGET
-        ):
+        if ref_codes_TN is not None and ref_codes_TN.shape[0] > _ENGINE_CONTEXT_BUDGET:
             raise ValueError(
                 f"reference_codes is too long ({ref_codes_TN.shape[0]} frames = "
                 f"~{ref_codes_TN.shape[0] / _CODEC_FRAMES_PER_SEC:.0f}s at "
@@ -783,11 +772,9 @@ def create_preprocessing_executor(
                 # the content key, drop the uploaded-voice identity (its
                 # cached artifacts describe the full clip, not this segment)
                 # and drop the transcript (it describes the full clip too).
-                waveform_tensor = (
-                    segments[0].view(1, 1, -1).contiguous().float()
-                )
-                reference_code_cache_key = (
-                    _reference_code_cache_key_from_waveform(waveform_tensor, 24000)
+                waveform_tensor = segments[0].view(1, 1, -1).contiguous().float()
+                reference_code_cache_key = _reference_code_cache_key_from_waveform(
+                    waveform_tensor, 24000
                 )
                 uploaded_voice_name = None
                 uploaded_voice_created_at = None
@@ -880,10 +867,19 @@ def create_audio_encoder_executor(
         codec.model.acoustic_encoder, mode="default", dynamic=True
     )
     # The HuBERT semantic tower (12 transformer layers at 50 fps) dominates
-    # long-reference encode time; compile it like the acoustic encoder.
-    codec.model.semantic_model = torch.compile(
-        codec.model.semantic_model, mode="default", dynamic=True
-    )
+    # long-reference encode time; compile it like the acoustic encoder. This
+    # is a speed optimization, not a correctness requirement, so a codec that
+    # does not expose the tower (a test double, or an upstream rename) warns
+    # instead of failing the stage.
+    if hasattr(codec.model, "semantic_model"):
+        codec.model.semantic_model = torch.compile(
+            codec.model.semantic_model, mode="default", dynamic=True
+        )
+    else:
+        logger.warning(
+            "codec exposes no 'semantic_model'; skipping its torch.compile "
+            "(long-reference encoding will be slower)"
+        )
     # Two warm-up shapes: the second, different length flips torch.compile's
     # dynamic=True specialization into the generalized dynamic-shape kernel,
     # so live traffic with arbitrary reference lengths mostly avoids
@@ -955,9 +951,7 @@ def create_audio_encoder_executor(
                     wav = torch.as_tensor(wav, dtype=torch.float32)
                 pending.append(ref)
                 wavs.append(wav)
-            keys = [
-                _reference_code_cache_key_from_waveform(w, 24000) for w in wavs
-            ]
+            keys = [_reference_code_cache_key_from_waveform(w, 24000) for w in wavs]
             with fusion_code_cache_lock:
                 cached = [fusion_code_cache.get(k) for k in keys]
             rows_list: list[list[list[int]] | None] = [
@@ -981,9 +975,7 @@ def create_audio_encoder_executor(
                 encoded = [
                     apply_delay_pattern(
                         _validate_ref_codes(
-                            codec.encode_reference(w, sample_rate=24000).to(
-                                torch.long
-                            )
+                            codec.encode_reference(w, sample_rate=24000).to(torch.long)
                         )
                     )
                     for w in miss_wavs

@@ -75,7 +75,9 @@ def test_singleton_is_byte_identical_to_raw_logits_regardless_of_temperature():
     gid, w = _singleton_groups(B)
     # temperature == 1: out must equal the raw logits (division by 1 is moot
     # either way, so this alone would NOT catch the T² bug).
-    out1, is_grouped1, _ = fuse_group_logits(logits, gid, w, temperature_B=torch.ones(B))
+    out1, is_grouped1, _ = fuse_group_logits(
+        logits, gid, w, temperature_B=torch.ones(B)
+    )
     assert not is_grouped1.any()
     assert torch.equal(out1, logits.float())
     # arbitrary per-row temperature != 1: out must STILL equal the raw logits,
@@ -488,7 +490,7 @@ def test_temperature_applied_before_blend():
     out, _, _ = fuse_group_logits(logits, gid, w, temperature_B=temp)
     p0 = (logits[0] / 2.0).softmax(-1)
     p1 = (logits[1] / 2.0).softmax(-1)
-    expected = (p0 ** 0.5) * (p1 ** 0.5)
+    expected = (p0**0.5) * (p1**0.5)
     expected = expected / expected.sum(-1, keepdim=True)
     torch.testing.assert_close(out[0].softmax(-1), expected, atol=1e-4, rtol=1e-3)
 
@@ -516,7 +518,9 @@ def _wrong_caller_sample(
     gid = torch.arange(logits_NV.shape[0], dtype=torch.long)
     w = torch.ones(logits_NV.shape[0])
     temp = torch.full((logits_NV.shape[0],), 1e-5)  # requested: greedy
-    blended, _, _ = fuse_group_logits(logits_NV.unsqueeze(1), gid, w, temperature_B=temp)
+    blended, _, _ = fuse_group_logits(
+        logits_NV.unsqueeze(1), gid, w, temperature_B=temp
+    )
     probs = blended.squeeze(1).softmax(dim=-1)
     return probs.multinomial(num_samples=1, generator=generator).squeeze(-1)
 

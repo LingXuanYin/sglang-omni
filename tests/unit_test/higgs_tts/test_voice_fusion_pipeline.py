@@ -26,9 +26,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang_omni.models.higgs_tts.fusion import FusionRegistry
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
-from sglang_omni.models.higgs_tts.request_builders import (
-    build_fusion_sibling_requests,
-)
+from sglang_omni.models.higgs_tts.request_builders import build_fusion_sibling_requests
 from sglang_omni.models.higgs_tts.stages import _fusion_ref_entries
 
 

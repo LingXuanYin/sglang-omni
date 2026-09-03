@@ -47,10 +47,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from sglang_omni.models.higgs_tts.utils import (
-    apply_delay_pattern,
-    get_or_load_codec,
-)
+from sglang_omni.models.higgs_tts.utils import apply_delay_pattern, get_or_load_codec
 from sglang_omni.utils.codec_delay import reverse_delay_pattern
 
 logger = logging.getLogger(__name__)
@@ -63,7 +60,9 @@ CAL_TEXT_ENV = "HIGGS_FUSION_CAL_TEXT"
 # Calibration sentence: natural register, reasonably phoneme-rich, ~8 s read.
 # Must stay stable across releases: it is part of the cache key and of the
 # hybrid reference's transcript.
-DEFAULT_CAL_TEXT = "今天天气不错，我们在花园里散步，聊起了旅行、音乐和美食，每个人都很开心。"
+DEFAULT_CAL_TEXT = (
+    "今天天气不错，我们在花园里散步，聊起了旅行、音乐和美食，每个人都很开心。"
+)
 
 ALGO_VERSION = "ref-fusion-v1"
 
@@ -123,9 +122,7 @@ def _pyworld():
     return pyworld
 
 
-def world_f0(
-    wav: np.ndarray, fs: int = _SAMPLE_RATE
-) -> tuple[np.ndarray, np.ndarray]:
+def world_f0(wav: np.ndarray, fs: int = _SAMPLE_RATE) -> tuple[np.ndarray, np.ndarray]:
     """harvest + stonemask F0 track with its time axis.
 
     harvest is by far the most expensive WORLD stage; callers that need both
@@ -266,9 +263,7 @@ def _morph_pair(
     feats_a, feats_b = dtw_features(sp_a), dtw_features(sp_b)
     d = _DTW_DECIMATE
     map_ds = dtw_map(feats_a[::d], feats_b[::d])
-    map_ab = np.minimum(
-        np.repeat(map_ds * d, d)[: len(feats_a)], len(feats_b) - 1
-    )
+    map_ab = np.minimum(np.repeat(map_ds * d, d)[: len(feats_a)], len(feats_b) - 1)
     if len(map_ab) < len(feats_a):  # decimated track shorter than full track
         map_ab = np.pad(map_ab, (0, len(feats_a) - len(map_ab)), mode="edge")
     f0_bw, sp_bw, ap_bw = f0_b[map_ab], sp_b[map_ab], ap_b[map_ab]
@@ -279,9 +274,7 @@ def _morph_pair(
 
     f0_m = np.zeros_like(f0_a)
     both = voiced_a & voiced_b
-    f0_m[both] = np.exp(
-        (1 - alpha) * np.log(f0_a[both]) + alpha * np.log(f0_bw[both])
-    )
+    f0_m[both] = np.exp((1 - alpha) * np.log(f0_a[both]) + alpha * np.log(f0_bw[both]))
     only_a = voiced_a & ~voiced_b
     f0_m[only_a] = f0_a[only_a] * (gm_b / gm_a) ** alpha
     only_b = (~voiced_a) & voiced_b
@@ -601,9 +594,7 @@ class FusionReferenceOrchestrator:
         try:
             self._finalize_build_inner(group)
         except Exception as exc:  # noqa: BLE001 - single failure funnel
-            logger.exception(
-                "reference-fusion build failed for %s", group.request_id
-            )
+            logger.exception("reference-fusion build failed for %s", group.request_id)
             self._fail(group, exc)
 
     def _anchor_f0(self, fp: str, ref: dict[str, Any]) -> float | None:
@@ -690,8 +681,7 @@ class FusionReferenceOrchestrator:
             self._cal_cache_put(fp, group.cal_text, group.collected[fp])
 
         world_by_fp = {
-            fp: world_extract(wav, f0_t=f0_t)
-            for fp, (wav, f0_t) in group.gated.items()
+            fp: world_extract(wav, f0_t=f0_t) for fp, (wav, f0_t) in group.gated.items()
         }
         entries = [
             {"world": world_by_fp[fp], "weight": w}
@@ -726,9 +716,7 @@ class FusionReferenceOrchestrator:
         if group.request_id in scheduler._aborted_request_ids:
             self._drop(group)
             return
-        best_slot = max(
-            range(len(group.weights)), key=lambda i: group.weights[i]
-        )
+        best_slot = max(range(len(group.weights)), key=lambda i: group.weights[i])
         rows = group.ref_of_fp[group.fp_of_slot[best_slot]]["codes_delayed"]
         real_req_data = group.make_fallback_request(rows)
         self._drop(group)

@@ -118,7 +118,9 @@ def _solve_entropy_matching_gamma(
 
     idx_BN = gid.view(B, 1).expand(B, N)
     target_entropy_gN = torch.zeros(B, N, dtype=torch.float32, device=device)
-    target_entropy_gN.scatter_add_(0, idx_BN, base_entropy_BN * norm_weight_B.view(B, 1))
+    target_entropy_gN.scatter_add_(
+        0, idx_BN, base_entropy_BN * norm_weight_B.view(B, 1)
+    )
     target_entropy_BN = target_entropy_gN.index_select(0, gid)
 
     gamma_BN = torch.ones(B, N, dtype=torch.float32, device=device)
@@ -132,7 +134,9 @@ def _solve_entropy_matching_gamma(
         var_z = (mean_z2 - mean_z.square()).clamp_min(1e-6)
         dH_dgamma = (-gamma_BN * var_z).clamp(max=-1e-6)
         gamma_BN = gamma_BN - (entropy_BN - target_entropy_BN) / dH_dgamma
-        gamma_BN = gamma_BN.clamp(1.0 / _ENTROPY_MATCH_GAMMA_CLAMP, _ENTROPY_MATCH_GAMMA_CLAMP)
+        gamma_BN = gamma_BN.clamp(
+            1.0 / _ENTROPY_MATCH_GAMMA_CLAMP, _ENTROPY_MATCH_GAMMA_CLAMP
+        )
 
     return gamma_BN
 

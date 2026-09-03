@@ -23,10 +23,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
 )
-from sglang_omni.models.higgs_tts.model import (
-    _TRAJECTORY_DELTA_LAMBDA,
-    _flat_sampling_attr,
-)
+from sglang_omni.models.higgs_tts.model import _TRAJECTORY_DELTA_LAMBDA
 from sglang_omni.models.higgs_tts.sampler import K_MAX, selected_token_logprobs
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID

@@ -26,7 +26,6 @@ from sglang_omni.models.higgs_tts.text_tokenizer import (
 )
 from sglang_omni.models.higgs_tts.utils import apply_delay_pattern
 
-
 # --- cache key ---------------------------------------------------------------
 
 
@@ -143,9 +142,7 @@ def _bound_orchestrator(monkeypatch):
     orch.bind(sched, "/nonexistent/ckpt")
     monkeypatch.setattr(orch, "_codec", lambda: _FakeCodec())
     # Run the worker path inline so tests are deterministic.
-    monkeypatch.setattr(
-        orch._executor, "submit", lambda fn, *a, **k: fn(*a, **k)
-    )
+    monkeypatch.setattr(orch._executor, "submit", lambda fn, *a, **k: fn(*a, **k))
     return orch, sched
 
 
@@ -173,9 +170,9 @@ def _register(
     make_fallback_request=None,
 ):
     refs = refs if refs is not None else _refs(seed=7, n=n)
-    fps = fp_of_slot if fp_of_slot is not None else [
-        fr.ref_fingerprint(r) for r in refs
-    ]
+    fps = (
+        fp_of_slot if fp_of_slot is not None else [fr.ref_fingerprint(r) for r in refs]
+    )
     ref_of_fp = {fp: ref for fp, ref in zip(fps, refs)}
     built = {}
 
@@ -234,7 +231,9 @@ def test_short_real_reference_passes_the_length_floor(monkeypatch):
     monkeypatch.setattr(
         fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
-    rows, built = _register(orch, request_id="req2", refs=_refs(seed=11, n=2, frames=53))
+    rows, built = _register(
+        orch, request_id="req2", refs=_refs(seed=11, n=2, frames=53)
+    )
     orch.on_internal_done("req2", rows[0].fp, _cal_row_result(rows[0].rid, frames=53))
     orch.on_internal_done("req2", rows[1].fp, _cal_row_result(rows[1].rid, frames=53))
     assert built.get("rows"), "53-frame references must build successfully"
@@ -279,7 +278,9 @@ def test_member_registration_excludes_client_facing_id(monkeypatch):
 def test_aborted_calibration_row_fails_group_without_client_error(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     rows, built = _register(orch)
-    orch.on_internal_done("req1", rows[0].fp, _cal_row_result(rows[0].rid, finish="abort"))
+    orch.on_internal_done(
+        "req1", rows[0].fp, _cal_row_result(rows[0].rid, finish="abort")
+    )
     assert "rows" not in built
     assert not sched.enqueued
     assert not sched.errors  # abort came from the client; no extra error
