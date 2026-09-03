@@ -182,8 +182,17 @@ def _actor_phase() -> int:
     base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
     print(f"serving references at {base_url} from {serve_dir}", flush=True)
 
+    # The actor hands cleanup of its work dir to a daemon thread that waits
+    # for the OSS upload to consume the files. The fake callback above never
+    # uploads, so that thread waits out its timeout and the process exits
+    # first -- leaving a work dir per job under TMP_PATH. Harmless at runtime,
+    # but this machine gets snapshotted into the image, so track and remove
+    # them here rather than shipping the litter.
+    work_dirs: list[str] = []
+
     def run_job(label: str, payload: dict) -> str:
         task_id = f"acc-{label}-{uuid.uuid4().hex[:8]}"
+        work_dirs.append(os.path.join(actor_mod.TMP_PATH, task_id))
         recorded.clear()
         t0 = time.time()
         actor_mod.higgs_tts_actor.fn(
@@ -254,10 +263,16 @@ def _actor_phase() -> int:
                     f"{label}: output is identical to plain synthesis, so the "
                     f"reference audio was accepted and then ignored"
                 )
+    except BaseException:
+        # Leave the artifacts behind only when there is something to look at.
+        print(f"FAILED -- artifacts kept in {results_dir}", flush=True)
+        raise
     finally:
         httpd.shutdown()
+        for path in (*work_dirs, serve_dir):
+            shutil.rmtree(path, ignore_errors=True)
 
-    print(f"results kept in {results_dir}", flush=True)
+    shutil.rmtree(results_dir, ignore_errors=True)
     return 0
 
 
