@@ -31,8 +31,9 @@ Phases:
    prove a request can be served, which is why it is not sufficient on its
    own.
 2. Run three real jobs through ``higgs_tts_actor.fn``: plain, single-reference
-   clone from an HTTP URL, and a two-source mix. Each must reach
+   clone from an HTTP URL, and a three-source mix. Each must reach
    ``backend_callback`` with two ``filepath`` outputs and a decodable mp3.
+   References are production-sized, not token-sized -- see ``_REF_SECONDS``.
 
 Set ``BACKGROUND_DIR`` to point at the service source; phase 1 and 2 are
 skipped when it is absent.
@@ -40,10 +41,12 @@ skipped when it is absent.
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
 import time
+import wave
 
 BACKGROUND_DIR = os.environ.get("BACKGROUND_DIR", "/autodl-fs/data/prod/background")
 MODEL = os.environ.get("HIGGS_MODEL_PATH", "/root/models/higgs-tts-3-4b")
@@ -132,16 +135,31 @@ def _probe_mp3(path: str) -> float:
     return duration
 
 
-def _pitch_shifted_mp3(src_wav: str, dst_mp3: str, factor: float) -> None:
-    """Derive a distinct-timbre reference from real speech.
+# References must be long enough to cost what production's cost. Peak encoder
+# allocation scales linearly with reference length -- 89 MiB at 5 s, 533 MiB at
+# 30 s -- so a short reference exercises the clone path while consuming almost
+# none of the audio_encoder stage's GPU budget, and a GPU OOM that production
+# hits on every clone request cannot reproduce here. Above
+# HIGGS_REF_TRIM_SECONDS this also exercises the split-and-fuse path, which a
+# short reference skips entirely.
+_REF_SECONDS = int(os.environ.get("HIGGS_ACCEPTANCE_REF_SECONDS", "40"))
 
-    Shifting pitch while holding tempo gives a second voice that is genuinely
-    different to the fusion path without needing a second speaker on disk, so
-    this runs on a bare machine with no fixture audio.
+
+def _derive_reference_mp3(src_wav: str, dst_mp3: str, factor: float) -> None:
+    """Build a distinct-timbre reference of _REF_SECONDS from real speech.
+
+    Pitch-shifted while holding tempo, so fusion sees genuinely different
+    voices, and looped up to length, so the encoder sees a production-sized
+    input -- both without needing fixture audio staged on the machine.
     """
+    with wave.open(src_wav) as wf:
+        src_seconds = wf.getnframes() / wf.getframerate()
+    loops = max(0, math.ceil(_REF_SECONDS / max(src_seconds, 0.1)) - 1)
     subprocess.run(
         [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", src_wav,
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-stream_loop", str(loops), "-i", src_wav,
+            "-t", str(_REF_SECONDS),
             "-af", f"asetrate=24000*{factor},aresample=24000,atempo={1 / factor:.6f}",
             "-ar", "24000", "-ac", "1", "-codec:a", "libmp3lame", "-b:a", "192k",
             dst_mp3,
@@ -237,17 +255,28 @@ def _actor_phase() -> int:
         boot_wav = os.path.join(results_dir, "plain.wav")
         if not os.path.exists(boot_wav):
             raise RuntimeError("plain job produced no wav to derive references from")
-        for name, factor in (("ref_low.mp3", 0.85), ("ref_high.mp3", 1.18)):
-            _pitch_shifted_mp3(boot_wav, os.path.join(serve_dir, name), factor)
-        ref_low, ref_high = f"{base_url}/ref_low.mp3", f"{base_url}/ref_high.mp3"
+        refs = {}
+        for name, factor in (("low", 0.85), ("mid", 1.0), ("high", 1.18)):
+            path = os.path.join(serve_dir, f"ref_{name}.mp3")
+            _derive_reference_mp3(boot_wav, path, factor)
+            refs[name] = f"{base_url}/ref_{name}.mp3"
+        print(f"  references: {_REF_SECONDS}s each, 3 timbres", flush=True)
 
         # 2. Single-reference clone from an HTTP URL. Reaches the av decoder.
-        clone_digest = run_job("clone_url", {"text": TEXT, "reference_audio": ref_low})
+        clone_digest = run_job(
+            "clone_url", {"text": TEXT, "reference_audio": refs["low"]}
+        )
 
-        # 3. Two-source mix -- the fork's reason for existing.
+        # 3. Three-source mix -- the fork's reason for existing, and the
+        # heaviest thing the audio_encoder stage is asked to do: three
+        # references of _REF_SECONDS each, encoded max_concurrency-wide.
         mix_digest = run_job(
             "mix_url",
-            {"text": TEXT, "source_urls": [ref_low, ref_high], "weights": [0.6, 0.4]},
+            {
+                "text": TEXT,
+                "source_urls": [refs["low"], refs["mid"], refs["high"]],
+                "weights": [0.5, 0.3, 0.2],
+            },
         )
 
         # A reference that fails to load can be dropped without failing the

@@ -133,6 +133,37 @@ _SPLIT_FUSE_MAX_SEGMENTS = 4
 _SPLIT_FUSE_MIN_ACTIVE_RATIO = 0.15
 
 
+# Total reference audio one batched codec forward may carry. Peak allocation
+# scales with the batch's total samples (measured on a 4090: 89 MiB for 5 s,
+# 533 MiB for 30 s, 1419 MiB for 80 s), so budgeting by seconds rather than by
+# item count bounds the peak whatever mix of lengths arrives.
+_CODEC_BATCH_MAX_SEC = float(os.environ.get("HIGGS_CODEC_BATCH_MAX_SEC", "80"))
+
+
+def _batches_within_budget(
+    wavs: list[torch.Tensor], *, sample_rate: int = 24000
+) -> list[list[torch.Tensor]]:
+    """Split ``wavs`` into consecutive batches under the audio-seconds budget.
+
+    A batch always contains at least one waveform, so an item longer than the
+    budget is encoded alone rather than dropped.
+    """
+    budget = max(1, int(_CODEC_BATCH_MAX_SEC * sample_rate))
+    batches: list[list[torch.Tensor]] = []
+    current: list[torch.Tensor] = []
+    total = 0
+    for wav in wavs:
+        length = int(wav.shape[-1])
+        if current and total + length > budget:
+            batches.append(current)
+            current, total = [], 0
+        current.append(wav)
+        total += length
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _long_reference_mode() -> str:
     if _REF_TRIM_SECONDS <= 0:
         return "trim"  # long-reference handling disabled -> hard cap applies
@@ -967,10 +998,24 @@ def create_audio_encoder_executor(
                 # Equal-length refs (the auto-split segments of one long
                 # reference) encode in a single batched GPU forward instead
                 # of N sequential ones.
-                encoded = [
-                    apply_delay_pattern(_validate_ref_codes(c.to(torch.long)))
-                    for c in codec.encode_batch(miss_wavs)
-                ]
+                #
+                # Chunked by total audio, because the batch is not otherwise
+                # bounded: a request may carry any number of references, and
+                # equal lengths are the common case (the split segments of one
+                # clip, or same-duration clips from one recording session), so
+                # the batching condition above is met precisely when the batch
+                # is largest. Sixteen 80 s references reached one HuBERT
+                # forward asking for 2.15 GiB and took the whole stage's budget
+                # out with it. The per-chunk ceiling is one reference at the
+                # length cap, whose peak allocation is measured and provisioned
+                # for; a chunk always holds at least one reference so an
+                # over-long single item still makes progress.
+                encoded = []
+                for batch in _batches_within_budget(miss_wavs):
+                    encoded.extend(
+                        apply_delay_pattern(_validate_ref_codes(c.to(torch.long)))
+                        for c in codec.encode_batch(batch)
+                    )
             else:
                 encoded = [
                     apply_delay_pattern(

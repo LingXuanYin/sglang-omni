@@ -92,11 +92,23 @@ _CACHE_MAX_ENTRIES = 64
 _WORLD_FRAME_PERIOD_MS = 5.0
 _SAMPLE_RATE = 24_000
 
-# Anchor-F0 measurement window: ~20 s of delayed rows at the codec's real
+# Anchor-F0 measurement window: ~10 s of delayed rows at the codec's real
 # 25 Hz rate (+7 delay-pattern rows). Median F0 is insensitive to duration
-# past this; decoding the full reference would make the cold build scale
-# linearly with reference length for no gate-precision gain.
-_ANCHOR_MAX_DELAYED_ROWS = 20 * 25 + 7
+# past this -- measured on one voice, the median over 5 s and over 20 s differ
+# by ln 0.02, against a gate of ln 1.35 -- while harvest's cost is linear in
+# it, so a longer window buys no gate precision at real expense.
+_ANCHOR_MAX_DELAYED_ROWS = 10 * 25 + 7
+
+# WORLD analysis is CPU-bound C code that releases the GIL (measured: four
+# concurrent harvest calls finish in 1.2x the time of one), and the calls a
+# build makes are independent per voice. Running them on this pool instead of
+# in sequence is what keeps a multi-voice build from costing K times a single
+# one -- harvest dominates the whole build, at roughly 0.28 s per second of
+# audio analysed.
+_WORLD_POOL = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("HIGGS_WORLD_THREADS", "8")),
+    thread_name_prefix="higgs-world",
+)
 
 
 def fusion_mode() -> str:
@@ -435,6 +447,7 @@ class FusionReferenceOrchestrator:
         # voice's calibration synthesis is only ever paid once per process.
         self._cal_cache: dict[tuple[str, str], torch.Tensor] = {}
         self._anchor_cache: dict[str, float | None] = {}
+        self._anchor_futures: dict[str, Any] = {}
         self._codec_device: str | None = None
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="higgs-ref-fusion"
@@ -522,6 +535,12 @@ class FusionReferenceOrchestrator:
             row.rid for row in cal_rows
         }
 
+        # Start the anchor analyses now: they depend only on the reference
+        # codes, and the calibration reads they will be compared against are
+        # about to spend seconds generating on the GPU.
+        for fp, ref in ref_of_fp.items():
+            self.prefetch_anchor(fp, ref)
+
     def make_done_callback(self, request_id: str, fp: str) -> Callable[[Any], None]:
         def _done(req_data: Any) -> None:
             self.on_internal_done(request_id, fp, req_data)
@@ -600,23 +619,67 @@ class FusionReferenceOrchestrator:
             logger.exception("reference-fusion build failed for %s", group.request_id)
             self._fail(group, exc)
 
+    def prefetch_anchor(self, fp: str, ref: dict[str, Any]) -> None:
+        """Start this voice's anchor F0 now, off the critical path.
+
+        The anchor depends only on the reference codes, which are known as
+        soon as the group is registered -- while the calibration synthesis it
+        will be compared against is still generating on the GPU. Computing it
+        there instead of in ``_finalize_build_inner`` hides a harvest pass per
+        voice behind work that was going to happen anyway.
+
+        Only the harvest goes to the pool. The codec decode ahead of it stays
+        on the caller's thread: it is milliseconds of GPU work, and issuing it
+        from N pool threads instead puts N concurrent allocations on the
+        device at the exact moment the engine is running the calibration
+        generations this is meant to overlap with -- which is enough, at eight
+        voices, to take the engine out of memory.
+        """
+        with self._lock:
+            if fp in self._anchor_cache or fp in self._anchor_futures:
+                return
+        anchor_wav = self._anchor_wav(ref)
+        with self._lock:
+            if fp in self._anchor_cache or fp in self._anchor_futures:
+                return
+            self._anchor_futures[fp] = _WORLD_POOL.submit(
+                self._anchor_from_wav, fp, anchor_wav
+            )
+
+    def _anchor_wav(self, ref: dict[str, Any]) -> np.ndarray:
+        return self._delayed_to_wav(
+            torch.tensor(
+                ref["codes_delayed"][:_ANCHOR_MAX_DELAYED_ROWS], dtype=torch.long
+            )
+        )
+
+    def _anchor_from_wav(self, fp: str, anchor_wav: np.ndarray) -> float | None:
+        value = median_f0(anchor_wav)
+        with self._lock:
+            self._anchor_cache[fp] = value
+            self._anchor_futures.pop(fp, None)
+        return value
+
     def _anchor_f0(self, fp: str, ref: dict[str, Any]) -> float | None:
         with self._lock:
             if fp in self._anchor_cache:
                 return self._anchor_cache[fp]
         # The anchor is a coarse median-F0 register check against a ln(1.35)
-        # gate; ~20 s of audio pins the median as well as the full reference
-        # does, and this decode+harvest is the only cold-build cost that
-        # scales with reference length — so truncate.
-        anchor_wav = self._delayed_to_wav(
-            torch.tensor(
-                ref["codes_delayed"][:_ANCHOR_MAX_DELAYED_ROWS], dtype=torch.long
-            )
-        )
-        value = median_f0(anchor_wav)
+        # gate; ~10 s of audio pins the median closely enough for that (the
+        # median over 5 s and over 20 s of one voice differ by ln 0.02, under
+        # a tenth of the gate) and this decode+harvest is the only cold-build
+        # cost that scales with reference length — so truncate.
+        return self._anchor_from_wav(fp, self._anchor_wav(ref))
+
+    def _await_anchor(self, fp: str, ref: dict[str, Any]) -> float | None:
+        """The prefetched anchor, computing it here if no prefetch ran."""
         with self._lock:
-            self._anchor_cache[fp] = value
-        return value
+            if fp in self._anchor_cache:
+                return self._anchor_cache[fp]
+            future = self._anchor_futures.get(fp)
+        if future is not None:
+            return future.result()
+        return self._anchor_f0(fp, ref)
 
     def _finalize_build_inner(self, group: _BuildGroup) -> None:
         scheduler = self._scheduler
@@ -630,14 +693,26 @@ class FusionReferenceOrchestrator:
         # track computed for the gate is reused by ``world_extract`` below —
         # harvest (the dominant WORLD cost) runs once per calibration wav.
         retry_rows: list[tuple[str, int]] = []  # (fp, next_seed_idx)
+
+        # Decode on this thread (the codec is GPU-side and the decodes are
+        # milliseconds), then run every voice's harvest concurrently. The gate
+        # verdicts below stay in ``unique_fps`` order regardless, so which
+        # voice finishes analysing first cannot change which seed is retried
+        # or which failure is reported.
+        ungated = [fp for fp in group.unique_fps if fp not in group.gated]
+        cal_wavs = {fp: self._delayed_to_wav(group.collected[fp]) for fp in ungated}
+        cal_futures = {
+            fp: _WORLD_POOL.submit(world_f0, wav) for fp, wav in cal_wavs.items()
+        }
+
         for fp in group.unique_fps:
             if fp in group.gated:
                 continue
-            cal_wav = self._delayed_to_wav(group.collected[fp])
-            f0, t = world_f0(cal_wav)
+            cal_wav = cal_wavs[fp]
+            f0, t = cal_futures[fp].result()
             voiced = f0[f0 > 0]
             cal_f0 = float(np.median(voiced)) if voiced.size else None
-            anchor_f0 = self._anchor_f0(fp, group.ref_of_fp[fp])
+            anchor_f0 = self._await_anchor(fp, group.ref_of_fp[fp])
             if cal_f0 is None or anchor_f0 is None:
                 deviation = None
             else:
@@ -683,9 +758,13 @@ class FusionReferenceOrchestrator:
         for fp in group.unique_fps:
             self._cal_cache_put(fp, group.cal_text, group.collected[fp])
 
-        world_by_fp = {
-            fp: world_extract(wav, f0_t=f0_t) for fp, (wav, f0_t) in group.gated.items()
+        # cheaptrick + d4c, one pass per voice. Cheaper than harvest but not
+        # free (about a tenth of it), and independent per voice like the rest.
+        extract_futures = {
+            fp: _WORLD_POOL.submit(world_extract, wav, f0_t=f0_t)
+            for fp, (wav, f0_t) in group.gated.items()
         }
+        world_by_fp = {fp: fut.result() for fp, fut in extract_futures.items()}
         entries = [
             {"world": world_by_fp[fp], "weight": w}
             for fp, w in zip(group.fp_of_slot, group.weights)

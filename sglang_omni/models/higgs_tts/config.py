@@ -48,7 +48,23 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_audio_encoder_executor",
             factory=FactoryArgs(device="cuda"),
             gpu=0,
-            gpu_memory_fraction=0.03,
+            # 0.03 (737 MiB on a 24 GiB card) was sized for encoding one
+            # reference at a time. Measured peak allocation for a single
+            # encode, codec weights excluded, is 533 MiB at the 30 s trim
+            # ceiling -- so serial encoding fit, with little to spare, and two
+            # concurrent encodes (730 MiB measured) did not. That is exactly
+            # what production hit: CUBLAS_STATUS_ALLOC_FAILED on the clone and
+            # blend paths only, never on default-voice requests, which encode
+            # no reference at all.
+            #
+            # 0.09 is 2211 MiB on that card. The number is what a sweep of
+            # reference counts needs, not a margin over the pair: sixteen
+            # references peak at 2056 MiB above idle.
+            # The ceiling is bounded because no single encode exceeds
+            # HIGGS_REF_TRIM_SECONDS: longer references are split before they
+            # reach this stage (see _split_reference_for_fusion). Encoding an
+            # untrimmed 80 s reference would need 1419 MiB on its own.
+            gpu_memory_fraction=0.09,
             next="tts_engine",
         ),
         EngineStageConfig(
@@ -59,7 +75,12 @@ class HiggsTtsPipelineConfig(PipelineConfig):
                 device="cuda", max_new_tokens=2048, enable_async_decode=True
             ),
             gpu=0,
-            gpu_memory_fraction=0.85,
+            # Yields what the audio_encoder above needs, and leaves the card
+            # with headroom rather than running to the last megabyte: at 0.79
+            # a sixteen-reference build still tripped a recoverable allocator
+            # OOM. It costs KV cache and nothing else -- 69k tokens remain
+            # against a 2048-token generation cap.
+            gpu_memory_fraction=0.76,
             next="vocoder",
             stream_to=["vocoder"],
         ),
