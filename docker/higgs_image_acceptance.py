@@ -153,6 +153,7 @@ def _pitch_shifted_mp3(src_wav: str, dst_mp3: str, factor: float) -> None:
 
 def _actor_phase() -> int:
     import functools
+    import hashlib
     import http.server
     import shutil
     import socketserver
@@ -210,16 +211,17 @@ def _actor_phase() -> int:
         wav = os.path.join(os.path.dirname(mp3), "output_audio.wav")
         if os.path.exists(wav):
             shutil.copy2(wav, os.path.join(results_dir, f"{label}.wav"))
+        digest = hashlib.md5(open(kept, "rb").read()).hexdigest()
         print(
             f"  {label:16s} OK  {duration:5.2f}s audio  {os.path.getsize(kept):>8d}B mp3"
-            f"  {elapsed:6.1f}s wall",
+            f"  {elapsed:6.1f}s wall  md5={digest[:8]}",
             flush=True,
         )
-        return kept
+        return digest
 
     try:
         # 1. Plain. Reaches _transcode_to_mp3, i.e. the ffmpeg binary.
-        run_job("plain", {"text": TEXT, "voice": "default"})
+        plain_digest = run_job("plain", {"text": TEXT, "voice": "default"})
 
         # Bootstrap references from that result rather than shipping fixture
         # audio, so this runs on a machine with nothing staged on disk.
@@ -231,13 +233,27 @@ def _actor_phase() -> int:
         ref_low, ref_high = f"{base_url}/ref_low.mp3", f"{base_url}/ref_high.mp3"
 
         # 2. Single-reference clone from an HTTP URL. Reaches the av decoder.
-        run_job("clone_url", {"text": TEXT, "reference_audio": ref_low})
+        clone_digest = run_job("clone_url", {"text": TEXT, "reference_audio": ref_low})
 
         # 3. Two-source mix -- the fork's reason for existing.
-        run_job(
+        mix_digest = run_job(
             "mix_url",
             {"text": TEXT, "source_urls": [ref_low, ref_high], "weights": [0.6, 0.4]},
         )
+
+        # A reference that fails to load can be dropped without failing the
+        # request, in which case both jobs above degrade to plain synthesis
+        # and every assertion so far still passes -- the mp3 is real, it just
+        # is not a clone. Generation is deterministic for a fixed prompt, so
+        # matching the plain digest means the reference had no effect.
+        # (Equal byte counts do not: these are CBR mp3s, so identical
+        # durations give identical sizes.)
+        for label, digest in (("clone_url", clone_digest), ("mix_url", mix_digest)):
+            if digest == plain_digest:
+                raise RuntimeError(
+                    f"{label}: output is identical to plain synthesis, so the "
+                    f"reference audio was accepted and then ignored"
+                )
     finally:
         httpd.shutdown()
 
