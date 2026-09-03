@@ -1,195 +1,261 @@
 """GPU acceptance for the Higgs TTS image.
 
-Two phases, because testing only the second one is how three deploys in a
-row shipped an image that could not start:
+Four deploys in a row shipped an image that could not serve a request. Every
+one of them was found by production, not by this script, and the reason was
+always the same: the script exercised a path the deployment does not take.
 
-1. Import the real service entrypoint (background.workers.higgs) in a
-   subprocess. That module's import boots the pipeline through the actor's
-   own warm-up, so it exercises the exact code path the deployment runs --
-   including every third-party import the service pulls in. A hand-written
-   `import dotenv, dramatiq, redis` list is not a substitute: it passed on a
-   machine whose deployed counterpart still died on redis -> jwt ->
-   cryptography.
-2. Drive the pipeline directly for plain TTS and -- because this fork's
-   reason for existing is voice fusion -- a two-reference fusion request,
-   which exercises reference-space fusion end to end.
+The rule this file now follows is that acceptance drives
+``higgs_tts_actor`` itself -- the exact function dramatiq invokes -- with the
+payload shapes the gateway actually sends, and asserts on what the actor
+hands to ``backend_callback``. Nothing here reimplements a step the actor
+performs.
 
-Set BACKGROUND_DIR to skip phase 1 when the service source is not mounted.
+Concretely, the earlier version of this file could not have caught the
+ffmpeg/av outage even in principle:
+
+  * it hardcoded ``response_format: "wav"`` and wrote the result with the
+    stdlib ``wave`` module, so it never reached ``_transcode_to_mp3`` --
+    which shells out to the ``ffmpeg`` binary, absent from the image;
+  * it took references as local ``.wav`` paths, which ``soundfile`` decodes
+    natively, so it never reached the ``av`` decoder the HTTP(S)-URL
+    references in production require.
+
+Both gaps were format choices, not oversights: at each point the test picked
+the one input shape that avoids the codec stack. So phase 2 below serves its
+references over real HTTP and asserts on the produced ``.mp3``.
+
+Phases:
+
+1. Import the real service entrypoint (``background.workers.higgs``) in a
+   subprocess. Import alone proves the module graph resolves -- it does not
+   prove a request can be served, which is why it is not sufficient on its
+   own.
+2. Run three real jobs through ``higgs_tts_actor.fn``: plain, single-reference
+   clone from an HTTP URL, and a two-source mix. Each must reach
+   ``backend_callback`` with two ``filepath`` outputs and a decodable mp3.
+
+Set ``BACKGROUND_DIR`` to point at the service source; phase 1 and 2 are
+skipped when it is absent.
 """
 
-import asyncio
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
 import time
-import wave
 
-import numpy as np
-
+BACKGROUND_DIR = os.environ.get("BACKGROUND_DIR", "/autodl-fs/data/prod/background")
 MODEL = os.environ.get("HIGGS_MODEL_PATH", "/root/models/higgs-tts-3-4b")
 TEXT = "你好，这是推理端镜像的验收测试，音色融合功能已经就绪。"
 
+# The module reads these at import time; nothing in this script talks to OSS,
+# and the fake callback in phase 2 replaces the only code that would.
+PLACEHOLDER_ENV = {
+    "OSS_ACCESS_KEY_ID": "placeholder",
+    "OSS_ACCESS_KEY_SECRET": "placeholder",
+    "OSS_GLOBAL_ACCESS_KEY_ID": "placeholder",
+    "OSS_GLOBAL_ACCESS_KEY_SECRET": "placeholder",
+}
 
-def write_wav(chunks, out_path):
-    sr, arrays = None, []
-    for c in chunks:
-        if getattr(c, "audio_data", None) is None:
-            continue
-        sr = sr or (c.sample_rate or 24000)
-        arrays.append(np.asarray(c.audio_data))
-    if not arrays:
-        raise RuntimeError("no audio_data in chunks")
-    arr = np.concatenate(arrays)
-    if arr.dtype != np.int16:
-        peak = max(abs(float(arr.max())), abs(float(arr.min())), 1e-8)
-        arr = (arr / peak * 32767).astype(np.int16)
-    with wave.open(out_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(arr.tobytes())
-    return len(arr) / sr
+
+def _service_env() -> dict:
+    return {**os.environ, **PLACEHOLDER_ENV, "PYTHONPATH": BACKGROUND_DIR}
 
 
 def check_service_entrypoint() -> None:
     """Phase 1: import what the deployment imports, in a throwaway process.
 
-    Runs in a subprocess so the pipeline it boots releases the GPU before
-    phase 2 starts its own. Credentials are placeholders: the module reads
-    them at import time but nothing here talks to OSS.
+    A subprocess so the pipeline this boots releases the GPU before phase 2
+    starts its own.
     """
-    bg = os.environ.get("BACKGROUND_DIR", "/autodl-fs/data/prod/background")
-    if not os.path.isdir(bg):
-        print(f"SERVICE_CHECK_SKIPPED (no service source at {bg})", flush=True)
-        return
-    env = {
-        **os.environ,
-        "PYTHONPATH": bg,
-        "OSS_ACCESS_KEY_ID": "placeholder",
-        "OSS_ACCESS_KEY_SECRET": "placeholder",
-        "OSS_GLOBAL_ACCESS_KEY_ID": "placeholder",
-        "OSS_GLOBAL_ACCESS_KEY_SECRET": "placeholder",
-    }
     print("importing background.workers.higgs (boots the pipeline)...", flush=True)
     t0 = time.time()
     proc = subprocess.run(
         [sys.executable, "-c", "import background.workers.higgs"],
-        cwd=bg,
-        env=env,
+        cwd=BACKGROUND_DIR,
+        env=_service_env(),
         capture_output=True,
         text=True,
         timeout=1800,
     )
     if proc.returncode != 0:
-        output = (proc.stderr or proc.stdout).strip().splitlines()[-15:]
-        tail = "\n".join(output)
+        tail = "\n".join((proc.stderr or proc.stdout).strip().splitlines()[-15:])
         raise RuntimeError(
             "the deployment's own worker entrypoint does not import:\n" + tail
         )
     print(f"SERVICE_ENTRYPOINT_OK ({time.time() - t0:.1f}s)", flush=True)
 
 
-async def main():
-    import sglang
-    import torch
-
-    import sglang_omni
-    from sglang_omni.client import Client, GenerateRequest, SamplingParams
-    from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
-    from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
-
-    print("sglang_omni", sglang_omni.__version__, sglang_omni.__file__, flush=True)
-    print(
-        "sglang",
-        sglang.__version__,
-        "| torch",
-        torch.__version__,
-        "| cuda",
-        torch.cuda.is_available(),
-        flush=True,
-    )
-
-    runner = MultiProcessPipelineRunner(HiggsTtsPipelineConfig(model_path=MODEL))
+def check_real_jobs() -> None:
+    """Phase 2: re-exec this file inside the service's import context."""
+    print("running real actor jobs...", flush=True)
     t0 = time.time()
-    await runner.start(timeout=900)
-    print(f"PIPELINE_STARTED {time.time() - t0:.1f}s", flush=True)
-    client = Client(runner.coordinator)
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--actor-phase"],
+        cwd=BACKGROUND_DIR,
+        env=_service_env(),
+        timeout=3600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("real actor jobs failed (see output above)")
+    print(f"REAL_JOBS_OK ({time.time() - t0:.1f}s)", flush=True)
 
-    def sampling():
-        return SamplingParams(
-            temperature=0.8,
-            top_p=0.8,
-            top_k=30,
-            repetition_penalty=1.1,
-            max_new_tokens=256,
-            seed=42,
-        )
 
-    meta = {
-        "task": "tts",
-        "tts_params": {"voice": "default", "response_format": "wav", "speed": 1.0},
-    }
+# --------------------------------------------------------------------------
+# phase 2 body -- runs in the subprocess started by check_real_jobs()
+# --------------------------------------------------------------------------
 
-    # 1) plain TTS
-    t1 = time.time()
-    chunks = [
-        c
-        async for c in client.generate(
-            GenerateRequest(
-                prompt=TEXT,
-                sampling=sampling(),
-                stream=False,
-                output_modalities=["audio"],
-                metadata=meta,
-            )
-        )
-    ]
-    dur = write_wav(chunks, "/root/acceptance_plain.wav")
-    print(
-        f"PLAIN_OK {len(chunks)} chunks, {dur:.2f}s audio, "
-        f"{time.time() - t1:.1f}s wall",
-        flush=True,
+
+def _probe_mp3(path: str) -> float:
+    """Duration in seconds via ffprobe, which also proves the file decodes.
+
+    Deliberately ffprobe and not a Python mp3 reader: the deployment's own
+    transcode step is a subprocess call to the ffmpeg binary, so acceptance
+    should fail the same way the deployment does when that binary is absent.
+    """
+    out = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name:format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    codec, duration = out[0], float(out[1])
+    if codec != "mp3":
+        raise RuntimeError(f"{path}: expected mp3 stream, got {codec!r}")
+    return duration
+
+
+def _pitch_shifted_mp3(src_wav: str, dst_mp3: str, factor: float) -> None:
+    """Derive a distinct-timbre reference from real speech.
+
+    Shifting pitch while holding tempo gives a second voice that is genuinely
+    different to the fusion path without needing a second speaker on disk, so
+    this runs on a bare machine with no fixture audio.
+    """
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", src_wav,
+            "-af", f"asetrate=24000*{factor},aresample=24000,atempo={1 / factor:.6f}",
+            "-ar", "24000", "-ac", "1", "-codec:a", "libmp3lame", "-b:a", "192k",
+            dst_mp3,
+        ],
+        check=True,
+        capture_output=True,
     )
 
-    # 2) voice fusion: blend the two reference clips this fork was built for.
-    refs = [p for p in (os.environ.get("REF_A"), os.environ.get("REF_B")) if p]
-    if len(refs) == 2 and all(os.path.exists(p) for p in refs):
-        t2 = time.time()
-        prompt = {
-            "text": TEXT,
-            "references": [
-                {"audio_path": refs[0], "weight": 0.5},
-                {"audio_path": refs[1], "weight": 0.5},
-            ],
-        }
-        chunks = [
-            c
-            async for c in client.generate(
-                GenerateRequest(
-                    prompt=prompt,
-                    sampling=sampling(),
-                    stream=False,
-                    output_modalities=["audio"],
-                    metadata=meta,
-                )
+
+def _actor_phase() -> int:
+    import functools
+    import http.server
+    import shutil
+    import socketserver
+    import tempfile
+    import threading
+    import uuid
+
+    from background.tasks import higgs_tts_actor as actor_mod
+
+    recorded: list[dict] = []
+
+    def fake_callback(**kwargs):
+        # The actor's failure branch also calls this -- with outputs=[] -- and
+        # does not re-raise, so "no exception" is not a pass. Everything the
+        # actor reports gets recorded and asserted on below.
+        recorded.append(kwargs)
+
+    actor_mod.backend_callback = fake_callback
+
+    results_dir = tempfile.mkdtemp(prefix="higgs_acceptance_")
+    serve_dir = tempfile.mkdtemp(prefix="higgs_refs_")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=serve_dir)
+    httpd = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    httpd.allow_reuse_address = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    print(f"serving references at {base_url} from {serve_dir}", flush=True)
+
+    def run_job(label: str, payload: dict) -> str:
+        task_id = f"acc-{label}-{uuid.uuid4().hex[:8]}"
+        recorded.clear()
+        t0 = time.time()
+        actor_mod.higgs_tts_actor.fn(
+            task_id,
+            {"api_payload": payload, "backend_url": None, "callback_path": None},
+        )
+        elapsed = time.time() - t0
+
+        if not recorded:
+            raise RuntimeError(f"{label}: actor never called backend_callback")
+        outputs = recorded[-1].get("outputs") or []
+        if len(outputs) != 2:
+            raise RuntimeError(
+                f"{label}: actor reported failure -- outputs={outputs!r} "
+                f"callback={recorded[-1]!r}"
             )
-        ]
-        dur = write_wav(chunks, "/root/acceptance_fusion.wav")
+        mp3 = outputs[0]["data"]
+        duration = _probe_mp3(mp3)
+        if duration < 0.5:
+            raise RuntimeError(f"{label}: mp3 is only {duration:.2f}s")
+
+        # Copy out before the actor's reaper thread removes the work dir.
+        kept = os.path.join(results_dir, f"{label}.mp3")
+        shutil.copy2(mp3, kept)
+        wav = os.path.join(os.path.dirname(mp3), "output_audio.wav")
+        if os.path.exists(wav):
+            shutil.copy2(wav, os.path.join(results_dir, f"{label}.wav"))
         print(
-            f"FUSION_OK {len(chunks)} chunks, {dur:.2f}s audio, "
-            f"{time.time() - t2:.1f}s wall (cold build incl.)",
+            f"  {label:16s} OK  {duration:5.2f}s audio  {os.path.getsize(kept):>8d}B mp3"
+            f"  {elapsed:6.1f}s wall",
             flush=True,
         )
-    else:
-        print("FUSION_SKIPPED (set REF_A/REF_B to two wav paths)", flush=True)
+        return kept
 
     try:
-        await runner.stop()
-    except Exception:
-        pass
+        # 1. Plain. Reaches _transcode_to_mp3, i.e. the ffmpeg binary.
+        run_job("plain", {"text": TEXT, "voice": "default"})
+
+        # Bootstrap references from that result rather than shipping fixture
+        # audio, so this runs on a machine with nothing staged on disk.
+        boot_wav = os.path.join(results_dir, "plain.wav")
+        if not os.path.exists(boot_wav):
+            raise RuntimeError("plain job produced no wav to derive references from")
+        for name, factor in (("ref_low.mp3", 0.85), ("ref_high.mp3", 1.18)):
+            _pitch_shifted_mp3(boot_wav, os.path.join(serve_dir, name), factor)
+        ref_low, ref_high = f"{base_url}/ref_low.mp3", f"{base_url}/ref_high.mp3"
+
+        # 2. Single-reference clone from an HTTP URL. Reaches the av decoder.
+        run_job("clone_url", {"text": TEXT, "reference_audio": ref_low})
+
+        # 3. Two-source mix -- the fork's reason for existing.
+        run_job(
+            "mix_url",
+            {"text": TEXT, "source_urls": [ref_low, ref_high], "weights": [0.6, 0.4]},
+        )
+    finally:
+        httpd.shutdown()
+
+    print(f"results kept in {results_dir}", flush=True)
+    return 0
+
+
+def main() -> int:
+    if not os.path.isdir(BACKGROUND_DIR):
+        print(f"SKIPPED (no service source at {BACKGROUND_DIR})", flush=True)
+        return 0
+    check_service_entrypoint()
+    check_real_jobs()
     print("ACCEPTANCE_DONE", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    check_service_entrypoint()
-    sys.exit(asyncio.run(main()))
+    if "--actor-phase" in sys.argv:
+        sys.exit(_actor_phase())
+    sys.exit(main())
