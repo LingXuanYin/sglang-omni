@@ -89,13 +89,46 @@ else
     echo "weights already present at ${MODEL_DIR}"
 fi
 
-echo "== 6. verify =="
+echo "== 6. background service dependencies =="
+# The deployment runs background/main.py straight out of this image, so the
+# service's own dependencies have to be here -- without them it dies at import
+# on python-dotenv before any Higgs code runs. They used to arrive from
+# background/Dockerfile's `pip install -e .`.
+#
+# Deliberately NOT background's whole dependency list. That list also carries
+# its other worker types (aider-chat, playwright, codewithgpu, volcengine),
+# and aider-chat in particular pins an older universe -- huggingface-hub 0.31,
+# numpy 1.26, openai 1.x -- which pip will happily install over this image's
+# stack, leaving transformers unimportable and the pipeline dead. The Higgs
+# worker imports none of them. This list is what background/Dockerfile's own
+# smoke test asserts a Higgs image must import, plus the extras those need.
+#
+# The constraints cover every package the two sides share, not just torch:
+# a narrower list still lets pip walk numpy and huggingface-hub backwards.
+cat >/root/higgs-stack-constraints.txt <<'CONSTRAINTS'
+torch==2.13.0+cu130
+torchvision==0.28.0
+sglang==0.5.18
+transformers==5.12.1
+flashinfer-python==0.6.17
+numpy>=2.1
+huggingface-hub>=0.36.0
+openai==2.6.1
+CONSTRAINTS
+"$PY" -m pip install --no-cache-dir -c /root/higgs-stack-constraints.txt     "python-dotenv>=1.0.1,<2.0.0"     "dramatiq[redis,watch]>=2.0.0,<3.0.0"     "redis>=5.2.1,<6.0.0"     "oss2>=2.19.1,<3.0.0"     "opentelemetry-sdk>=1.30.0,<2.0.0"     "opentelemetry-api>=1.30.0,<2.0.0"     "opentelemetry-exporter-otlp-proto-grpc>=1.30.0,<2.0.0"     "opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0"     "opentelemetry-instrumentation-httpx>=0.51b0,<1.0.0"     "opentelemetry-instrumentation-requests>=0.51b0,<1.0.0"     "ffmpeg-python>=0.2.0,<0.3.0"     "mutagen>=1.47.0,<2.0.0"     "httpx[socks]>=0.28.1,<0.29.0"     "pyyaml>=6.0.2,<7.0.0"     "pillow>=11.2.1,<12.0.0"     "json-repair>=0.47.7"     "websockets>=14.1.0,<15.0.0"
+
+echo "== 7. verify =="
 "$PY" -c "
-import sglang, sglang_omni, torch, pyworld
+import numpy, sglang, sglang_omni, torch, pyworld
 import sglang_omni.models.higgs_tts.stages          # noqa: F401
 import sglang_omni.models.higgs_tts.fusion_reference  # noqa: F401
+# the service side must import too, in the same interpreter
+import dotenv, dramatiq, redis, oss2, opentelemetry.sdk  # noqa: F401
+import mutagen, ffmpeg, httpx, pydantic, yaml           # noqa: F401
+print('numpy', numpy.__version__)
 print('sglang_omni', sglang_omni.__version__, '|', sglang_omni.__file__)
 print('sglang', sglang.__version__, '| torch', torch.__version__,
       '| cuda', torch.cuda.is_available())
+assert torch.cuda.is_available(), 'torch cannot see the GPU'
 "
 echo "PROVISION_DONE -- run docker/higgs_image_acceptance.py before snapshotting"
