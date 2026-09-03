@@ -17,6 +17,7 @@ from sglang_omni.models.higgs_tts import fusion_reference
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.rollout_trace import build_omni_rollout_trace
 from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
+from sglang_omni.models.higgs_tts.utils import collected_output_codes
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
     DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
     DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
@@ -515,17 +516,11 @@ def build_higgs_stream_metadata(
 
 
 def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> None:
-    num_codebooks = int(data.num_codebooks)
-    if data.output_code_buffer is not None and data.output_code_count > 0:
-        codes = data.output_code_buffer[: data.output_code_count].to(torch.long)
-        state.output_codes_delayed = codes.tolist()
-        state.completion_tokens = int(codes.shape[0])
-    elif data.output_codes:
-        codes = torch.stack(data.output_codes, dim=0).to(torch.long)
+    codes = collected_output_codes(data)
+    if codes.shape[0] > 0:
         state.output_codes_delayed = codes.tolist()
         state.completion_tokens = int(codes.shape[0])
     else:
-        codes = torch.empty((0, num_codebooks), dtype=torch.long)
         state.output_codes_delayed = None
 
     if data.return_omni_rollout:

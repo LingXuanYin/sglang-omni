@@ -57,8 +57,12 @@ PROFILE
 
 echo "== 3. dependencies =="
 "$PY" -m pip install --no-cache-dir "sglang==${SGLANG_VERSION}"
+# setuptools<81: pyworld still imports pkg_resources at module load, which
+# setuptools removed in 81. Without the pin the voice-fusion path dies at
+# import time inside the tts_engine process -- and only there, so plain TTS
+# keeps working and the breakage presents as a fusion bug.
 "$PY" -m pip install --no-cache-dir \
-    "pyworld>=0.3.4" "soundfile>=0.12.0" "scipy>=1.10.0" \
+    "pyworld>=0.3.4" "setuptools<81" "soundfile>=0.12.0" "scipy>=1.10.0" \
     msgspec xxhash librosa huggingface_hub
 
 echo "== 4. fork source =="

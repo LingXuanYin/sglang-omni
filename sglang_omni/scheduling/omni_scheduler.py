@@ -1374,18 +1374,92 @@ class OmniScheduler:
         )
 
     def get_next_batch_to_run(self):
-        """Bridge Omni's batch-owning loops to the upstream scheduler contract.
+        """Upstream batch selection, gated for group-atomic fusion admission.
 
-        Upstream takes running_batch and last_batch as arguments instead of
-        reading them off self and returns a NextBatchPlan instead of the batch. Omni's event loops
-        own that state, so feed it in and write the (possibly rebuilt) running
-        batch back before handing the runnable batch to the caller.
+        An earlier version of this override tried to enforce group-atomic
+        prefill admission *after* upstream had already chosen a batch: if it
+        contained only some members of a fusion group, it trimmed
+        ``batch.reqs`` down to the present members and requeued the rest.
+        That is unsound and was removed. By the time upstream's
+        ``get_next_batch_to_run`` returns a prefill batch,
+        ``ScheduleBatch.prepare_for_extend`` has already flattened every
+        req's tokens/KV slots/positions into batch-wide tensors
+        (``input_ids``, ``seq_lens``, ``out_cache_loc``, ...) sized to the
+        FULL original ``batch.reqs``. Trimming ``batch.reqs`` afterward
+        desyncs those tensors from the now-shorter req list and corrupts the
+        batch for *every* request in it, fusion or not — there is no
+        supported way to shrink an already-prepared extend batch (upstream's
+        own ``filter_batch`` is a decode-batch tool; it never touches extend
+        tensors).
+
+        Atomic admission is instead enforced *before* upstream ever runs, by
+        gating its input: ``self.waiting_queue`` is a plain Python list upstream
+        reads from (via ``PrefillAdder.add_one_req`` in a simple
+        first-fit-then-stop loop) — reordering or filtering that list is
+        just list surgery, with no tensors involved yet, so it carries none
+        of the risk above. See ``_reorder_queue_for_atomic_fusion_admission``
+        for the actual gate: incomplete groups are withheld entirely, and
+        complete-and-affordable groups are moved to the front (each group's
+        members kept contiguous, ahead of every ordinary request) so no
+        unrelated request can consume the prefill budget in between two
+        members of the same group. This is a conservative, best-effort gate,
+        not a hard proof — see that method's docstring for exactly what it
+        does and does not guarantee (it also gates on the running-request
+        slot budget and the chunked-prefill/input-token budgets, not just
+        the KV-token one, and gives up on a group that never fits after
+        enough consecutive ticks rather than withholding it forever). The
+        decode-time backstop (``HiggsTTSModelRunner._populate_fusion_buffers``
+        isolating a split group's present rows, ``stream_output``'s
+        cascade-abort cleaning up the rest) stays in place unchanged as
+        defense in depth for whatever this gate doesn't catch — e.g. a
+        KV-pressure retract splitting an already-admitted, already-decoding
+        group, which this prefill-time gate cannot see or prevent.
+
+        Non-fusion traffic is untouched: ``_fusion_group_members`` is empty,
+        so ``_reorder_queue_for_atomic_fusion_admission`` is a cheap no-op on
+        the hot path.
         """
-        plan = _Upstream.get_next_batch_to_run(
-            self, self.running_batch, self.last_batch
-        )
-        self.running_batch = plan.running_batch
-        return plan.batch_to_run
+        withheld = self._reorder_queue_for_atomic_fusion_admission()
+        try:
+            # Upstream takes running_batch/last_batch as arguments rather
+            # than reading them off self, and returns a NextBatchPlan; this
+            # loop owns that state, so feed it in and write the (possibly
+            # rebuilt) running batch back.
+            plan = _Upstream.get_next_batch_to_run(
+                self, self.running_batch, self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+        finally:
+            self._restore_queue_after_atomic_fusion_admission(withheld)
+
+        if batch is None or not self._fusion_group_members:
+            return batch
+        reqs = getattr(batch, "reqs", None)
+        if not reqs or self._batch_is_decode(batch):
+            return batch
+
+        present_by_group: dict[frozenset, set[str]] = {}
+        for req in reqs:
+            members = self._fusion_group_members.get(req.rid)
+            if members is None:
+                continue
+            present_by_group.setdefault(frozenset(members), set()).add(req.rid)
+
+        for members, present in present_by_group.items():
+            if present != set(members):
+                logger.debug(
+                    "voice-fusion group landed partially in a prefill batch "
+                    "despite the admission gate: %d/%d sibling(s) present "
+                    "(%s). The rest will join in a later batch; if they "
+                    "never do, the decode-time group-completeness guard "
+                    "aborts this group instead of blending an incomplete "
+                    "set.",
+                    len(present),
+                    len(members),
+                    sorted(present),
+                )
+        return batch
 
     def get_new_batch_prefill(self, running_batch):
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
@@ -2537,86 +2611,6 @@ class OmniScheduler:
             "Drain the result queue before the forward, then remove this "
             "guard."
         )
-
-    def get_next_batch_to_run(self):
-        """Upstream batch selection, gated for group-atomic fusion admission.
-
-        An earlier version of this override tried to enforce group-atomic
-        prefill admission *after* upstream had already chosen a batch: if it
-        contained only some members of a fusion group, it trimmed
-        ``batch.reqs`` down to the present members and requeued the rest.
-        That is unsound and was removed. By the time upstream's
-        ``get_next_batch_to_run`` returns a prefill batch,
-        ``ScheduleBatch.prepare_for_extend`` has already flattened every
-        req's tokens/KV slots/positions into batch-wide tensors
-        (``input_ids``, ``seq_lens``, ``out_cache_loc``, ...) sized to the
-        FULL original ``batch.reqs``. Trimming ``batch.reqs`` afterward
-        desyncs those tensors from the now-shorter req list and corrupts the
-        batch for *every* request in it, fusion or not — there is no
-        supported way to shrink an already-prepared extend batch (upstream's
-        own ``filter_batch`` is a decode-batch tool; it never touches extend
-        tensors).
-
-        Atomic admission is instead enforced *before* upstream ever runs, by
-        gating its input: ``self.waiting_queue`` is a plain Python list upstream
-        reads from (via ``PrefillAdder.add_one_req`` in a simple
-        first-fit-then-stop loop) — reordering or filtering that list is
-        just list surgery, with no tensors involved yet, so it carries none
-        of the risk above. See ``_reorder_queue_for_atomic_fusion_admission``
-        for the actual gate: incomplete groups are withheld entirely, and
-        complete-and-affordable groups are moved to the front (each group's
-        members kept contiguous, ahead of every ordinary request) so no
-        unrelated request can consume the prefill budget in between two
-        members of the same group. This is a conservative, best-effort gate,
-        not a hard proof — see that method's docstring for exactly what it
-        does and does not guarantee (it also gates on the running-request
-        slot budget and the chunked-prefill/input-token budgets, not just
-        the KV-token one, and gives up on a group that never fits after
-        enough consecutive ticks rather than withholding it forever). The
-        decode-time backstop (``HiggsTTSModelRunner._populate_fusion_buffers``
-        isolating a split group's present rows, ``stream_output``'s
-        cascade-abort cleaning up the rest) stays in place unchanged as
-        defense in depth for whatever this gate doesn't catch — e.g. a
-        KV-pressure retract splitting an already-admitted, already-decoding
-        group, which this prefill-time gate cannot see or prevent.
-
-        Non-fusion traffic is untouched: ``_fusion_group_members`` is empty,
-        so ``_reorder_queue_for_atomic_fusion_admission`` is a cheap no-op on
-        the hot path.
-        """
-        withheld = self._reorder_queue_for_atomic_fusion_admission()
-        try:
-            batch = _Upstream.get_next_batch_to_run(self)
-        finally:
-            self._restore_queue_after_atomic_fusion_admission(withheld)
-
-        if batch is None or not self._fusion_group_members:
-            return batch
-        reqs = getattr(batch, "reqs", None)
-        if not reqs or self._batch_is_decode(batch):
-            return batch
-
-        present_by_group: dict[frozenset, set[str]] = {}
-        for req in reqs:
-            members = self._fusion_group_members.get(req.rid)
-            if members is None:
-                continue
-            present_by_group.setdefault(frozenset(members), set()).add(req.rid)
-
-        for members, present in present_by_group.items():
-            if present != set(members):
-                logger.debug(
-                    "voice-fusion group landed partially in a prefill batch "
-                    "despite the admission gate: %d/%d sibling(s) present "
-                    "(%s). The rest will join in a later batch; if they "
-                    "never do, the decode-time group-completeness guard "
-                    "aborts this group instead of blending an incomplete "
-                    "set.",
-                    len(present),
-                    len(members),
-                    sorted(present),
-                )
-        return batch
 
     def _estimate_available_prefill_tokens(self) -> int:
         """Conservative (pessimistic) estimate of how many fresh prefill

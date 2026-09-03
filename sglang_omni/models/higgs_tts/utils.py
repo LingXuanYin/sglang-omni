@@ -130,6 +130,30 @@ def get_or_load_codec(path: str, device: str, dtype: str) -> HiggsAudioCodec:
     return codec
 
 
+def collected_output_codes(data: Any) -> torch.Tensor:
+    """Decoded codes for a finished request as ``[T, num_codebooks]``.
+
+    Two storage paths exist: the preallocated ``output_code_buffer`` the model
+    runner normally fills, and the ``output_codes`` list it falls back to for
+    request objects that lack the buffer fields. Readers must consult both --
+    checking only the list silently sees an empty result for every ordinary
+    request (this is how the reference-fusion calibration path came to
+    believe its own synthesis had produced nothing).
+    """
+    # getattr, not attribute access: ``_append_output_code`` also tolerates
+    # request objects without the buffer fields and falls back to the list
+    # for them, so a reader that assumed the fields exist would raise on
+    # exactly the objects that path is meant to serve.
+    buffer = getattr(data, "output_code_buffer", None)
+    count = int(getattr(data, "output_code_count", 0) or 0)
+    if buffer is not None and count > 0:
+        return buffer[:count].to(torch.long)
+    codes = getattr(data, "output_codes", None)
+    if codes:
+        return torch.stack(list(codes), dim=0).to(torch.long)
+    return torch.empty((0, int(getattr(data, "num_codebooks", 8))), dtype=torch.long)
+
+
 def to_codes_TN(raw: Any, num_codebooks: int) -> torch.Tensor | None:
     """Coerce client-supplied ``reference_codes`` to a ``[T, N]`` int64 tensor."""
     if raw is None:
@@ -191,6 +215,7 @@ __all__ = [
     "BOC_ID",
     "EOC_ID",
     "apply_delay_pattern",
+    "collected_output_codes",
     "delay_pattern_action_mask",
     "get_or_load_codec",
     "load_audio_to_24k",

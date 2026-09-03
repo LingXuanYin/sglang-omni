@@ -392,6 +392,36 @@ def test_f0_gate_exhaustion_degrades_to_fallback_when_available(monkeypatch):
     assert "req9" not in sched._fusion_group_members
 
 
+def test_calibration_reads_codes_from_the_preallocated_buffer(monkeypatch):
+    """The model runner writes decoded codes into ``output_code_buffer``, not
+    the ``output_codes`` list, for every request that carries the buffer
+    fields -- which is every ordinary request. A calibration row read only
+    through the list therefore looked empty, and every cold fusion build
+    failed with "produced no codes"."""
+    orch, sched = _bound_orchestrator(monkeypatch)
+    _patch_world(monkeypatch)
+    monkeypatch.setattr(
+        fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
+    )
+    rows, built = _register(orch, request_id="reqbuf")
+
+    def buffered_result(rid, frames=90):
+        """A finished row shaped the way the model runner leaves it."""
+        result = _cal_row_result(rid, frames=frames)
+        stacked = torch.stack(result.output_codes, dim=0)
+        result.output_codes = []  # runner never appends here
+        result.output_code_buffer = stacked
+        result.output_code_count = stacked.shape[0]
+        result.num_codebooks = stacked.shape[1]
+        return result
+
+    orch.on_internal_done("reqbuf", rows[0].fp, buffered_result(rows[0].rid))
+    orch.on_internal_done("reqbuf", rows[1].fp, buffered_result(rows[1].rid))
+
+    assert built.get("rows"), "buffer-backed calibration must drive the build"
+    assert not sched.errors
+
+
 def test_client_abort_before_finalize_drops_the_build(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     _patch_world(monkeypatch)

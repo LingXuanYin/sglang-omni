@@ -47,7 +47,11 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
-from sglang_omni.models.higgs_tts.utils import apply_delay_pattern, get_or_load_codec
+from sglang_omni.models.higgs_tts.utils import (
+    apply_delay_pattern,
+    collected_output_codes,
+    get_or_load_codec,
+)
 from sglang_omni.utils.codec_delay import reverse_delay_pattern
 
 logger = logging.getLogger(__name__)
@@ -536,7 +540,8 @@ class FusionReferenceOrchestrator:
         if (req_data.finish_reason or "").lower() == "abort":
             self._fail(group, RuntimeError("calibration row aborted"), emit=False)
             return
-        if not req_data.output_codes:
+        delayed = collected_output_codes(req_data).cpu()
+        if delayed.shape[0] == 0:
             self._fail(
                 group,
                 RuntimeError(
@@ -544,8 +549,6 @@ class FusionReferenceOrchestrator:
                 ),
             )
             return
-
-        delayed = torch.stack(req_data.output_codes, dim=0).to(torch.long).cpu()
         group.collected[fp] = delayed
         if group.pending or any(f not in group.collected for f in group.unique_fps):
             return
