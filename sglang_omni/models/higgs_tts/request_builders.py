@@ -516,6 +516,7 @@ def build_higgs_stream_metadata(
 
 
 def apply_higgs_result(state: HiggsTtsState, data: HiggsSGLangRequestData) -> None:
+    num_codebooks = int(data.num_codebooks)
     codes = collected_output_codes(data)
     if codes.shape[0] > 0:
         state.output_codes_delayed = codes.tolist()
