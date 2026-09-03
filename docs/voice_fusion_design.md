@@ -646,6 +646,29 @@ serve 层编排;构造管线完整地活在 higgs 自己的 stage 代码 + engin
   log 加权落点与权重单调性),不依赖 sglang,纯 CPU 可跑;旧 `test_voice_fusion.py`
   44 项回归通过(logits 对照模式未受影响)。
 
+### 长参考自动切段融合(split_fuse,复用本机制)
+
+单参考 raw 音频超过 `HIGGS_REF_TRIM_SECONDS`(默认 30s)时的默认处理
+(`HIGGS_REF_LONG_MODE=split_fuse`):preprocessing 把整段音频等分为 ≤4 段
+(丢弃语音活跃占比 < 0.15 的段),当作同一说话人的 N 路等权重参考走上述
+reference-space 融合——整段录音都对音色有贡献,而不是只保留一个窗口。要点:
+
+- **等长切段**是刻意设计:audio_encoder 对等长段用 `codec.encode_batch`
+  一次 GPU 前向批量编码;段码另有进程级内容寻址缓存(同一参考重复请求
+  零编码),引擎侧混合参考缓存则免去重复校准构建。
+- **确定性**:同一段音频永远切出同样的段(内容哈希/缓存 key 稳定)。
+- **降级兜底**:auto-split 构建携带一对无参考转写的 prompt 零件
+  (`fallback_prompt_prefix/suffix`);若校准 F0 闸在全部 3 个种子上耗尽,
+  编排器不再对客户端报错,而是取最高权重的原始段做普通单参考克隆
+  (`FusionReferenceOrchestrator._serve_fallback`)——保证"以前能成的请求
+  现在也能成"。
+- **reference_text 语义**:切段后各段与全文转写不再对应,用户传入的
+  reference_text 会被忽略(打 warning 日志);混合参考的转写是校准句。
+- 仅一段有语音时退化为"用该段做普通单参考"(等效基于活跃度的裁剪)。
+- `HIGGS_REF_LONG_MODE=trim` 切回纯裁剪(取最优 30s 窗口,零额外成本);
+  `HIGGS_FUSION_MODE=logits` 或 `HIGGS_REF_TRIM_SECONDS<=0` 时自动回退 trim。
+- 尚未做的听感验证:同声源各段融合的混合参考质量(E1 只测过异声源对)。
+
 ### 遗留风险(E1 未覆盖,集成前需补验证)
 
 1. **听感**:E1 只量化了 F0 维度;"morph 伪影被克隆净化"的假设需要人耳确认(重点听

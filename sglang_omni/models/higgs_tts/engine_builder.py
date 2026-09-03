@@ -85,9 +85,16 @@ class HiggsTtsEngineBuilder(TtsEngineBuilder):
                 else 0.85
             ),
             "chunked_prefill_size": 8192,
-            # Qualified capture budget; longer prefills run eager.
+            # Cap one prefill forward at 4096 extend tokens (was the 16384
+            # server default): with overlap scheduling disabled, every prefill
+            # batch stalls all in-flight decodes, so halving the batch budget
+            # halves the worst-case streaming hiccup. Single requests are never
+            # chunked by this (input caps at context_length - max_new_tokens).
+            "max_prefill_tokens": 4096,
+            # Qualified capture budget; longer prefills run eager. 1024 tokens
+            # covers a ~40 s reference (25 codec frames/s) plus target text.
             "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
-            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(512),
+            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(1024),
             "dtype": "bfloat16",
         }
 

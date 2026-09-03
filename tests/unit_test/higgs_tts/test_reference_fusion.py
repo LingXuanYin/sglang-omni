@@ -149,7 +149,29 @@ def _bound_orchestrator(monkeypatch):
     return orch, sched
 
 
-def _register(orch, request_id="req1", n=2, refs=None, fp_of_slot=None):
+def _patch_world(monkeypatch, cal_f0=150.0, anchor_f0=150.0):
+    """Stub the WORLD analysis stack: the gate measures calibration wavs via
+    ``world_f0``, the anchor via ``median_f0``, and the morph consumes
+    ``world_extract`` (whose harvest pass is short-circuited by ``f0_t``)."""
+    monkeypatch.setattr(
+        fr,
+        "world_f0",
+        lambda wav, fs=24000: (np.full(8, float(cal_f0)), np.zeros(8)),
+    )
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: anchor_f0)
+    monkeypatch.setattr(
+        fr, "world_extract", lambda w, fs=24000, f0_t=None: ("f0", "sp", "ap")
+    )
+
+
+def _register(
+    orch,
+    request_id="req1",
+    n=2,
+    refs=None,
+    fp_of_slot=None,
+    make_fallback_request=None,
+):
     refs = refs if refs is not None else _refs(seed=7, n=n)
     fps = fp_of_slot if fp_of_slot is not None else [
         fr.ref_fingerprint(r) for r in refs
@@ -175,14 +197,14 @@ def _register(orch, request_id="req1", n=2, refs=None, fp_of_slot=None):
         cal_text="cal",
         make_real_request=make_real,
         cal_rows=rows,
+        make_fallback_request=make_fallback_request,
     )
     return rows, built
 
 
 def test_happy_path_builds_and_enqueues_real_request(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
-    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
-    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    _patch_world(monkeypatch)
     monkeypatch.setattr(
         fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
@@ -208,8 +230,7 @@ def test_short_real_reference_passes_the_length_floor(monkeypatch):
     25 Hz rate — the length floor must reject garbage, not short references.
     (Regression: an erroneous 75-frame floor rejected real 53-frame refs.)"""
     orch, sched = _bound_orchestrator(monkeypatch)
-    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
-    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    _patch_world(monkeypatch)
     monkeypatch.setattr(
         fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
@@ -224,8 +245,7 @@ def test_duplicate_references_deduplicate_to_distinct_voices(monkeypatch):
     """12 slots of only 2 distinct voices: 2 calibration rows drive the whole
     build, and the morph sees all 12 weighted slots."""
     orch, sched = _bound_orchestrator(monkeypatch)
-    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
-    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    _patch_world(monkeypatch)
     seen_entries = {}
 
     def fake_fuse(entries, fs=24000):
@@ -280,11 +300,19 @@ def test_empty_calibration_output_emits_error(monkeypatch):
 def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
     # ref0's calibration comes back an octave off its anchor once, then fine.
-    # (Every finalize pass re-measures cal+anchor for every ref: 4 calls in
-    # round one, then 4 more after the retry lands.)
-    f0_values = iter([300.0, 100.0] + [100.0] * 10)
-    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: next(f0_values))
-    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    # The gate measures calibration wavs via world_f0; the retry round must
+    # re-measure ONLY the failed voice, so exactly 3 world_f0 calls happen
+    # (cal0 fail, cal1 pass, cal0-retry pass) — a 4th raises StopIteration.
+    cal_track = iter([300.0, 100.0, 100.0])
+    monkeypatch.setattr(
+        fr,
+        "world_f0",
+        lambda wav, fs=24000: (np.full(8, next(cal_track)), np.zeros(8)),
+    )
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 100.0)
+    monkeypatch.setattr(
+        fr, "world_extract", lambda w, fs=24000, f0_t=None: ("f0", "sp", "ap")
+    )
     monkeypatch.setattr(
         fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )
@@ -313,10 +341,59 @@ def test_f0_gate_failure_retries_with_next_seed(monkeypatch):
     assert any(getattr(r, "real", False) for r in sched.enqueued)
 
 
+def test_f0_gate_exhaustion_degrades_to_fallback_when_available(monkeypatch):
+    """Auto-split builds must not hard-fail a request plain trimming would
+    have served: when every calibration seed fails the F0 gate, the group
+    degrades to cloning from the highest-weight raw segment."""
+    orch, sched = _bound_orchestrator(monkeypatch)
+    # Every calibration read is an octave off its anchor, on every seed.
+    monkeypatch.setattr(
+        fr, "world_f0", lambda wav, fs=24000: (np.full(8, 300.0), np.zeros(8))
+    )
+    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 100.0)
+    monkeypatch.setattr(
+        fr, "world_extract", lambda w, fs=24000, f0_t=None: ("f0", "sp", "ap")
+    )
+    retry_builds = []
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang_omni.models.higgs_tts.request_builders",
+        types.SimpleNamespace(
+            build_calibration_request=lambda **kw: (
+                retry_builds.append(kw),
+                SimpleNamespace(req=SimpleNamespace(rid=kw["rid"]), retry=True),
+            )[1]
+        ),
+    )
+    fallback_built = {}
+
+    def make_fallback(rows):
+        fallback_built["rows"] = rows
+        return SimpleNamespace(req=SimpleNamespace(rid="req9"), fallback=True)
+
+    refs = _refs(seed=17, n=2)
+    rows, built = _register(
+        orch, request_id="req9", refs=refs, make_fallback_request=make_fallback
+    )
+
+    orch.on_internal_done("req9", rows[0].fp, _cal_row_result(rows[0].rid))
+    orch.on_internal_done("req9", rows[1].fp, _cal_row_result(rows[1].rid))
+    for _ in range(2):  # seed 1 and seed 2 retry rounds, both voices
+        rids = [kw["rid"] for kw in retry_builds[-2:]]
+        for rid, row in zip(rids, rows):
+            orch.on_internal_done("req9", row.fp, _cal_row_result(rid))
+
+    assert "rows" not in built, "hybrid build must not run after exhaustion"
+    assert fallback_built["rows"] == refs[0]["codes_delayed"]
+    assert any(getattr(r, "fallback", False) for r in sched.enqueued)
+    assert not sched.errors
+    assert "req9" not in orch._groups
+    assert "req9" not in sched._fusion_group_members
+
+
 def test_client_abort_before_finalize_drops_the_build(monkeypatch):
     orch, sched = _bound_orchestrator(monkeypatch)
-    monkeypatch.setattr(fr, "median_f0", lambda wav, fs=24000: 150.0)
-    monkeypatch.setattr(fr, "world_extract", lambda w, fs=24000: ("f0", "sp", "ap"))
+    _patch_world(monkeypatch)
     monkeypatch.setattr(
         fr, "_fuse_world_entries", lambda entries, fs=24000: np.zeros(24000)
     )

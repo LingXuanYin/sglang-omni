@@ -89,6 +89,12 @@ _CACHE_MAX_ENTRIES = 64
 _WORLD_FRAME_PERIOD_MS = 5.0
 _SAMPLE_RATE = 24_000
 
+# Anchor-F0 measurement window: ~20 s of delayed rows at the codec's real
+# 25 Hz rate (+7 delay-pattern rows). Median F0 is insensitive to duration
+# past this; decoding the full reference would make the cold build scale
+# linearly with reference length for no gate-precision gain.
+_ANCHOR_MAX_DELAYED_ROWS = 20 * 25 + 7
+
 
 def fusion_mode() -> str:
     mode = os.environ.get(FUSION_MODE_ENV, "reference").strip().lower()
@@ -117,14 +123,37 @@ def _pyworld():
     return pyworld
 
 
-def world_extract(
+def world_f0(
     wav: np.ndarray, fs: int = _SAMPLE_RATE
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """mono float waveform → (f0, spectral envelope, aperiodicity)."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """harvest + stonemask F0 track with its time axis.
+
+    harvest is by far the most expensive WORLD stage; callers that need both
+    an F0 gate check and a full ``world_extract`` should run this once and
+    pass the result on via ``world_extract(..., f0_t=...)``.
+    """
     pw = _pyworld()
     x = np.ascontiguousarray(wav, dtype=np.float64)
     f0, t = pw.harvest(x, fs, frame_period=_WORLD_FRAME_PERIOD_MS)
-    f0 = pw.stonemask(x, f0, t, fs)
+    return pw.stonemask(x, f0, t, fs), t
+
+
+def world_extract(
+    wav: np.ndarray,
+    fs: int = _SAMPLE_RATE,
+    f0_t: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """mono float waveform → (f0, spectral envelope, aperiodicity).
+
+    ``f0_t`` short-circuits the harvest/stonemask pass with a precomputed
+    ``world_f0`` result for the same waveform.
+    """
+    pw = _pyworld()
+    x = np.ascontiguousarray(wav, dtype=np.float64)
+    if f0_t is None:
+        f0, t = world_f0(x, fs)
+    else:
+        f0, t = f0_t
     sp = pw.cheaptrick(x, f0, t, fs)
     ap = pw.d4c(x, f0, t, fs)
     return f0, sp, ap
@@ -132,10 +161,7 @@ def world_extract(
 
 def median_f0(wav: np.ndarray, fs: int = _SAMPLE_RATE) -> float | None:
     """Median voiced F0 via WORLD harvest; None when fully unvoiced."""
-    pw = _pyworld()
-    x = np.ascontiguousarray(wav, dtype=np.float64)
-    f0, t = pw.harvest(x, fs, frame_period=_WORLD_FRAME_PERIOD_MS)
-    f0 = pw.stonemask(x, f0, t, fs)
+    f0, _ = world_f0(wav, fs)
     voiced = f0[f0 > 0]
     if voiced.size == 0:
         return None
@@ -153,8 +179,18 @@ def dtw_features(sp: np.ndarray, num_bands: int = 32) -> np.ndarray:
     return feats - feats.mean(axis=0, keepdims=True)
 
 
-def dtw_map(feats_a: np.ndarray, feats_b: np.ndarray) -> np.ndarray:
-    """DTW-align B onto A's frame axis: returns ``map_ab[T_a] -> B index``."""
+def dtw_map(
+    feats_a: np.ndarray, feats_b: np.ndarray, band: int | None = None
+) -> np.ndarray:
+    """DTW-align B onto A's frame axis: returns ``map_ab[T_a] -> B index``.
+
+    ``band`` is a slope-normalized Sakoe-Chiba radius: row ``i`` only fills
+    cells within ``band`` of the diagonal point ``i * tb / ta``. Calibration
+    readings share the exact same text, so their alignment hugs the diagonal
+    and the band cuts the pure-python DP from O(ta*tb) to O(ta*band). If the
+    banded pass fails to connect (pathological drift), it falls back to the
+    full matrix.
+    """
     cost = np.sqrt(
         np.maximum(
             (feats_a**2).sum(1)[:, None]
@@ -164,16 +200,26 @@ def dtw_map(feats_a: np.ndarray, feats_b: np.ndarray) -> np.ndarray:
         )
     )
     ta, tb = cost.shape
+    if band is None:
+        # Floor of 64 decimated frames (= ~5 s of drift allowance at the
+        # 20 ms decimated rate) absorbs local pauses/speed differences
+        # between same-text readings without falling back to the full matrix.
+        band = max(64, int(0.15 * tb) + abs(tb - ta))
     acc = np.full((ta + 1, tb + 1), np.inf)
     acc[0, 0] = 0.0
     for i in range(1, ta + 1):
+        center = int(round((i - 1) * tb / max(ta, 1))) + 1
+        lo = max(1, center - band)
+        hi = min(tb, center + band)
         cost_row = cost[i - 1]
         prev_row = acc[i - 1]
         cur_row = acc[i]
-        for j in range(1, tb + 1):
+        for j in range(lo, hi + 1):
             cur_row[j] = cost_row[j - 1] + min(
                 prev_row[j], cur_row[j - 1], prev_row[j - 1]
             )
+    if not np.isfinite(acc[ta, tb]):  # band too tight for this pair: redo full
+        return dtw_map(feats_a, feats_b, band=max(ta, tb))
     i, j = ta, tb
     path: list[tuple[int, int]] = []
     while i > 0 and j > 0:
@@ -310,11 +356,10 @@ def ref_fingerprint(ref: dict[str, Any]) -> str:
     references inside a single fusion request (12 slots of 2 distinct voices
     cost 2 calibration syntheses, not 12).
     """
-    h = hashlib.blake2b(digest_size=16)
-    for row in ref["codes_delayed"]:
-        for c in row:
-            h.update(int(c).to_bytes(2, "little"))
-    return h.hexdigest()
+    # Row-major little-endian uint16 — byte-identical to the historical
+    # per-value ``int(c).to_bytes(2, "little")`` loop, so keys survive.
+    buf = np.asarray(ref["codes_delayed"], dtype="<u2").tobytes()
+    return hashlib.blake2b(buf, digest_size=16).hexdigest()
 
 
 def fused_reference_cache_key(
@@ -355,6 +400,15 @@ class _BuildGroup:
     pending: dict[str, _CalRow] = field(default_factory=dict)
     collected: dict[str, torch.Tensor] = field(default_factory=dict)  # fp -> delayed
     seed_used: dict[str, int] = field(default_factory=dict)
+    # fp -> (cal_wav, (f0, t)) for voices that already passed the F0 gate, so
+    # a seed retry re-decodes/re-measures only the voices that failed.
+    gated: dict[str, tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]] = field(
+        default_factory=dict
+    )
+    # Auto-split long-reference builds: degrade to plain single-segment
+    # cloning instead of failing the request when the F0 gate exhausts all
+    # calibration seeds. None for ordinary client-provided fusions.
+    make_fallback_request: Callable[[list[list[int]]], Any] | None = None
     failed: bool = False
 
     @property
@@ -437,6 +491,7 @@ class FusionReferenceOrchestrator:
         make_real_request: Callable[[list[list[int]]], Any],
         cal_rows: list[_CalRow],
         pre_collected: dict[str, torch.Tensor] | None = None,
+        make_fallback_request: Callable[[list[list[int]]], Any] | None = None,
     ) -> None:
         group = _BuildGroup(
             request_id=request_id,
@@ -447,6 +502,7 @@ class FusionReferenceOrchestrator:
             weights=weights,
             cal_text=cal_text,
             make_real_request=make_real_request,
+            make_fallback_request=make_fallback_request,
             deadline=time.monotonic() + BUILD_DEADLINE_S,
         )
         self._sweep_expired()
@@ -554,8 +610,14 @@ class FusionReferenceOrchestrator:
         with self._lock:
             if fp in self._anchor_cache:
                 return self._anchor_cache[fp]
+        # The anchor is a coarse median-F0 register check against a ln(1.35)
+        # gate; ~20 s of audio pins the median as well as the full reference
+        # does, and this decode+harvest is the only cold-build cost that
+        # scales with reference length — so truncate.
         anchor_wav = self._delayed_to_wav(
-            torch.tensor(ref["codes_delayed"], dtype=torch.long)
+            torch.tensor(
+                ref["codes_delayed"][:_ANCHOR_MAX_DELAYED_ROWS], dtype=torch.long
+            )
         )
         value = median_f0(anchor_wav)
         with self._lock:
@@ -568,12 +630,19 @@ class FusionReferenceOrchestrator:
             self._drop(group)
             return
 
-        # Gate + decode once per DISTINCT voice; duplicate slots share it.
-        cal_wav_by_fp: dict[str, np.ndarray] = {}
+        # Gate + decode once per DISTINCT voice; duplicate slots share it, and
+        # ``group.gated`` carries voices that already passed on a previous
+        # round so a seed retry re-measures only the ones that failed. The F0
+        # track computed for the gate is reused by ``world_extract`` below —
+        # harvest (the dominant WORLD cost) runs once per calibration wav.
         retry_rows: list[tuple[str, int]] = []  # (fp, next_seed_idx)
         for fp in group.unique_fps:
+            if fp in group.gated:
+                continue
             cal_wav = self._delayed_to_wav(group.collected[fp])
-            cal_f0 = median_f0(cal_wav)
+            f0, t = world_f0(cal_wav)
+            voiced = f0[f0 > 0]
+            cal_f0 = float(np.median(voiced)) if voiced.size else None
             anchor_f0 = self._anchor_f0(fp, group.ref_of_fp[fp])
             if cal_f0 is None or anchor_f0 is None:
                 deviation = None
@@ -593,12 +662,25 @@ class FusionReferenceOrchestrator:
                         next_seed,
                     )
                     continue
+                if group.make_fallback_request is not None:
+                    logger.warning(
+                        "reference-fusion %s: voice %s failed the F0 gate on "
+                        "all %d seeds (last: cal_f0=%s anchor_f0=%s); "
+                        "degrading to single-segment cloning",
+                        group.request_id,
+                        fp[:8],
+                        len(CAL_SEEDS),
+                        cal_f0,
+                        anchor_f0,
+                    )
+                    self._serve_fallback(group)
+                    return
                 raise RuntimeError(
                     f"calibration for voice {fp[:8]} failed the F0 quality "
                     f"gate on all {len(CAL_SEEDS)} seeds "
                     f"(last: cal_f0={cal_f0}, anchor_f0={anchor_f0})"
                 )
-            cal_wav_by_fp[fp] = cal_wav
+            group.gated[fp] = (cal_wav, (f0, t))
 
         if retry_rows:
             self._enqueue_retries(group, retry_rows)
@@ -607,7 +689,10 @@ class FusionReferenceOrchestrator:
         for fp in group.unique_fps:
             self._cal_cache_put(fp, group.cal_text, group.collected[fp])
 
-        world_by_fp = {fp: world_extract(w) for fp, w in cal_wav_by_fp.items()}
+        world_by_fp = {
+            fp: world_extract(wav, f0_t=f0_t)
+            for fp, (wav, f0_t) in group.gated.items()
+        }
         entries = [
             {"world": world_by_fp[fp], "weight": w}
             for fp, w in zip(group.fp_of_slot, group.weights)
@@ -633,6 +718,21 @@ class FusionReferenceOrchestrator:
             len(group.unique_fps),
             len(group.fp_of_slot),
         )
+
+    def _serve_fallback(self, group: _BuildGroup) -> None:
+        """Serve an auto-split build as a plain single-reference clone of the
+        highest-weight raw segment (no calibration, no morph)."""
+        scheduler = self._scheduler
+        if group.request_id in scheduler._aborted_request_ids:
+            self._drop(group)
+            return
+        best_slot = max(
+            range(len(group.weights)), key=lambda i: group.weights[i]
+        )
+        rows = group.ref_of_fp[group.fp_of_slot[best_slot]]["codes_delayed"]
+        real_req_data = group.make_fallback_request(rows)
+        self._drop(group)
+        scheduler._enqueue_built_request(group.payload, False, real_req_data)
 
     def _enqueue_retries(
         self, group: _BuildGroup, retry_rows: list[tuple[str, int]]
@@ -735,4 +835,5 @@ __all__ = [
     "get_orchestrator",
     "median_f0",
     "world_extract",
+    "world_f0",
 ]

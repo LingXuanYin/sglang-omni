@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
+import numpy as np
 import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -96,14 +97,10 @@ def _ref_audio_fingerprint(codes: list[list[int]] | None) -> str | None:
     """
     if not codes:
         return None
-    buf = bytearray(2 * sum(len(row) for row in codes))
-    i = 0
-    for row in codes:
-        for c in row:
-            buf[i] = c & 0xFF
-            buf[i + 1] = (c >> 8) & 0xFF
-            i += 2
-    return hashlib.blake2b(bytes(buf), digest_size=16).hexdigest()
+    # Row-major little-endian uint16 — byte-identical to the historical
+    # per-value ``c & 0xFF, (c >> 8) & 0xFF`` loop, so existing keys survive.
+    buf = np.asarray(codes, dtype="<u2").tobytes()
+    return hashlib.blake2b(buf, digest_size=16).hexdigest()
 
 
 def _build_one_higgs_request(
@@ -370,9 +367,15 @@ def build_reference_fusion_requests(
         )
     weights = _coerce_fusion_weights(refs)
 
-    def _make_real_request(delayed_rows: list[list[int]]) -> HiggsSGLangRequestData:
-        prompt_ids = list(prefix) + [AUDIO_PLACEHOLDER_ID] * len(delayed_rows) + list(
-            suffix
+    def _make_single_ref_request(
+        delayed_rows: list[list[int]],
+        prefix_ids: list[int],
+        suffix_ids: list[int],
+    ) -> HiggsSGLangRequestData:
+        prompt_ids = (
+            list(prefix_ids)
+            + [AUDIO_PLACEHOLDER_ID] * len(delayed_rows)
+            + list(suffix_ids)
         )
         data = _build_one_higgs_request(
             prompt_token_ids=prompt_ids,
@@ -389,6 +392,25 @@ def build_reference_fusion_requests(
             return_omni_rollout=bool(state.return_omni_rollout),
         )
         return finalize(data, payload)
+
+    def _make_real_request(delayed_rows: list[list[int]]) -> HiggsSGLangRequestData:
+        return _make_single_ref_request(delayed_rows, prefix, suffix)
+
+    # Auto-split long-reference builds carry a second prompt-part pair (no
+    # reference transcript): if the calibration F0 gate exhausts all seeds,
+    # the orchestrator degrades to cloning from one raw segment instead of
+    # failing a request that plain trimming would have served.
+    fallback_prefix = build.get("fallback_prompt_prefix")
+    fallback_suffix = build.get("fallback_prompt_suffix")
+    make_fallback_request = None
+    if fallback_prefix and fallback_suffix:
+
+        def make_fallback_request(
+            delayed_rows: list[list[int]],
+        ) -> HiggsSGLangRequestData:
+            return _make_single_ref_request(
+                delayed_rows, fallback_prefix, fallback_suffix
+            )
 
     cache_key = fusion_reference.fused_reference_cache_key(refs, weights, cal_text)
     cached_rows = orchestrator.cache_get(cache_key)
@@ -442,6 +464,7 @@ def build_reference_fusion_requests(
         make_real_request=_make_real_request,
         cal_rows=cal_rows,
         pre_collected=pre_collected,
+        make_fallback_request=make_fallback_request,
     )
     # The sibling side-channel is reused purely as "enqueue these adjacent
     # rows" — the leader's ``fusion_skip_atomic_admission`` keeps them out of
