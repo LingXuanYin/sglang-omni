@@ -117,6 +117,28 @@ openai==2.6.1
 CONSTRAINTS
 "$PY" -m pip install --no-cache-dir -c /root/higgs-stack-constraints.txt     "python-dotenv>=1.0.1,<2.0.0"     "dramatiq[redis,watch]>=2.0.0,<3.0.0"     "redis>=5.2.1,<6.0.0"     "oss2>=2.19.1,<3.0.0"     "opentelemetry-sdk>=1.30.0,<2.0.0"     "opentelemetry-api>=1.30.0,<2.0.0"     "opentelemetry-exporter-otlp-proto-grpc>=1.30.0,<2.0.0"     "opentelemetry-exporter-otlp-proto-http>=1.30.0,<2.0.0"     "opentelemetry-instrumentation-httpx>=0.51b0,<1.0.0"     "opentelemetry-instrumentation-requests>=0.51b0,<1.0.0"     "ffmpeg-python>=0.2.0,<0.3.0"     "mutagen>=1.47.0,<2.0.0"     "httpx[socks]>=0.28.1,<0.29.0"     "pyyaml>=6.0.2,<7.0.0"     "pillow>=11.2.1,<12.0.0"     "json-repair>=0.47.7"     "websockets>=14.1.0,<15.0.0"
 
+echo "== 6b. drop conda extensions that pip's replacements cannot shadow =="
+# A conda-installed package leaves a versioned extension
+# (_rust.cpython-312-x86_64-linux-gnu.so) that takes import precedence over
+# the abi3 .so pip ships. pip upgrading the package replaces the Python files
+# and its own .so but never deletes conda's, so the new Python code ends up
+# calling an old binary: cryptography 44 against a 2024 _rust gives
+# "module 'openssl' has no attribute 'ciphers'", which surfaces far away as
+# redis -> jwt failing to import, and only on hosts where that stale file
+# exists.
+"$PY" - <<'PY'
+import pathlib, sysconfig
+sp = pathlib.Path(sysconfig.get_paths()["purelib"])
+moved = 0
+for abi3 in sp.rglob("*.abi3.so"):
+    for rival in abi3.parent.glob(abi3.name.split(".")[0] + ".cpython-*.so"):
+        backup = rival.with_suffix(rival.suffix + ".shadowed-by-abi3")
+        print(f"  shadowing {rival.name} -> {backup.name}")
+        rival.rename(backup)
+        moved += 1
+print(f"moved {moved} shadowed extension(s)")
+PY
+
 echo "== 7. verify =="
 "$PY" -c "
 import numpy, sglang, sglang_omni, torch, pyworld
