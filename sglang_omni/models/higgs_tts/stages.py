@@ -111,19 +111,36 @@ def _effective_max_new_tokens(requested: Any) -> int:
 _REF_TRIM_SECONDS = float(os.environ.get("HIGGS_REF_TRIM_SECONDS", "30"))
 
 # How a single raw reference LONGER than _REF_TRIM_SECONDS is handled:
-#   "split_fuse" (default) — split into equal segments and blend them through
-#       reference-space voice fusion: the whole clip contributes to the
-#       timbre instead of one window, equal-length segments batch-encode in
-#       one GPU forward, and the fused reference is content-cached in-engine
-#       so only the first request of a voice pays the calibration build.
-#   "trim" — keep only the best _REF_TRIM_SECONDS window (lossy but zero
-#       extra cost; no calibration synthesis on first use).
+#   "whole" (default) — encode the clip as one reference, up to the hard
+#       _MAX_REF_AUDIO_SEC cap. Keeps every feature and does no fusion work.
+#   "split_fuse" — split into equal segments and blend them through
+#       reference-space voice fusion, so the timbre comes from the whole clip
+#       via a short hybrid reference rather than a long prompt.
+#   "trim" — keep only the best _REF_TRIM_SECONDS window (lossy).
+#
+# "whole" is the default because measurement, not the design's expectation,
+# decides between the first two. split_fuse was written on the premise that
+# its calibration build amortizes over later requests for the same voice --
+# which requires those requests to land on the pod holding the cache, and
+# there is no affinity routing, so in practice every request pays a cold
+# build. Cold, on a card constrained to the deployment's size, an 80 s
+# single-reference clone costs 10.1 s through split_fuse and 5.4 s encoded
+# whole, and whole stays ahead at every concurrency level up to saturation
+# (at 4 concurrent: 30.0 s vs 39.7 s wall). Splitting does make the encode
+# itself 34% cheaper -- 2x40 s batched is 99 ms against 150 ms for 1x80 s --
+# but that is 50 ms of a multi-second request, while the calibration
+# synthesis it adds is seconds.
+#
+# split_fuse remains available, and remains the right shape if reference
+# caching ever becomes effective (affinity routing, or a shared cache), or
+# for references beyond the hard cap: it is the only mode whose prompt cost
+# does not grow with the reference.
 # Falls back to "trim" when the legacy "logits" fusion mode is active
 # (fanning one voice out into K sibling rows costs K× KV for nothing).
-_REF_LONG_MODE = os.environ.get("HIGGS_REF_LONG_MODE", "split_fuse").strip().lower()
-if _REF_LONG_MODE not in ("split_fuse", "trim"):
+_REF_LONG_MODE = os.environ.get("HIGGS_REF_LONG_MODE", "whole").strip().lower()
+if _REF_LONG_MODE not in ("whole", "split_fuse", "trim"):
     raise ValueError(
-        f"HIGGS_REF_LONG_MODE must be 'split_fuse' or 'trim', "
+        f"HIGGS_REF_LONG_MODE must be 'whole', 'split_fuse' or 'trim', "
         f"got {_REF_LONG_MODE!r}"
     )
 _SPLIT_FUSE_MAX_SEGMENTS = 4
@@ -166,7 +183,7 @@ def _batches_within_budget(
 
 def _long_reference_mode() -> str:
     if _REF_TRIM_SECONDS <= 0:
-        return "trim"  # long-reference handling disabled -> hard cap applies
+        return "whole"  # segment/window handling disabled -> hard cap applies
     if _REF_LONG_MODE == "split_fuse" and fusion_reference.fusion_mode() != "reference":
         return "trim"
     return _REF_LONG_MODE
@@ -737,8 +754,12 @@ def create_preprocessing_executor(
                 wav = torch.from_numpy(waveform_np)
                 if sample_rate != 24000:
                     wav = F_audio.resample(wav, sample_rate, 24000)
-                if _long_reference_mode() == "trim":
-                    wav = _trim_reference_waveform(wav)
+                mode = _long_reference_mode()
+                if mode in ("trim", "whole"):
+                    if mode == "trim":
+                        wav = _trim_reference_waveform(wav)
+                    # Both serve the clip as one prompt, so the context
+                    # length is the binding constraint.
                     max_sec = float(_MAX_REF_AUDIO_SEC)
                 else:
                     # split_fuse keeps the full clip; the engine only ever

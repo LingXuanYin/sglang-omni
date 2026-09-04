@@ -296,9 +296,22 @@ def test_split_reference_short_clip_returns_none():
     assert stages._split_reference_for_fusion(wav) is None
 
 
+def test_long_reference_mode_defaults_to_encoding_the_whole_clip(monkeypatch):
+    """The default serves a long reference as one prompt, not a fusion build.
+
+    split_fuse's build is only worth its cost if later requests for the same
+    voice reuse it, and nothing routes them to the pod that holds it.
+    """
+    stages = _stages()
+    monkeypatch.delenv("HIGGS_FUSION_MODE", raising=False)
+    assert stages._REF_LONG_MODE == "whole"
+    assert stages._long_reference_mode() == "whole"
+
+
 def test_long_reference_mode_falls_back_to_trim_for_logits_fusion(monkeypatch):
     stages = _stages()
     monkeypatch.delenv("HIGGS_FUSION_MODE", raising=False)
+    monkeypatch.setattr(stages, "_REF_LONG_MODE", "split_fuse")
     assert stages._long_reference_mode() == "split_fuse"
     monkeypatch.setenv("HIGGS_FUSION_MODE", "logits")
     assert stages._long_reference_mode() == "trim"
