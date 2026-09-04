@@ -57,14 +57,11 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             # blend paths only, never on default-voice requests, which encode
             # no reference at all.
             #
-            # 0.09 is 2211 MiB on that card. The number is what a sweep of
-            # reference counts needs, not a margin over the pair: sixteen
-            # references peak at 2056 MiB above idle.
-            # The ceiling is bounded because no single encode exceeds
-            # HIGGS_REF_TRIM_SECONDS: longer references are split before they
-            # reach this stage (see _split_reference_for_fusion). Encoding an
-            # untrimmed 80 s reference would need 1419 MiB on its own.
-            gpu_memory_fraction=0.09,
+            # 0.12 is 2948 MiB on that card, sized against the worst case
+            # the gateway schema admits rather than a typical one: sixteen
+            # references at the 80 s cap, none of them cropped, peak at
+            # 2966 MiB above idle and leave the card 975 MiB free.
+            gpu_memory_fraction=0.12,
             next="tts_engine",
         ),
         EngineStageConfig(
@@ -78,9 +75,9 @@ class HiggsTtsPipelineConfig(PipelineConfig):
             # Yields what the audio_encoder above needs, and leaves the card
             # with headroom rather than running to the last megabyte: at 0.79
             # a sixteen-reference build still tripped a recoverable allocator
-            # OOM. It costs KV cache and nothing else -- 69k tokens remain
+            # OOM. It costs KV cache and nothing else -- 64k tokens remain
             # against a 2048-token generation cap.
-            gpu_memory_fraction=0.76,
+            gpu_memory_fraction=0.73,
             next="vocoder",
             stream_to=["vocoder"],
         ),

@@ -546,12 +546,25 @@ def create_preprocessing_executor(
     speaker_cache = get_speaker_artifact_cache()
 
     def _load_fusion_waveform(audio: Any) -> torch.Tensor:
-        """Load a fusion reference's audio source to a ``[1, 1, L]`` 24 kHz tensor."""
+        """Load a fusion reference's audio source to a ``[1, 1, L]`` 24 kHz tensor.
+
+        Cropping here is opt-in, like it is for a single reference. It used to
+        be unconditional, which quietly discarded 50 s of an 80 s source --
+        62% of the audio whose timbre the caller asked to blend -- in the one
+        path this feature exists for. Nothing forces it: a source's
+        calibration prompt is its reference plus CAL_MAX_NEW_TOKENS, so 80 s
+        comes to 2768 of the engine's 4095 tokens and fits, and the anchor
+        pass is truncated by length already. A source that genuinely cannot
+        fit is rejected by _check_prompt_budget with a message saying so,
+        which is the caller's decision to make rather than ours to make
+        silently.
+        """
         waveform_np, sample_rate = load_audio_to_24k(audio)
         wav = torch.from_numpy(waveform_np)
         if sample_rate != 24000:
             wav = F_audio.resample(wav, sample_rate, 24000)
-        wav = _trim_reference_waveform(wav)
+        if _long_reference_mode() == "trim":
+            wav = _trim_reference_waveform(wav)
         if wav.shape[-1] > _MAX_REF_AUDIO_SEC * 24000:
             raise ValueError(
                 f"a fusion reference is too long "
